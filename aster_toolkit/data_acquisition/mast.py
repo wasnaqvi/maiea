@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ast
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -63,6 +64,14 @@ JWST_PRODUCT_SUBGROUPS = (
     "WHTLT",      # white-light curve
 )
 
+JWST_INSTRUMENT_ALIASES = {
+    "NIRSPEC": ["NIRSPEC/SLIT", "NIRSPEC/IFU", "NIRSPEC/MSA", "NIRSPEC/IMAGE"],
+    "NIRCAM": ["NIRCAM/IMAGE", "NIRCAM/GRISM"],
+    "NIRISS": ["NIRISS/SOSS", "NIRISS/IMAGE", "NIRISS/WFSS", "NIRISS/AMI"],
+    "MIRI": ["MIRI/IMAGE", "MIRI/IFU", "MIRI/MRS", "MIRI/LRS"],
+    "FGS": ["FGS/FGS"],
+}
+
 
 def _mast_query(
     request: dict[str, Any],
@@ -92,12 +101,53 @@ def _extract_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def _as_list(value: str | list[str] | tuple[str, ...] | None) -> list[str] | None:
+def _as_list(value: Any) -> list[Any] | None:
     if value is None:
         return None
     if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped[0] in "[(" and stripped[-1:] in "])":
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                return [value]
+            if isinstance(parsed, (list, tuple)):
+                return list(parsed)
+            return [parsed]
         return [value]
-    return list(value)
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _as_int_list(value: Any) -> list[int] | None:
+    values = _as_list(value)
+    if values is None:
+        return None
+    return [int(v) for v in values]
+
+
+def _normalize_jwst_instruments(value: Any) -> list[str] | None:
+    values = _as_list(value)
+    if values is None:
+        return None
+
+    normalized: list[str] = []
+    for item in values:
+        instrument = str(item).strip()
+        if not instrument:
+            continue
+
+        key = instrument.upper()
+        aliases = JWST_INSTRUMENT_ALIASES.get(key)
+        if aliases:
+            normalized.extend(aliases)
+        else:
+            normalized.append(key if "/" in key else instrument)
+
+    return normalized or None
 
 
 def _sanitize_path_component(value: str) -> str:
@@ -117,7 +167,7 @@ def _build_jwst_observation_filters(
         {"paramName": "obs_collection", "values": ["JWST"]},
     ]
 
-    instrument_values = _as_list(instruments)
+    instrument_values = _normalize_jwst_instruments(instruments)
     if instrument_values:
         filters.append({"paramName": "instrument_name", "values": instrument_values})
 
@@ -125,11 +175,8 @@ def _build_jwst_observation_filters(
     if data_values:
         filters.append({"paramName": "dataproduct_type", "values": data_values})
 
-    if calib_levels is not None:
-        if isinstance(calib_levels, int):
-            level_values = [calib_levels]
-        else:
-            level_values = list(calib_levels)
+    level_values = _as_int_list(calib_levels)
+    if level_values:
         filters.append({"paramName": "calib_level", "values": level_values})
 
     if target_name:
@@ -337,9 +384,9 @@ def download_mast_product(
     if not local_name:
         raise ValueError("Could not infer a filename from data_uri.")
 
-    response = client.get(
+    response = client.post(
         MAST_DOWNLOAD_URL,
-        params={"uri": data_uri},
+        data=data_uri,
         stream=True,
         timeout=timeout,
     )

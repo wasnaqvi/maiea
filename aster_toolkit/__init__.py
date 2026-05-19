@@ -8,6 +8,11 @@ from .taurex.set_paths import SetTaurexPaths
 from .taurex.retrieval import SimulateTaurexRetrieval
 from .taurex.corner_plot import PlotCornerPosteriors
 from .data_acquisition.exoarchive import GetExoplanetParameters, DownloadDataset, FindExoplanetsByCondition
+from .data_acquisition.mast import (
+    SearchMastJwstObservations,
+    GetMastObservationProducts,
+    DownloadMastJwstProducts,
+)
 
 __all__ = [
     'RunTaurexModelTool',
@@ -17,6 +22,9 @@ __all__ = [
     'GetExoplanetParameters',
     'DownloadDataset',
     'FindExoplanetsByCondition',
+    'SearchMastJwstObservations',
+    'GetMastObservationProducts',
+    'DownloadMastJwstProducts',
 ]
 
 # from .taurex_tools import (

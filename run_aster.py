@@ -136,8 +136,11 @@ from aster_toolkit import (
     SimulateTaurexRetrieval,
     PlotCornerPosteriors,
     GetExoplanetParameters,
-    DownloadDataset, 
-    FindExoplanetsByCondition
+    DownloadDataset,
+    FindExoplanetsByCondition,
+    SearchMastJwstObservations,
+    GetMastObservationProducts,
+    DownloadMastJwstProducts,
 )
 
 base_directory = 'workspace'
@@ -164,7 +167,12 @@ tools = [
     # Data acquisition tools
     GetExoplanetParameters(),
     DownloadDataset(base_directory=base_directory),
-    FindExoplanetsByCondition()
+    FindExoplanetsByCondition(),
+
+    # MAST / JWST tools
+    SearchMastJwstObservations(),
+    GetMastObservationProducts(),
+    DownloadMastJwstProducts(base_directory=base_directory),
 ]
 
 if llm_provider == 'openai':

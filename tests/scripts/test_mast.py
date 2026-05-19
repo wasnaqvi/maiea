@@ -36,11 +36,11 @@ class FakeDownloadSession:
     def __init__(self):
         self.calls = []
 
-    def get(self, url, params=None, stream=False, timeout=None):
+    def post(self, url, data=None, stream=False, timeout=None):
         self.calls.append(
             {
                 "url": url,
-                "params": params,
+                "data": data,
                 "stream": stream,
                 "timeout": timeout,
             }
@@ -62,10 +62,9 @@ class MastWrapperTests(unittest.TestCase):
         )
 
         self.assertEqual(filters[0], {"paramName": "obs_collection", "values": ["JWST"]})
-        self.assertIn(
-            {"paramName": "instrument_name", "values": ["NIRSpec", "NIRCam"]},
-            filters,
-        )
+        instrument_filter = next(f for f in filters if f["paramName"] == "instrument_name")
+        self.assertIn("NIRSPEC/SLIT", instrument_filter["values"])
+        self.assertIn("NIRCAM/IMAGE", instrument_filter["values"])
         self.assertIn({"paramName": "dataproduct_type", "values": ["spectrum"]}, filters)
         self.assertIn({"paramName": "calib_level", "values": [2, 3]}, filters)
         self.assertIn({"paramName": "proposal_id", "values": ["1366"]}, filters)
@@ -97,7 +96,10 @@ class MastWrapperTests(unittest.TestCase):
             request["params"]["filters"],
         )
         self.assertIn(
-            {"paramName": "instrument_name", "values": ["NIRSpec"]},
+            {
+                "paramName": "instrument_name",
+                "values": ["NIRSPEC/SLIT", "NIRSPEC/IFU", "NIRSPEC/MSA", "NIRSPEC/IMAGE"],
+            },
             request["params"]["filters"],
         )
 
@@ -147,12 +149,45 @@ class MastWrapperTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"abcdef")
 
         self.assertEqual(session.calls[0]["url"], self.mast.MAST_DOWNLOAD_URL)
-        self.assertEqual(
-            session.calls[0]["params"],
-            {"uri": "mast:JWST/product/jw01234_uncal.fits"},
-        )
+        self.assertEqual(session.calls[0]["data"], "mast:JWST/product/jw01234_uncal.fits")
         self.assertTrue(session.calls[0]["stream"])
         self.assertEqual(session.calls[0]["timeout"], 7)
+
+    def test_list_like_strings_are_coerced_for_tool_calls(self):
+        filters = self.mast._build_jwst_observation_filters(
+            instruments="['NIRSpec']",
+            dataproduct_types="['spectrum', 'timeseries']",
+            calib_levels="[3]",
+        )
+
+        self.assertIn(
+            {
+                "paramName": "instrument_name",
+                "values": ["NIRSPEC/SLIT", "NIRSPEC/IFU", "NIRSPEC/MSA", "NIRSPEC/IMAGE"],
+            },
+            filters,
+        )
+        self.assertIn(
+            {"paramName": "dataproduct_type", "values": ["spectrum", "timeseries"]},
+            filters,
+        )
+        self.assertIn({"paramName": "calib_level", "values": [3]}, filters)
+
+    def test_filter_products_accepts_list_like_string_subgroups(self):
+        products = [
+            {
+                "productType": "SCIENCE",
+                "productSubGroupDescription": "X1DINTS",
+                "productFilename": "jw01234_x1dints.fits",
+            }
+        ]
+
+        selected = self.mast.filter_products(
+            products,
+            product_subgroups="['X1DINTS']",
+        )
+
+        self.assertEqual(selected, products)
 
     def test_resolve_target_coordinates_parses_payload(self):
         payload = {
