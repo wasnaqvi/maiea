@@ -36,6 +36,39 @@ new_aster/
 
 ## Usage
 
+By default, ASTER is configured to use Ollama locally so you can try the app without OpenAI API billing:
+
+```bash
+ollama pull llama3.2
+python run_aster.py
+```
+
+Optional `.env` settings:
+
+```bash
+ASTER_LLM_PROVIDER=ollama
+ASTER_LLM_MODEL=llama3.2:latest
+# OLLAMA_HOST=http://localhost:11434
+```
+
+To use OpenAI instead, set:
+
+```bash
+ASTER_LLM_PROVIDER=openai
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+To use Groq instead, set:
+
+```bash
+ASTER_LLM_PROVIDER=groq
+ASTER_LLM_MODEL=openai/gpt-oss-120b
+GROQ_API_KEY=your_groq_api_key_here
+# GROQ_BASE_URL=https://api.groq.com/openai/v1
+# GROQ_TEMPERATURE=0.2
+# GROQ_TOOL_RETRIES=3
+```
+
 ```bash
 python run_aster.py
 ```
@@ -76,4 +109,3 @@ Other applications of Orchestral-AI to science are detailed here:
 - [HEPTAPOD: Orchestrating High Energy Physics Workflows Towards Autonomous Agency (Menzo et al., 2025)](https://arxiv.org/abs/2512.15867)
 - [Agentic Diagrammatica: Towards Autonomous Symbolic Computation in High Energy Physics (Menzo et al., 2026)](https://arxiv.org/abs/2603.26990)
 - [AI Agents for Variational Quantum Circuit Design (Knipfer et al., 2026)](https://arxiv.org/abs/2602.19387)
-

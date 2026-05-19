@@ -1,6 +1,7 @@
 # Environment and secrets
 .env
 .env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -29,7 +30,7 @@ aster-env/
 venv/
 ENV/
 env/
-
+.venv/
 # API testing folder
 api_testing/
 
