@@ -510,11 +510,12 @@ def _format_observations_summary(rows: list[dict[str, Any]], limit: int = 50) ->
         filters = row.get("filters", "?")
         target = row.get("target_name", "?")
         proposal = row.get("proposal_id", "?")
+        pi = row.get("proposal_pi", "?")
         calib = row.get("calib_level", "?")
         lines.append(
             f"{i:3}. obsid={obsid} obs_id={obs_id} target={target} "
             f"inst={instrument} type={dptype} filters={filters} "
-            f"calib_level={calib} proposal={proposal}"
+            f"calib_level={calib} proposal_id={proposal} pi={pi}"
         )
     if len(rows) > limit:
         lines.append(f"... ({len(rows) - limit} more truncated)")
