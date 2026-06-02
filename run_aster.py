@@ -141,6 +141,9 @@ from aster_toolkit import (
     SearchMastJwstObservations,
     GetMastObservationProducts,
     DownloadMastJwstProducts,
+    CrossmatchJwstToPlanets,
+    AggregateJwstObservations,
+    DownloadDemographicJwstProducts,
 )
 
 base_directory = 'workspace'
@@ -173,6 +176,9 @@ tools = [
     SearchMastJwstObservations(),
     GetMastObservationProducts(),
     DownloadMastJwstProducts(base_directory=base_directory),
+    CrossmatchJwstToPlanets(base_directory=base_directory),
+    AggregateJwstObservations(base_directory=base_directory),
+    DownloadDemographicJwstProducts(base_directory=base_directory),
 ]
 
 if llm_provider == 'openai':
