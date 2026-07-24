@@ -1,0 +1,8 @@
+requests
+tqdm
+taurex
+astropy
+orchestral-ai
+corner
+pymultinest
+taurex_ultranest
