@@ -8,8 +8,22 @@ import pandas as pd
 from astropy.io import ascii
 from tqdm import tqdm
 
-from orchestral.tools.base.tool import BaseTool
-from orchestral.tools.base.field_utils import RuntimeField, StateField
+try:
+    from orchestral.tools.base.tool import BaseTool
+    from orchestral.tools.base.field_utils import RuntimeField, StateField
+except ModuleNotFoundError:
+    # Fallback so the pure query helpers (get_exoplanet_params_tap,
+    # find_exoplanets_by_condition) stay importable/testable without the full
+    # Orchestral stack. Mirrors the shim in mast.py. Tool subclasses become
+    # inert stubs (fields collapse to their defaults) but do not crash import.
+    class BaseTool:  # type: ignore[no-redef]
+        pass
+
+    def RuntimeField(default=None, description=None):  # type: ignore[misc]
+        return default
+
+    def StateField(default=None, description=None):  # type: ignore[misc]
+        return default
 
 
 def process_wgets_file(base_directory, wgets_file_path: str, data_path: str) -> None:
@@ -282,6 +296,15 @@ def find_exoplanets_by_condition(conditions: list[str] | str, return_columns: li
 
 class FindExoplanetsByCondition(BaseTool):
     """
+    Find a LIST of planets/systems matching physical criteria (NASA Exoplanet Archive TAP).
+
+    USE WHEN: the user wants every planet satisfying conditions — "sub-Neptunes
+    within 50 pc", "planets with Teq > 1000 K in multi-planet systems". Returns
+    many rows.
+
+    NOT FOR: a single named planet's parameters (use `GetExoplanetParameters`),
+    or anything about JWST observations/instruments/programs (use the MAST tools).
+
     Query the NASA Exoplanet Archive using the TAP (Table Access Protocol) service to retrieve exoplanets or planetary systems that satisfy user-defined conditions.
 
     This tool enables flexible, condition-based searches over the Exoplanet Archive by allowing users to specify one or more constraints using ADQL (Astronomical Data Query Language) syntax. 
@@ -414,7 +437,21 @@ class FindExoplanetsByCondition(BaseTool):
 
 class GetExoplanetParameters(BaseTool):
     """
-    Get exoplanet parameters from NASA Exoplanet Archive via TAP service.
+    Get one planet/star's physical parameters from the NASA Exoplanet Archive.
+
+    USE WHEN: the user asks for a named planet's measured properties — radius,
+    mass, equilibrium temperature, orbital period, semi-major axis, or its host
+    star's radius/temperature/mass/metallicity.
+
+    NOT FOR: "who observed X", "what instrument", "which JWST program/proposal/PI"
+    — this tool queries a PARAMETER table (pscomppars/ps) with NO observation
+    logs, instruments, or programs. Route those to `SearchMastJwstObservations`
+    or `GetJwstProgramInfo`. For a LIST of planets matching criteria, use
+    `FindExoplanetsByCondition`.
+
+    `table` accepts ONLY 'pscomppars' (default) or 'ps'. Never pass a file path
+    or CSV name. `planet_name` is required and must match the archive exactly
+    (e.g. 'GJ 9827 d', 'WASP-39 b').
 
     This tool allows programmatic access to exoplanet data from the NASA Exoplanet Archive.
     Uses the "pscomppars" table by default, which provides composite parameters for confirmed
@@ -511,7 +548,14 @@ class GetExoplanetParameters(BaseTool):
 
 class DownloadDataset(BaseTool):
     """
-    Download transit spectra from NASA Exoplanet Archive and reformat them.
+    Download REDUCED transit spectra from the NASA Exoplanet Archive (Firefly).
+
+    USE WHEN: the user has Firefly wget commands / URL and wants ready-to-fit
+    transit spectra (wavelength, depth, error) for a retrieval.
+
+    NOT FOR: JWST FITS products (X1DINTS, UNCAL, etc.) — those come from MAST via
+    `DownloadMastJwstProducts`. This tool only ingests Exoplanet-Archive wget
+    commands and cannot construct URLs itself; the user must supply them.
 
     This tool supports THREE ways to provide wget commands:
 

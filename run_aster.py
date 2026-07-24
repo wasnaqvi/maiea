@@ -30,7 +30,10 @@ def require_groq_credentials():
 
 
 def get_llm_provider():
-    return os.getenv('ASTER_LLM_PROVIDER', 'ollama').lower()
+    # Default to 'openai': tool-routing accuracy across ASTER's ~14 tools is
+    # poor on small local models (llama3.2 routinely picks the wrong tool and
+    # invents arguments). '.env' can still override to 'ollama' or 'groq'.
+    return os.getenv('ASTER_LLM_PROVIDER', 'openai').lower()
 
 from orchestral import Agent
 from orchestral.tools import (

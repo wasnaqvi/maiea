@@ -14,7 +14,7 @@ and stellar parameters (Teff/logg/[Fe/H], used only for wavelength
 calibration). A copy of the exact YAML config used is archived by
 exoTEDRF next to the outputs, so any reduction is reproducible.
 
-Transit -> Phase curve. Scale up!!
+Transit -> Phase curve. Scale up LATER!!
 
 Environment isolation
 ---------------------

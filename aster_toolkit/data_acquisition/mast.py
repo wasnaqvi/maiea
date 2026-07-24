@@ -1376,9 +1376,112 @@ def _format_download_manifest(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _diagnose_empty_demographics(
+    *,
+    instruments: Any,
+    dataproduct_types: Any,
+    calib_levels: Any,
+    proposal_id: str | None,
+    target_name: str | None,
+    session: requests.Session | None = None,
+    timeout: float = 120.0,
+) -> str:
+    """
+    Explain an empty no-position (demographics) JWST search so the agent does
+    not conclude "no such data exists" when the FILTERS are simply too strict.
+
+    Strategy: re-run the same search with the filters progressively relaxed
+    (drop calib_levels, then dataproduct_types, then instruments) and report the
+    first relaxation that yields rows, summarizing what is actually present. If a
+    proposal_id was given, probe that proposal alone. Every branch tells the
+    caller which filter to change rather than dead-ending.
+    """
+    lines = [
+        "Diagnostics (demographics mode): the strict query matched nothing. "
+        "This usually means the FILTER combination is too narrow, NOT that the "
+        "data is absent. Findings:",
+    ]
+    applied = {
+        "instruments": _as_list(instruments),
+        "dataproduct_types": _as_list(dataproduct_types),
+        "calib_levels": _as_int_list(calib_levels),
+        "proposal_id": proposal_id,
+    }
+    applied = {k: v for k, v in applied.items() if v}
+    lines.append(f"  filters applied: {applied or '(none)'}")
+
+    # Proposal probe first — cheapest and most specific.
+    if proposal_id:
+        try:
+            prog_rows, _ = search_all_jwst_observations(
+                proposal_id=proposal_id, session=session, timeout=timeout,
+                pagesize=2000, max_pages=1,
+            )
+        except Exception as exc:
+            prog_rows = []
+            lines.append(f"  (proposal probe failed: {exc})")
+        if prog_rows:
+            lines.append(
+                f"  proposal {proposal_id} has {len(prog_rows)} observation(s), "
+                "but your OTHER filters excluded them. Present in that proposal:"
+            )
+            lines.append(f"    instrument_name:  {_summarize_distinct(prog_rows, 'instrument_name')}")
+            lines.append(f"    dataproduct_type: {_summarize_distinct(prog_rows, 'dataproduct_type')}")
+            lines.append(f"    calib_level:      {_summarize_distinct(prog_rows, 'calib_level')}")
+            lines.append("  Relax the mismatched filter(s) above and retry.")
+            return "\n".join(lines)
+        lines.append(
+            f"  a search for proposal {proposal_id} alone ALSO returned nothing "
+            "— the proposal id itself may be wrong."
+        )
+        return "\n".join(lines)
+
+    # No proposal_id to scope a cheap probe. Live relaxation is deliberately
+    # AVOIDED here: a filter-free demographics search spans ~170k rows and the
+    # completeness guard would refetch the whole set — a diagnostic must never
+    # cost more than the query. Give targeted static guidance instead.
+    culprits = []
+    if applied.get("calib_levels"):
+        culprits.append(
+            "calib_levels — the most common culprit; JWST science is calib_level "
+            "3 and calib_level=1 matches almost nothing. Try removing it first."
+        )
+    if applied.get("dataproduct_types"):
+        culprits.append(
+            "dataproduct_types — transit/eclipse data is usually 'timeseries', "
+            "not 'spectrum'; a 'spectrum'-only filter drops it."
+        )
+    if applied.get("instruments"):
+        culprits.append(
+            "instruments — check spelling/mode (e.g. NIRSpec transit data is "
+            "NIRSPEC/BOTS; a bare 'NIRSpec' is expanded automatically)."
+        )
+    if culprits:
+        lines.append("  Remove filters ONE AT A TIME and retry — likely culprits:")
+        lines.extend(f"    - {c}" for c in culprits)
+    else:
+        lines.append(
+            "  no filters were applied, yet nothing returned — check "
+            "instrument/target spelling, or the data may genuinely not exist."
+        )
+    lines.append(
+        "  Do NOT conclude the data does not exist from this empty result "
+        "until the filters above have been relaxed."
+    )
+    return "\n".join(lines)
+
+
 class SearchMastJwstObservations(BaseTool):
     """
-    Search MAST for JWST observations.
+    Search MAST for JWST observations (the "who/what observed" tool).
+
+    USE WHEN: the user asks who observed a planet, what instrument/mode was used,
+    which JWST program or PI, or wants to discover JWST data for a target or a
+    whole population. This is the FIRST step for any observation question.
+
+    NOT FOR: a planet's physical parameters (`GetExoplanetParameters`). It returns
+    observation rows (obsid, instrument, filters, proposal_id, PI) — not files.
+    To get files for an obsid, call `GetMastObservationProducts` next.
 
     Three modes:
       * **Per-planet cone search** — supply ``planet_name`` (resolved to RA/Dec
@@ -1437,11 +1540,20 @@ class SearchMastJwstObservations(BaseTool):
 
     Calibration levels
     ------------------
-    Valid values for ``calib_levels``:
-        - 1 : raw / minimal calibration
+    ``calib_level`` is the OBSERVATION's highest processing stage — NOT a way to
+    select raw vs calibrated FILES. Valid values:
+        - 1 : uncalibrated observation (JWST science obs are almost NEVER filed here)
         - 2 : per-exposure calibrated products
-        - 3 : combined / extracted science-ready products (recommended for retrievals)
+        - 3 : combined / extracted science-ready products (the usual JWST value)
         - 4 : community / contributed products
+
+    IMPORTANT — getting RAW / uncalibrated (UNCAL) data:
+        Do NOT filter ``calib_levels=[1]`` to find raw data. A calib_level-3
+        observation still CONTAINS the raw UNCAL ramps as products. To fetch
+        them, search WITHOUT a calib_level filter, then call
+        ``GetMastObservationProducts(obsid, raw_only=True)`` (or
+        ``DownloadMastJwstProducts(..., raw_only=True)``). Filtering by
+        calib_level=1 will return nothing and falsely imply "no raw data exists".
 
     Returns
     -------
@@ -1491,7 +1603,12 @@ class SearchMastJwstObservations(BaseTool):
         description="MAST dataproduct filters, e.g. ['spectrum', 'timeseries', 'image'].",
     )
     calib_levels: list | str | None = OptionalRuntimeField(
-        description="Optional MAST calibration levels.",
+        description=(
+            "Optional MAST calibration levels (observation processing stage; "
+            "JWST science is usually 3). Do NOT use calib_levels=[1] to find raw "
+            "data — UNCAL products live under calib_level 2/3 observations; fetch "
+            "them with raw_only=True on the products/download tools instead."
+        ),
     )
     proposal_id: str | None = OptionalRuntimeField(
         description="Optional JWST proposal id filter.",
@@ -1516,6 +1633,25 @@ class SearchMastJwstObservations(BaseTool):
         radius_deg = _as_float_or_none(self.radius_deg, "radius_deg")
         radius_deg = 0.02 if radius_deg is None else radius_deg
 
+        # calib_level=1 is a common trap: callers use it hoping to get raw /
+        # uncalibrated data, but JWST science observations are almost never
+        # filed at calib_level 1 (they are calib_level 3, and the UNCAL ramps
+        # are PRODUCTS under them). The empty result then reads as "no raw data
+        # exists", which is false. Attach a correction to every return path.
+        calib_list = _as_int_list(self.calib_levels)
+        raw_note = ""
+        if calib_list and 1 in calib_list:
+            raw_note = (
+                "\n\nNOTE ON calib_level=1: JWST science observations are almost "
+                "never filed at calib_level 1, so this filter usually matches "
+                "nothing. Raw/uncalibrated (UNCAL) data is NOT obtained this way "
+                "— it exists as PRODUCTS under calib_level 2/3 observations. To "
+                "get raw data: re-run this search WITHOUT calib_levels, then call "
+                "GetMastObservationProducts(obsid, raw_only=True) or "
+                "DownloadMastJwstProducts(..., raw_only=True). An empty result "
+                "here does NOT mean uncalibrated data is unavailable."
+            )
+
         if planet_name is None and ra is None and dec is None:
             observations, filters = search_all_jwst_observations(
                 instruments=self.instruments,
@@ -1524,11 +1660,24 @@ class SearchMastJwstObservations(BaseTool):
                 target_name=target_name,
                 proposal_id=proposal_id,
             )
-            return _format_observations_summary(
+            summary = _format_observations_summary(
                 observations,
                 filters=filters,
                 query_extra={"mode": "demographics (Mast.Caom.Filtered, no position)"},
             )
+            if not observations:
+                # Empty demographics result used to dead-end as a bare "No JWST
+                # observations found", inviting a false "no such data" verdict.
+                # Diagnose which filter was too strict instead.
+                diagnostics = _diagnose_empty_demographics(
+                    instruments=self.instruments,
+                    dataproduct_types=self.dataproduct_types,
+                    calib_levels=self.calib_levels,
+                    proposal_id=proposal_id,
+                    target_name=target_name,
+                )
+                summary = f"{summary}\n\n{diagnostics}"
+            return summary + raw_note
 
         if (ra is None) != (dec is None):
             raise ValueError(
@@ -1560,7 +1709,7 @@ class SearchMastJwstObservations(BaseTool):
         if observations:
             return _format_observations_summary(
                 observations, filters=filters, query_extra=query_extra
-            )
+            ) + raw_note
 
         # Strict query came back empty: self-diagnose instead of dead-ending.
         if ra is None or dec is None:
@@ -1579,16 +1728,22 @@ class SearchMastJwstObservations(BaseTool):
             summary = _format_observations_summary(
                 recovered, filters=filters, query_extra=query_extra
             )
-            return f"{diagnostics}\n\n{summary}"
+            return f"{diagnostics}\n\n{summary}{raw_note}"
         empty_summary = _format_observations_summary(
             [], filters=filters, query_extra=query_extra
         )
-        return f"{empty_summary}\n\n{diagnostics}"
+        return f"{empty_summary}\n\n{diagnostics}{raw_note}"
 
 
 class GetMastObservationProducts(BaseTool):
     """
-    List downloadable MAST products for one JWST observation id.
+    List downloadable MAST product files for one JWST observation id (obsid).
+
+    USE WHEN: you already have an `obsid` (from `SearchMastJwstObservations`) and
+    want to see the available files/pipeline stages before downloading.
+
+    NOT FOR: discovering observations (use `SearchMastJwstObservations`) or
+    actually downloading (use `DownloadMastJwstProducts`). Requires a real obsid.
 
     Workflow
     --------
@@ -1656,7 +1811,14 @@ class GetMastObservationProducts(BaseTool):
 
 class DownloadMastJwstProducts(BaseTool):
     """
-    One-shot download of JWST products.
+    One-shot download of JWST FITS products for ONE planet or an obsid list.
+
+    USE WHEN: the user wants JWST FITS files (X1DINTS, UNCAL, …) for a single
+    target, or for a specific list of obsids.
+
+    NOT FOR: reduced Exoplanet-Archive transit spectra (use `DownloadDataset`),
+    or bulk downloads across many planets from a crossmatch/aggregate CSV (use
+    `DownloadDemographicJwstProducts`).
 
     Two modes:
       * **Per-planet** — supply ``planet_name``. Runs search + product listing
@@ -2374,6 +2536,8 @@ def _format_crossmatch_summary(
     limit: int = 20,
     preset: str | None = None,
     conditions: list[str] | None = None,
+    planets_with_coords: int | None = None,
+    obs_filters: dict[str, Any] | None = None,
 ) -> str:
     head: list[str] = []
     if csv_path is not None:
@@ -2400,7 +2564,39 @@ def _format_crossmatch_summary(
         ]
     )
     if not rows:
-        head.append("No matches.")
+        head.append("No (planet, observation) pairs matched. WHY — check the stage "
+                    "that was empty before concluding anything:")
+        active_filters = {k: v for k, v in (obs_filters or {}).items() if v}
+        if planet_count == 0:
+            head.append(
+                "  • 0 population planets matched your archive conditions/preset. "
+                "The ARCHIVE query is empty — this says NOTHING about JWST data. "
+                "Loosen archive_conditions or check the population_preset name."
+            )
+        elif planets_with_coords == 0:
+            head.append(
+                f"  • {planet_count} planets matched, but NONE have usable RA/Dec, "
+                "so the cone-match had nothing to match against. Ensure "
+                "archive_columns includes 'ra' and 'dec'."
+            )
+        if obs_count == 0:
+            head.append(
+                "  • 0 JWST observations matched your instrument/dataproduct/calib/"
+                f"proposal filters ({active_filters or 'none'}). The MAST search is "
+                "empty — loosen those filters (e.g. DROP calib_levels; JWST science "
+                "is calib_level 3, and calib_level=1 matches almost nothing)."
+            )
+        if planet_count > 0 and planets_with_coords and obs_count > 0:
+            head.append(
+                f"  • Both sides are non-empty ({planet_count} planets, {obs_count} "
+                f"observations) but none fall within {radius_deg} deg of each other. "
+                "Try a LARGER radius_deg (e.g. 0.05), or these two populations "
+                "genuinely do not overlap on-sky."
+            )
+        head.append(
+            "  Do NOT report 'no planets have JWST data' from an empty result "
+            "without identifying which stage above was empty."
+        )
         return "\n".join(head)
 
     head.append(f"Preview — first {min(len(rows), limit)} of {len(rows)} rows:")
@@ -2586,7 +2782,17 @@ def _format_demographic_summary(manifest: dict[str, Any], limit: int = 40) -> st
 class CrossmatchJwstToPlanets(BaseTool):
     """
     Cross-match a JWST demographics search against an Exoplanet-Archive planet
-    population by RA/Dec.
+    population by RA/Dec. (Population pipeline, step 2 of 3.)
+
+    USE WHEN: a population study needs each JWST observation joined to its
+    planet's archive parameters — e.g. "which sub-Neptunes have NIRSpec data,
+    with their radii". Combines a MAST demographics search + an archive TAP
+    query in one call and writes a rows CSV.
+
+    NOT FOR: a single target (use `SearchMastJwstObservations`), just counting
+    rows you already have (use `AggregateJwstObservations`), or a planet-list
+    with no observations (use `FindExoplanetsByCondition`). Feed the output CSV
+    to `AggregateJwstObservations` or `DownloadDemographicJwstProducts`.
 
     Workflow
     --------
@@ -2772,12 +2978,28 @@ class CrossmatchJwstToPlanets(BaseTool):
                 "or population_preset (or both)."
             )
 
+        # The cone-match keys planets on RA/Dec. If the caller's archive_columns
+        # omit them, EVERY planet is silently dropped and the tool reports "no
+        # matches" — a classic false negative. Force ra/dec into the column set.
+        archive_columns = _as_list(self.archive_columns) or list(DEFAULT_ARCHIVE_COLUMNS)
+        for required in ("ra", "dec"):
+            if required not in archive_columns:
+                archive_columns.append(required)
+
         planets = archive_tap_query(
             merged_conditions,
-            columns=self.archive_columns,
+            columns=archive_columns,
             table=archive_table,
             limit=archive_limit,
         )
+
+        def _has_coords(p: dict[str, Any]) -> bool:
+            try:
+                return (_as_float_or_none(p.get("ra"), "ra") is not None
+                        and _as_float_or_none(p.get("dec"), "dec") is not None)
+            except ValueError:
+                return False
+        planets_with_coords = sum(1 for p in planets if _has_coords(p))
 
         observations, _filters = search_all_jwst_observations(
             instruments=self.instruments,
@@ -2829,10 +3051,17 @@ class CrossmatchJwstToPlanets(BaseTool):
             rows,
             planet_count=len(planets),
             obs_count=len(observations),
+            planets_with_coords=planets_with_coords,
             radius_deg=radius_deg,
             csv_path=csv_path,
             preset=population_preset,
             conditions=merged_conditions,
+            obs_filters={
+                "instruments": _as_list(self.instruments),
+                "dataproduct_types": _as_list(self.dataproduct_types),
+                "calib_levels": _as_int_list(self.calib_levels),
+                "proposal_id": proposal_id,
+            },
         )
         if obs_type_line:
             summary += f"\n\n{obs_type_line}"
@@ -2847,8 +3076,14 @@ class CrossmatchJwstToPlanets(BaseTool):
 
 class AggregateJwstObservations(BaseTool):
     """
-    Group JWST rows by one or more keys and count, optionally tracking the
-    distinct values of additional fields per group.
+    Group JWST rows by one or more keys and count. (Population pipeline, step 3 of 3.)
+
+    USE WHEN: the answer is a count or breakdown — "how many planets per
+    instrument", "observations by cycle". Either aggregates a rows CSV from
+    `CrossmatchJwstToPlanets`, or runs its own demographics search first.
+
+    NOT FOR: discovering observations (`SearchMastJwstObservations`) or joining
+    to planet params (`CrossmatchJwstToPlanets`).
 
     Input modes (provide exactly one):
       * ``rows_path`` — path (relative to ``base_directory``) to a CSV or JSON
@@ -3063,8 +3298,13 @@ class AggregateJwstObservations(BaseTool):
 
 class DownloadDemographicJwstProducts(BaseTool):
     """
-    Download JWST products for every planet in a demographic, on disk per
-    planet.
+    Bulk-download JWST products for EVERY planet in a demographic (from a CSV).
+
+    USE WHEN: you have a `CrossmatchJwstToPlanets` rows CSV and want to fetch
+    files for all planets in it at once.
+
+    NOT FOR: one planet or a hand-picked obsid list (use
+    `DownloadMastJwstProducts`), or reduced archive spectra (use `DownloadDataset`).
 
     Reads a crossmatch dump (the CSV/JSON written by
     ``CrossmatchJwstToPlanets`` — must contain ``pl_name`` and ``obsid``
@@ -3164,6 +3404,13 @@ class GetJwstProgramInfo(BaseTool):
     Look up authoritative JWST program metadata — observing Cycle, title, PI,
     proposal type (GO/GTO/DD/CAL), status, exclusive-access period — for one
     or more proposal ids, from STScI's program-info pages.
+
+    USE WHEN: you have a `proposal_id` (e.g. from `SearchMastJwstObservations`)
+    and need its cycle, title, PI, or status.
+
+    NOT FOR: finding observations (use `SearchMastJwstObservations`) or planet
+    parameters (use `GetExoplanetParameters`). Requires a proposal id, not a
+    planet name.
 
     Why this tool exists
     --------------------
