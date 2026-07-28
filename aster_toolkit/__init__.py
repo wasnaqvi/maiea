@@ -18,6 +18,19 @@ _EXPORTS = {
     'AggregateJwstObservations': '.data_acquisition.mast',
     'DownloadDemographicJwstProducts': '.data_acquisition.mast',
     'GetJwstProgramInfo': '.data_acquisition.mast',
+    'DiscoverPatchworkVisits': '.data_reduction.discover',
+    'InspectNirspecG395hUncalData': '.data_reduction.exotedrf',
+    'ReduceNirspecG395hTso': '.data_reduction.exotedrf',
+    'MakeUncalTestSubset': '.data_reduction.exotedrf',
+    'DetectNirspecTiltEvents': '.data_reduction.lightcurves',
+    'FitNirspecG395hWhiteLight': '.data_reduction.juliet',
+    'FitNirspecG395hTransmissionSpectrum': '.data_reduction.juliet',
+    'CombineNirspecG395hVisits': '.data_reduction.juliet',
+    'RunPatchworkTarget': '.data_reduction.survey',
+    'GeneratePatchworkFirJob': '.data_reduction.survey',
+    'OptimizeNirspecG395hReduction': '.data_reduction.optimize',
+    'SummarizeG395hOptimization': '.data_reduction.optimize',
+    'GenerateFirOptimizerJobs': '.data_reduction.optimize',
 }
 
 __all__ = [
@@ -35,6 +48,19 @@ __all__ = [
     'AggregateJwstObservations',
     'DownloadDemographicJwstProducts',
     'GetJwstProgramInfo',
+    'DiscoverPatchworkVisits',
+    'InspectNirspecG395hUncalData',
+    'ReduceNirspecG395hTso',
+    'MakeUncalTestSubset',
+    'DetectNirspecTiltEvents',
+    'FitNirspecG395hWhiteLight',
+    'FitNirspecG395hTransmissionSpectrum',
+    'CombineNirspecG395hVisits',
+    'RunPatchworkTarget',
+    'GeneratePatchworkFirJob',
+    'OptimizeNirspecG395hReduction',
+    'SummarizeG395hOptimization',
+    'GenerateFirOptimizerJobs',
 ]
 
 

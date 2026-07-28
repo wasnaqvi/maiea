@@ -62,7 +62,13 @@ NIRSPEC_DETECTORS = ("NRS1", "NRS2")
 # NRSRAPID). Changing any value here changes the survey definition — bump
 # ``PATCHWORK_CONFIG_VERSION`` if you do, so old and new reductions are
 # never silently mixed in one population analysis.
-PATCHWORK_CONFIG_VERSION = "1.0"
+#
+# v1.1: settings aligned with the validated GJ 9827 d run
+# (workspace/patchwork/GJ_9827d.ipynb): 1/f via 'scale-achromatic',
+# fixed 16-px box extraction (was 'optimize' — a per-target optimized
+# width silently breaks survey uniformity), per-visit baseline_ints
+# computed from the data instead of a fixed [50, -50].
+PATCHWORK_CONFIG_VERSION = "1.1"
 PATCHWORK_G395H_CONFIG: dict[str, Any] = {
     "observing_mode": "NIRSpec/G395H",
     "input_filetag": "uncal",
@@ -82,7 +88,7 @@ PATCHWORK_G395H_CONFIG: dict[str, Any] = {
     "hot_pixel_map": "None",
     "superbias_method": "crds",
     "soss_background_file": "None",
-    "oof_method": "median",       # NIRSpec options: 'median' or 'slope'
+    "oof_method": "scale-achromatic",  # group-level 1/f treatment
     "soss_timeseries": "None",
     "soss_timeseries_o2": "None",
     "outlier_maps": "None",
@@ -122,7 +128,7 @@ PATCHWORK_G395H_CONFIG: dict[str, Any] = {
     "stage2_kwargs": {},
     # --- Stage 3 ---
     "extract_method": "box",
-    "extract_width": "optimize",  # scan widths, minimize white-LC scatter
+    "extract_width": 16,          # fixed survey-wide (= nirspec_mask_width)
     "soss_specprofile": "None",
     "stage3_kwargs": {},
     # --- General ---
@@ -168,6 +174,7 @@ def write_dms_config(
     st_met: float | None = None,
     planet_letter: str = "b",
     output_tag: str = "",
+    baseline_ints: list[int] | None = None,
     overrides: dict[str, Any] | None = None,
 ) -> Path:
     """Write an exoTEDRF run_DMS YAML config from the frozen Patchwork settings.
@@ -189,6 +196,8 @@ def write_dms_config(
             "run_stages": run_stages,
         }
     )
+    if baseline_ints is not None:
+        config["baseline_ints"] = list(baseline_ints)
     if overrides:
         config.update(overrides)
 
@@ -251,6 +260,43 @@ def inspect_uncal_directory(input_dir: str | os.PathLike[str]) -> dict[str, Any]
         entry["missing_segments"] = [s for s in range(1, expected + 1) if s not in found]
         entry["complete"] = expected > 0 and not entry["missing_segments"]
     return report
+
+
+def count_integrations(input_dir: str | os.PathLike[str],
+                       detector: str = "NRS1") -> int:
+    """Total integrations across the uncal segments of one detector."""
+    from astropy.io import fits
+
+    n_seg, n_tot = 0, 0
+    for f in sorted(glob.glob(str(Path(input_dir) / "**" / "*.fits"),
+                              recursive=True)):
+        name = os.path.basename(f)
+        if f"_{detector.lower()}_" not in name or "uncal" not in name:
+            continue
+        try:
+            h = fits.getheader(f)
+        except OSError:
+            continue
+        if h.get("INTEND") and h.get("INTSTART"):
+            n_seg += int(h["INTEND"]) - int(h["INTSTART"]) + 1
+        n_tot = max(n_tot, int(h.get("NINTS", 0)))
+    return n_seg or n_tot
+
+
+def compute_baseline_ints(input_dir: str | os.PathLike[str],
+                          *, fraction: float = 0.20,
+                          min_side: int = 5) -> list[int]:
+    """Per-visit out-of-transit baseline window, ``[n_pre, -n_post]``.
+
+    The survey-uniform *rule* is fractional (20% of the integrations each
+    side, floor of 5), not a fixed count — visits differ in length, so a
+    fixed count is what would actually break uniformity.
+    """
+    n = count_integrations(input_dir, "NRS1") or count_integrations(input_dir, "NRS2")
+    if n == 0:
+        raise FileNotFoundError(f"No uncal files with NINTS found in {input_dir}")
+    side = max(min_side, int(fraction * n))
+    return [side, -side]
 
 
 def make_uncal_subset(
@@ -330,6 +376,7 @@ def run_reduction(
     st_met: float | None = None,
     planet_letter: str = "b",
     crds_cache_path: str | None = None,
+    baseline_ints: list[int] | None = None,
     overrides: dict[str, Any] | None = None,
     log_callback=None,
 ) -> dict[str, Any]:
@@ -348,6 +395,9 @@ def run_reduction(
     crds = crds_cache_path or os.environ.get("CRDS_PATH", DEFAULT_CRDS_CACHE)
     Path(crds).mkdir(parents=True, exist_ok=True)
 
+    if baseline_ints is None:
+        baseline_ints = compute_baseline_ints(input_dir)
+
     python = _exotedrf_python()
     # run_DMS.py executes at import time (reads sys.argv), so locate it by
     # path instead of importing it.
@@ -364,6 +414,7 @@ def run_reduction(
         "output_dir": str(output_dir),
         "config_version": PATCHWORK_CONFIG_VERSION,
         "stages": stages,
+        "baseline_ints": list(baseline_ints),
         "detectors": {},
     }
 
@@ -380,6 +431,7 @@ def run_reduction(
             st_logg=st_logg,
             st_met=st_met,
             planet_letter=planet_letter,
+            baseline_ints=baseline_ints,
             overrides=overrides,
         )
 

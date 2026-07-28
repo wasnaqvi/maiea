@@ -148,6 +148,19 @@ from aster_toolkit import (
     AggregateJwstObservations,
     DownloadDemographicJwstProducts,
     GetJwstProgramInfo,
+    DiscoverPatchworkVisits,
+    InspectNirspecG395hUncalData,
+    ReduceNirspecG395hTso,
+    MakeUncalTestSubset,
+    DetectNirspecTiltEvents,
+    FitNirspecG395hWhiteLight,
+    FitNirspecG395hTransmissionSpectrum,
+    CombineNirspecG395hVisits,
+    RunPatchworkTarget,
+    GeneratePatchworkFirJob,
+    OptimizeNirspecG395hReduction,
+    SummarizeG395hOptimization,
+    GenerateFirOptimizerJobs,
 )
 
 base_directory = 'workspace'
@@ -184,6 +197,21 @@ tools = [
     AggregateJwstObservations(base_directory=base_directory),
     DownloadDemographicJwstProducts(base_directory=base_directory),
     GetJwstProgramInfo(base_directory=base_directory),
+
+    # Patchwork data reduction / fitting tools
+    DiscoverPatchworkVisits(base_directory=base_directory),
+    InspectNirspecG395hUncalData(base_directory=base_directory),
+    ReduceNirspecG395hTso(base_directory=base_directory),
+    MakeUncalTestSubset(base_directory=base_directory),
+    DetectNirspecTiltEvents(base_directory=base_directory),
+    FitNirspecG395hWhiteLight(base_directory=base_directory),
+    FitNirspecG395hTransmissionSpectrum(base_directory=base_directory),
+    CombineNirspecG395hVisits(base_directory=base_directory),
+    RunPatchworkTarget(base_directory=base_directory),
+    GeneratePatchworkFirJob(base_directory=base_directory),
+    OptimizeNirspecG395hReduction(base_directory=base_directory),
+    SummarizeG395hOptimization(base_directory=base_directory),
+    GenerateFirOptimizerJobs(base_directory=base_directory),
 ]
 
 if llm_provider == 'openai':
