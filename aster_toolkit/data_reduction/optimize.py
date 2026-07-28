@@ -70,7 +70,7 @@ except ModuleNotFoundError:
     def StateField(default=None, description=None):
         return default
 
-from .exotedrf import _exotedrf_python, DEFAULT_CRDS_CACHE
+from .exotedrf import _exotedrf_python, exotedrf_version, DEFAULT_CRDS_CACHE
 from .lightcurves import G395H_WAVE_RANGES
 
 PATCHWORK_OPTIMIZER_VERSION = "1.0"
@@ -354,6 +354,11 @@ def run_optimization(
         "config": str(config_path),
         "log": str(log_path),
         "baseline_ints": list(baseline_ints),
+        # The stage code the sweep actually ran against (the checkout,
+        # via the PYTHONPATH shadow). Compare against the 'exotedrf'
+        # entry of any reduction that adopts these parameters — if the
+        # paths differ, the tuning was done on different code.
+        "exotedrf": exotedrf_version(python, extra_pythonpath=repo),
         "returncode": returncode,
         "success": returncode == 0 and cost_path.exists(),
         "cost_table": str(cost_path) if cost_path.exists() else None,

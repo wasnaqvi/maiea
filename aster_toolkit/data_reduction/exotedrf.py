@@ -359,6 +359,59 @@ def _env_python_version(python: str) -> str:
     return result.stdout.strip()
 
 
+def exotedrf_script_path(python: str, script: str = "run_DMS.py",
+                         extra_pythonpath: str | None = None) -> Path:
+    """Locate a script inside the exoTEDRF package of a given interpreter.
+
+    Asks the interpreter where ``exotedrf`` actually lives rather than
+    reconstructing a site-packages path — venv, conda, ``pip --user`` and
+    editable installs all lay that out differently, and a PYTHONPATH
+    shadow (the optimizer checkout) moves it again. ``run_DMS.py`` reads
+    ``sys.argv`` at import time, so it is located by path and never
+    imported here.
+    """
+    env = dict(os.environ)
+    if extra_pythonpath:
+        env["PYTHONPATH"] = extra_pythonpath + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run(
+        [python, "-c",
+         "import exotedrf, os; print(os.path.dirname(exotedrf.__file__))"],
+        capture_output=True, text=True, env=env,
+    )
+    if result.returncode != 0:
+        raise FileNotFoundError(
+            f"Could not import exotedrf with {python}:\n{result.stderr.strip()[-500:]}"
+        )
+    package_dir = Path(result.stdout.strip())
+    path = package_dir / script
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{script} not found in the exotedrf package at {package_dir}."
+        )
+    return path
+
+
+def exotedrf_version(python: str, extra_pythonpath: str | None = None) -> dict[str, str]:
+    """Report which exoTEDRF an interpreter resolves, and from where.
+
+    The reduction and the optimizer must agree on this — parameters tuned
+    against one copy of the stage code are not valid for another.
+    """
+    env = dict(os.environ)
+    if extra_pythonpath:
+        env["PYTHONPATH"] = extra_pythonpath + os.pathsep + env.get("PYTHONPATH", "")
+    code = (
+        "import exotedrf, os, json;"
+        "print(json.dumps({'path': os.path.dirname(exotedrf.__file__),"
+        " 'version': getattr(exotedrf, '__version__', 'unknown')}))"
+    )
+    result = subprocess.run([python, "-c", code], capture_output=True,
+                            text=True, env=env)
+    if result.returncode != 0:
+        raise FileNotFoundError(result.stderr.strip()[-500:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
 def find_stage3_products(root: str | os.PathLike[str]) -> list[str]:
     """Locate extracted stellar-spectra products under a reduction directory."""
     pattern = str(Path(root) / "**" / "*_spectra_fullres.fits")
@@ -399,15 +452,7 @@ def run_reduction(
         baseline_ints = compute_baseline_ints(input_dir)
 
     python = _exotedrf_python()
-    # run_DMS.py executes at import time (reads sys.argv), so locate it by
-    # path instead of importing it.
-    script_path = (
-        Path(python).parent.parent
-        / "lib" / f"python{_env_python_version(python)}" / "site-packages"
-        / "exotedrf" / "run_DMS.py"
-    )
-    if not script_path.exists():
-        raise FileNotFoundError(f"exoTEDRF run_DMS.py not found at {script_path}")
+    script_path = exotedrf_script_path(python, "run_DMS.py")
 
     manifest: dict[str, Any] = {
         "input_dir": str(input_dir),
@@ -415,6 +460,9 @@ def run_reduction(
         "config_version": PATCHWORK_CONFIG_VERSION,
         "stages": stages,
         "baseline_ints": list(baseline_ints),
+        # Which exoTEDRF actually ran. Must match whatever the optimizer
+        # was swept against, or tuned parameters do not transfer.
+        "exotedrf": exotedrf_version(python),
         "detectors": {},
     }
 
