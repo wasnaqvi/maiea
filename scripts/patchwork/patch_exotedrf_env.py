@@ -98,22 +98,21 @@ _BADPIX_NEW = """        if save_results is True and to_flag is not None:
             outfile = self.output_dir + self.fileroot_noseg + 'hot_pixels.npy'
             np.save(outfile, to_flag)"""
 
-_LOOP_OLD = """        all_files = glob.glob(self.output_dir + '*')
-        results = []
-        first_time = True
-        for i, segment in enumerate(self.datafiles):
-            # If an output file for this segment already exists, skip the step.
-            expected_file = self.output_dir + self.fileroots[i] + self.tag"""
+# NOTE: several exoTEDRF step classes share this boilerplate (BackgroundStep
+# has an identical block earlier in the file), so this anchor MUST be applied
+# inside the BadPixStep class only -- a plain str.replace hits BackgroundStep
+# and leaves the real bug in place.
+_LOOP_OLD = """        first_time = True
+        for i, segment in enumerate(self.datafiles):"""
 
-_LOOP_NEW = """        all_files = glob.glob(self.output_dir + '*')
-        results = []
-        first_time = True
-        to_flag = None  # Patchwork: bind before the loop so a fully
-        # resumed step (every segment already on disk) cannot raise
-        # UnboundLocalError at the hot-pixel save below.
-        for i, segment in enumerate(self.datafiles):
-            # If an output file for this segment already exists, skip the step.
-            expected_file = self.output_dir + self.fileroots[i] + self.tag"""
+_LOOP_NEW = """        first_time = True
+        # Patchwork: bind before the loop so a fully resumed step (every
+        # segment already on disk, so the else-branch never runs) cannot
+        # raise UnboundLocalError at the hot-pixel save below.
+        to_flag = None
+        for i, segment in enumerate(self.datafiles):"""
+
+_MARKER = "Patchwork: bind before the loop"
 
 
 def patch_badpixstep_resume() -> str:
@@ -121,18 +120,36 @@ def patch_badpixstep_resume() -> str:
     if pkg is None:
         return "SKIP  exotedrf not importable"
     stage2 = pkg / "stage2.py"
-    text = stage2.read_text()
-    if "Patchwork: bind before the loop" in text:
-        return "OK    BadPixStep resume already patched"
-    if _LOOP_OLD not in text or _BADPIX_OLD not in text:
-        return ("SKIP  BadPixStep source does not match the expected exoTEDRF "
-                "2.3.1 form -- inspect stage2.py by hand before running")
-
     backup = stage2.with_suffix(".py.patchwork-orig")
-    if not backup.exists():
+    text = stage2.read_text()
+
+    # Always rebuild from pristine source. An earlier version of this script
+    # anchored the loop edit with str.replace(..., 1), which patched
+    # BackgroundStep instead of BadPixStep; restoring first repairs that.
+    if backup.exists():
+        text = backup.read_text()
+    else:
         backup.write_text(text)
-    text = text.replace(_LOOP_OLD, _LOOP_NEW, 1)
+
+    if _BADPIX_OLD not in text:
+        return ("SKIP  BadPixStep hot-pixel save does not match the expected "
+                "exoTEDRF 2.3.1 form -- inspect stage2.py by hand")
+
+    # Restrict the loop edit to the BadPixStep class body.
+    cls = text.index("class BadPixStep")
+    head, body = text[:cls], text[cls:]
+    if _LOOP_OLD not in body:
+        return ("SKIP  BadPixStep loop does not match the expected exoTEDRF "
+                "2.3.1 form -- inspect stage2.py by hand")
+    body = body.replace(_LOOP_OLD, _LOOP_NEW, 1)
+    text = head + body
     text = text.replace(_BADPIX_OLD, _BADPIX_NEW, 1)
+
+    # Verify the initialiser really landed inside BadPixStep, before the guard.
+    check = text[text.index("class BadPixStep"):]
+    if not (0 < check.index(_MARKER) < check.index("to_flag is not None")):
+        return "SKIP  patch verification failed -- stage2.py left unchanged"
+
     stage2.write_text(text)
     return f"FIXED BadPixStep resume guard applied (backup: {backup.name})"
 
