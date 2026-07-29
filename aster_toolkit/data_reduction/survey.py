@@ -309,9 +309,16 @@ FIR_SBATCH_TEMPLATE = """\
 #SBATCH --output={output_root}/{slug}/slurm-%x-%j.out
 
 # --- Patchwork on DRAC Fir ---------------------------------------
-module load StdEnv/2023 python/3.11
-source {aster_env}/bin/activate           # env with aster_toolkit + juliet
+# Load the module aster-env was built from. Stages 1-3 run in a separate
+# environment on a different python, so ASTER_EXOTEDRF_PYTHON should point
+# at a wrapper that loads its own module (see docs) rather than straight
+# at the interpreter.
+module load StdEnv/2023 {python_module}
+source {aster_env}/bin/activate           # env with juliet + aster deps
 
+# aster_toolkit is used from the repo checkout, not installed into the env.
+export PYTHONPATH={aster_repo}${{PYTHONPATH:+:$PYTHONPATH}}
+# Stages 1-3 run as a subprocess in the pinned exoTEDRF environment.
 export ASTER_EXOTEDRF_PYTHON={exotedrf_python}
 export CRDS_PATH={crds_path}
 export CRDS_SERVER_URL=https://jwst-crds.stsci.edu
@@ -334,8 +341,10 @@ def write_fir_slurm_script(
     time: str = "24:00:00",
     cpus: int = 8,
     mem: str = "40G",
-    aster_env: str = "~/aster_env",
-    exotedrf_python: str = "~/envs/exotedrf/bin/python",
+    aster_env: str = "~/aster/aster-env",
+    aster_repo: str = "~/aster/maiea",
+    python_module: str = "python/3.13",
+    exotedrf_python: str = "~/bin/exotedrf-python",
     crds_path: str = "~/scratch/crds_cache",
     exotic_ld_data: str = "~/scratch/exotic_ld_data",
     steps: str = "inspect,reduce,fit,combine",
@@ -349,7 +358,8 @@ def write_fir_slurm_script(
     slug = _slug(manifest["planet_name"])
     script = FIR_SBATCH_TEMPLATE.format(
         account=account, slug=slug, time=time, cpus=cpus, mem=mem,
-        output_root=output_root, aster_env=aster_env,
+        output_root=output_root, aster_env=aster_env, aster_repo=aster_repo,
+        python_module=python_module,
         exotedrf_python=exotedrf_python, crds_path=crds_path,
         exotic_ld_data=exotic_ld_data,
         manifest_path=os.path.abspath(manifest_path), steps=steps,
@@ -495,12 +505,23 @@ class GeneratePatchworkFirJob(BaseTool):
     cpus: int = RuntimeField(default=8, description="CPUs per task.")
     mem: str = RuntimeField(default="40G", description="Memory request.")
     aster_env: str = RuntimeField(
-        default="~/aster_env",
-        description="Path on Fir to the venv with aster_toolkit + juliet.",
+        default="~/aster/aster-env",
+        description="Path on Fir to the venv with juliet and the aster deps.",
+    )
+    aster_repo: str = RuntimeField(
+        default="~/aster/maiea",
+        description="Path on Fir to the repo containing aster_toolkit/ "
+                    "(exported as PYTHONPATH).",
+    )
+    python_module: str = RuntimeField(
+        default="python/3.13",
+        description="Module providing the python that aster_env was built from.",
     )
     exotedrf_python: str = RuntimeField(
-        default="~/envs/exotedrf/bin/python",
-        description="Path on Fir to the pinned exoTEDRF environment's python.",
+        default="~/bin/exotedrf-python",
+        description="Path on Fir to the exoTEDRF interpreter. Prefer a wrapper "
+                    "that module-loads its own python, since that env runs a "
+                    "different python version than aster_env.",
     )
     steps: str = RuntimeField(
         default="inspect,reduce,fit,combine",
@@ -520,6 +541,8 @@ class GeneratePatchworkFirJob(BaseTool):
             cpus=self.cpus,
             mem=self.mem,
             aster_env=self.aster_env,
+            aster_repo=self.aster_repo,
+            python_module=self.python_module,
             exotedrf_python=self.exotedrf_python,
             steps=self.steps,
         )

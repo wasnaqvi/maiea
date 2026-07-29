@@ -512,9 +512,10 @@ FIR_OPTIMIZER_SBATCH_TEMPLATE = """\
 
 # --- Patchwork optimizer (Class-2 rule) on DRAC Fir -----------------
 # One visit x one detector per job; NRS1/NRS2 are independent sweeps.
-module load StdEnv/2023 python/3.11
-source {aster_env}/bin/activate           # env with aster_toolkit
+module load StdEnv/2023 {python_module}
+source {aster_env}/bin/activate
 
+export PYTHONPATH={aster_repo}${{PYTHONPATH:+:$PYTHONPATH}}
 export ASTER_EXOTEDRF_PYTHON={exotedrf_python}
 export ASTER_EXOTEDRF_REPO={exotedrf_repo}   # git pull of the optimizer branch
 export CRDS_PATH={crds_path}
@@ -539,8 +540,10 @@ def write_fir_optimizer_slurm_scripts(
     time: str = "3-00:00:00",
     cpus: int = 16,
     mem: str = "64G",
-    aster_env: str = "~/aster_env",
-    exotedrf_python: str = "~/envs/exotedrf/bin/python",
+    aster_env: str = "~/aster/aster-env",
+    aster_repo: str = "~/aster/maiea",
+    python_module: str = "python/3.13",
+    exotedrf_python: str = "~/bin/exotedrf-python",
     exotedrf_repo: str = "~/exoTEDRF",
     crds_path: str = "~/scratch/crds_cache",
     script_dir: str | os.PathLike[str] | None = None,
@@ -563,7 +566,9 @@ def write_fir_optimizer_slurm_scripts(
             script = FIR_OPTIMIZER_SBATCH_TEMPLATE.format(
                 account=account, slug=slug, visit=visit, det=det.lower(),
                 time=time, cpus=cpus, mem=mem, output_root=output_root,
-                aster_env=aster_env, exotedrf_python=exotedrf_python,
+                aster_env=aster_env, aster_repo=aster_repo,
+                python_module=python_module,
+                exotedrf_python=exotedrf_python,
                 exotedrf_repo=exotedrf_repo, crds_path=crds_path,
                 manifest_path=os.path.abspath(str(manifest_path)),
             )
@@ -795,11 +800,21 @@ class GenerateFirOptimizerJobs(BaseTool):
     cpus: int = RuntimeField(default=16, description="CPUs per task.")
     mem: str = RuntimeField(default="64G", description="Memory request.")
     aster_env: str = RuntimeField(
-        default="~/aster_env", description="Fir path to the ASTER venv."
+        default="~/aster/aster-env", description="Fir path to the ASTER venv."
+    )
+    aster_repo: str = RuntimeField(
+        default="~/aster/maiea",
+        description="Fir path to the repo containing aster_toolkit/ "
+                    "(exported as PYTHONPATH).",
+    )
+    python_module: str = RuntimeField(
+        default="python/3.13",
+        description="Module providing the python that aster_env was built from.",
     )
     exotedrf_python: str = RuntimeField(
-        default="~/envs/exotedrf/bin/python",
-        description="Fir path to the pinned exoTEDRF env python.",
+        default="~/bin/exotedrf-python",
+        description="Fir path to the exoTEDRF interpreter (prefer a wrapper "
+                    "that module-loads its own python).",
     )
     exotedrf_repo: str = RuntimeField(
         default="~/exoTEDRF",
@@ -823,6 +838,8 @@ class GenerateFirOptimizerJobs(BaseTool):
             cpus=self.cpus,
             mem=self.mem,
             aster_env=self.aster_env,
+            aster_repo=self.aster_repo,
+            python_module=self.python_module,
             exotedrf_python=self.exotedrf_python,
             exotedrf_repo=self.exotedrf_repo,
         )
