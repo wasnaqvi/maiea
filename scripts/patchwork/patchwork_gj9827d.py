@@ -186,8 +186,15 @@ def phase_reduce(raw_root: str, visits: dict, detectors: list) -> dict:
                             force_redo=False, output_tag=tag,
                             do_plot=True, show_plot=False)
 
+            # PCAReconstructStep is a diagnostic-only TSO-stability step and
+            # it crashes in exoTEDRF 2.3.1 against sklearn >= 1.3: it feeds a
+            # 3D array to PCA.inverse_transform, which accepts <= 2D. Nothing
+            # downstream needs it -- TracingStep computes its own deep frame
+            # when deepframe is None -- so it is skipped, matching
+            # PATCHWORK_G395H_CONFIG in aster_toolkit.
             s2 = run_stage2(s1, mode=MODE, baseline_ints=bl,
                             nirspec_mask_width=MASK_W, generate_lc=True,
+                            skip_steps=['PCAReconstructStep'],
                             save_results=True, force_redo=False,
                             output_tag=tag, do_plot=True, show_plot=False)
 

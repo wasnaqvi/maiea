@@ -24,6 +24,10 @@ PHASE=${PHASE:-all}          # override at submit: sbatch --export=PHASE=fit ...
 
 export CRDS_PATH=~/scratch/crds_cache
 export CRDS_SERVER_URL=https://jwst-crds.stsci.edu
+# Pin the reference context: an unpinned CRDS resolves to "latest", so two
+# targets reduced weeks apart could silently use different reference files
+# and no longer be a uniform survey. Matches the optimizer template.
+export CRDS_CONTEXT=jwst_1322.pmap
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 mkdir -p "$WORKDIR"
