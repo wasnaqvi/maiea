@@ -192,13 +192,20 @@ def phase_reduce(raw_root: str, visits: dict, detectors: list) -> dict:
             # downstream needs it -- TracingStep computes its own deep frame
             # when deepframe is None -- so it is skipped, matching
             # PATCHWORK_G395H_CONFIG in aster_toolkit.
-            s2 = run_stage2(s1, mode=MODE, baseline_ints=bl,
-                            nirspec_mask_width=MASK_W, generate_lc=True,
-                            skip_steps=['PCAReconstructStep'],
-                            save_results=True, force_redo=False,
-                            output_tag=tag, do_plot=True, show_plot=False)
+            # run_stage2 returns (results, centroids) -- it must be unpacked,
+            # and the TracingStep centroids handed to Stage 3, exactly as
+            # exoTEDRF's own run_DMS.py does (run_DMS.py:173, 192). Passing
+            # the raw tuple makes Stage 3 fail in sort_datamodels with
+            # "inhomogeneous shape ... (2,)".
+            s2, centroids = run_stage2(
+                s1, mode=MODE, baseline_ints=bl,
+                nirspec_mask_width=MASK_W, generate_lc=True,
+                skip_steps=['PCAReconstructStep'],
+                save_results=True, force_redo=False,
+                output_tag=tag, do_plot=True, show_plot=False)
 
             run_stage3(s2, extract_method="box", extract_width=MASK_W,
+                       centroids=centroids,
                        planet_letter="d", st_teff=SYS["teff"],
                        st_logg=SYS["logg"], st_met=SYS["feh"],
                        save_results=True, force_redo=False, output_tag=tag,
