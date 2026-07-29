@@ -1,0 +1,31 @@
+#!/bin/bash
+# Wrapper: run the pinned exoTEDRF interpreter under ITS OWN python module.
+#
+# aster-env is python 3.13 (orchestral requires it); the exoTEDRF env is
+# python 3.11. A job runs with the 3.13 module loaded, so spawning the
+# 3.11 interpreter directly can pick up mismatched PATH/LD_LIBRARY_PATH
+# from the parent. This wrapper resets the module environment for the
+# child only, leaving the parent's untouched.
+#
+# Install once on Fir:
+#     mkdir -p ~/bin
+#     cp ~/aster/maiea/scripts/patchwork/exotedrf-python ~/bin/
+#     chmod +x ~/bin/exotedrf-python
+#     export ASTER_EXOTEDRF_PYTHON=~/bin/exotedrf-python
+#
+# Everything in aster_toolkit invokes this as a plain interpreter
+# ("$PY" -c ..., "$PY" script.py args, "$PY" -m module), so it is a
+# drop-in replacement for the interpreter path.
+
+set -euo pipefail
+
+EXOTEDRF_PYTHON="${EXOTEDRF_PYTHON:-$HOME/envs/exotedrf/bin/python}"
+EXOTEDRF_MODULE="${EXOTEDRF_MODULE:-python/3.11}"
+
+if command -v module >/dev/null 2>&1; then
+    # Module output must never reach stdout: callers parse it.
+    { module --force purge && module load StdEnv/2023 "$EXOTEDRF_MODULE"; } \
+        >/dev/null 2>&1 || true
+fi
+
+exec "$EXOTEDRF_PYTHON" "$@"
