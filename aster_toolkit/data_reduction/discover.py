@@ -291,7 +291,7 @@ def resolve_planet_from_rows(
     ``confident`` flag true only when exactly one candidate matches.
     """
     result: dict[str, Any] = {"matches": [], "host_planets": [],
-                              "confident": False, "note": ""}
+                              "untestable": [], "confident": False, "note": ""}
     if not rows:
         result["note"] = "No archive planet at this pointing."
         return result
@@ -303,12 +303,17 @@ def resolve_planet_from_rows(
     half_window_hr = 0.5 * (t_end - t_start) * 24
 
     for row in rows:
+        # A planet with no archive ephemeris cannot be tested at all. It is
+        # NOT evidence against that planet — record it, so a lone surviving
+        # candidate is not mistaken for a positive identification.
         try:
             period = float(row["pl_orbper"])
             tranmid = float(row["pl_tranmid"])
         except (TypeError, ValueError, KeyError):
+            result["untestable"].append(row["pl_name"])
             continue
         if period <= 0:
+            result["untestable"].append(row["pl_name"])
             continue
         try:
             duration_hr = float(row["pl_trandur"])
@@ -433,6 +438,7 @@ def build_manifests(
         res = resolve_planet_from_rows(rows, v["expstart_mjd"], v["expend_mjd"])
         v["host_planets"] = res["host_planets"]
         v["planet_matches"] = res["matches"]
+        v["untestable_planets"] = res.get("untestable", [])
         v["resolution_note"] = query_error or res["note"]
         if res["confident"]:
             v["planet_name"] = res["matches"][0]["pl_name"]
@@ -544,6 +550,19 @@ def format_discovery_report(result: dict[str, Any]) -> str:
             f"{dets:<10} {str(v['planet_name'] or '—'):<14} "
             f"{v.get('planet_source', '?')}{flag}"
         )
+
+    untested = [v for v in visits
+                if v.get("planet_name") and v.get("untestable_planets")]
+    if untested:
+        lines.append("")
+        lines.append("Identified, but some host planets had NO archive "
+                     "ephemeris and could not be tested — the ID rests on the "
+                     "remaining candidates only:")
+        for v in untested:
+            lines.append(
+                f"  {v['visit_prefix']} -> {v['planet_name']}   "
+                f"untestable: {', '.join(v['untestable_planets'])}"
+            )
 
     ambiguous = [v for v in visits if v.get("planet_source") == "ambiguous"]
     if ambiguous:

@@ -1,11 +1,16 @@
 #!/bin/bash
-# Wrapper: run the pinned exoTEDRF interpreter under ITS OWN python module.
+# Wrapper: run the pinned exoTEDRF interpreter in a correctly set-up
+# environment, independent of whatever the caller has loaded.
 #
-# aster-env is python 3.13 (orchestral requires it); the exoTEDRF env is
-# python 3.11. A job runs with the 3.13 module loaded, so spawning the
-# 3.11 interpreter directly can pick up mismatched PATH/LD_LIBRARY_PATH
-# from the parent. This wrapper resets the module environment for the
-# child only, leaving the parent's untouched.
+# Two problems this solves on DRAC Fir:
+#
+#  1. aster-env is python 3.13 (orchestral requires it), the exoTEDRF env
+#     is python 3.11. A job runs with the 3.13 module loaded, so the 3.11
+#     child would otherwise inherit a mismatched PATH/LD_LIBRARY_PATH.
+#  2. An Alliance virtualenv must be ACTIVATED. Invoking
+#     <venv>/bin/python directly leaves the venv's site-packages off
+#     sys.path on a compute node — "ModuleNotFoundError: numpy" even
+#     though the package is installed.
 #
 # Install once on Fir:
 #     mkdir -p ~/bin
@@ -13,19 +18,32 @@
 #     chmod +x ~/bin/exotedrf-python
 #     export ASTER_EXOTEDRF_PYTHON=~/bin/exotedrf-python
 #
-# Everything in aster_toolkit invokes this as a plain interpreter
-# ("$PY" -c ..., "$PY" script.py args, "$PY" -m module), so it is a
-# drop-in replacement for the interpreter path.
+# aster_toolkit invokes this as a plain interpreter ("$PY" -c ...,
+# "$PY" script.py args, "$PY" -m module), so it is a drop-in replacement
+# for the interpreter path.
 
 set -euo pipefail
 
-EXOTEDRF_PYTHON="${EXOTEDRF_PYTHON:-$HOME/envs/exotedrf/bin/python}"
-EXOTEDRF_MODULE="${EXOTEDRF_MODULE:-python/3.11}"
+EXOTEDRF_ENV="${EXOTEDRF_ENV:-$HOME/envs/exotedrf}"
+# Space-separated; deliberately unquoted below so it word-splits.
+# opencv is required: stcal.jump imports cv2 at module level and Alliance
+# provides it only as a module, never as an installable wheel.
+EXOTEDRF_MODULES="${EXOTEDRF_MODULES:-python/3.11.5 opencv/4.12.0}"
 
 if command -v module >/dev/null 2>&1; then
     # Module output must never reach stdout: callers parse it.
-    { module --force purge && module load StdEnv/2023 "$EXOTEDRF_MODULE"; } \
+    # PYTHONPATH is intentionally left alone -- the opencv module puts
+    # cv2 there, so clearing it would undo the load.
+    # shellcheck disable=SC2086
+    { module purge && module load StdEnv/2023 $EXOTEDRF_MODULES; } \
         >/dev/null 2>&1 || true
 fi
 
-exec "$EXOTEDRF_PYTHON" "$@"
+if [[ -f "$EXOTEDRF_ENV/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$EXOTEDRF_ENV/bin/activate"
+    exec python "$@"
+fi
+
+# Not a virtualenv (e.g. a conda env or a bare interpreter path).
+exec "${EXOTEDRF_PYTHON:-$EXOTEDRF_ENV/bin/python}" "$@"

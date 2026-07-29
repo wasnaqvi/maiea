@@ -343,7 +343,7 @@ def write_fir_slurm_script(
     mem: str = "40G",
     aster_env: str = "~/aster/aster-env",
     aster_repo: str = "~/aster/maiea",
-    python_module: str = "python/3.13",
+    python_module: str = "python/3.13.2",
     exotedrf_python: str = "~/bin/exotedrf-python",
     crds_path: str = "~/scratch/crds_cache",
     exotic_ld_data: str = "~/scratch/exotic_ld_data",
@@ -514,7 +514,7 @@ class GeneratePatchworkFirJob(BaseTool):
                     "(exported as PYTHONPATH).",
     )
     python_module: str = RuntimeField(
-        default="python/3.13",
+        default="python/3.13.2",
         description="Module providing the python that aster_env was built from.",
     )
     exotedrf_python: str = RuntimeField(
