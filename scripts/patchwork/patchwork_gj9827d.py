@@ -217,16 +217,40 @@ def phase_reduce(raw_root: str, visits: dict, detectors: list) -> dict:
     return products
 
 
+def pipeline_dir(tag: str) -> str:
+    """Reproduce exoTEDRF's output-directory naming exactly.
+
+    exoTEDRF prepends its own separator to a non-empty output_tag
+    (stage1.py: ``if output_tag != '': output_tag = '_' + output_tag``),
+    so a tag that already starts with '_' produces a DOUBLED underscore.
+    Constructing this by hand instead of mirroring that rule is how the
+    fit phase ended up looking in a directory that never existed.
+    """
+    return "pipeline_outputs_directory" + ("_" + tag if tag else "")
+
+
 def find_spectra(tag: str, det: str) -> str | None:
     """Locate the Stage 3 product for one visit x detector in the workdir."""
-    hits = glob.glob(os.path.join(
-        f"pipeline_outputs_directory{tag}", "Stage3",
-        f"*_{det}_box_spectra_fullres.fits"))
-    if not hits:  # exoTEDRF has varied the detector case across versions
-        hits = glob.glob(os.path.join(
-            f"pipeline_outputs_directory{tag}", "Stage3",
-            "*box_spectra_fullres.fits"))
-    return hits[0] if hits else None
+    # exoTEDRF writes the detector lowercase (GJ9827_nrs1_box_...), but the
+    # case has varied across versions, so try both explicitly before falling
+    # back to a detector-agnostic glob.
+    patterns = [
+        os.path.join(pipeline_dir(tag), "Stage3",
+                     f"*_{det.lower()}_box_spectra_fullres.fits"),
+        os.path.join(pipeline_dir(tag), "Stage3",
+                     f"*_{det.upper()}_box_spectra_fullres.fits"),
+        # Safe because each tag directory holds exactly one detector.
+        os.path.join(pipeline_dir(tag), "Stage3",
+                     "*box_spectra_fullres.fits"),
+        # Last resort: tolerate any separator convention.
+        os.path.join(f"pipeline_outputs_directory*{tag.lstrip('_')}",
+                     "Stage3", "*box_spectra_fullres.fits"),
+    ]
+    for pattern in patterns:
+        hits = sorted(glob.glob(pattern))
+        if hits:
+            return hits[0]
+    return None
 
 
 # ------------------------------------------------------ lightcurves
@@ -526,7 +550,7 @@ def phase_fit(raw_root: str, visits: dict, detectors: list,
             spectra = find_spectra(tag, det)
             if spectra is None:
                 print(f"!! no Stage 3 spectra for {vname} {det} "
-                      f"(expected under pipeline_outputs_directory{tag}) "
+                      f"(expected under {pipeline_dir(tag)}/Stage3/) "
                       "— run --phase reduce first. Skipping.")
                 continue
             lc = build_lightcurves(spectra, det, bl)
