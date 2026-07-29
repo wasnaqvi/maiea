@@ -56,6 +56,11 @@ except ModuleNotFoundError:
 
 DEFAULT_EXOTEDRF_PYTHON = "/opt/anaconda3/envs/exotedrf/bin/python"
 DEFAULT_CRDS_CACHE = str(Path.home() / "crds_cache")
+# Pinned reference context. Part of the survey definition: an unpinned CRDS
+# resolves to "latest", so two targets reduced weeks apart could use
+# different reference files. The pip build of run_DMS.py has no
+# crds_context config key, so this is set via the environment instead.
+CRDS_CONTEXT = "jwst_1322.pmap"
 NIRSPEC_DETECTORS = ("NRS1", "NRS2")
 
 # Frozen Patchwork reduction settings for NIRSpec/G395H BOTS (SUB2048,
@@ -147,9 +152,166 @@ def _exotedrf_python() -> str:
         raise FileNotFoundError(
             f"exoTEDRF python not found at {python}. Install the pinned "
             "environment (conda create -n exotedrf python=3.11; "
-            "pip install 'exotedrf[stage4]') or set ASTER_EXOTEDRF_PYTHON."
+            "pip install 'exotedrf[stage4]') or set ASTER_EXOTEDRF_PYTHON.\n"
+            "On an HPC cluster whose environments are virtualenvs (e.g. DRAC), "
+            "point ASTER_EXOTEDRF_PYTHON at a wrapper that ACTIVATES the venv "
+            "and module-loads its python/opencv -- see "
+            "scripts/patchwork/exotedrf-python. Calling <venv>/bin/python "
+            "directly leaves site-packages off sys.path on a compute node."
         )
     return python
+
+
+# Checks run inside the exoTEDRF environment. Each entry hard-won from a
+# real failure on DRAC Fir; see scripts/patchwork/patch_exotedrf_env.py.
+_ENV_CHECK_SCRIPT = r"""
+import json, os, sys
+report = {"python": sys.executable,
+          "version": "%d.%d.%d" % sys.version_info[:3],
+          "checks": [], "packages": {}}
+
+def check(name, fatal, fn):
+    try:
+        detail = fn()
+        report["checks"].append({"name": name, "ok": True, "fatal": fatal,
+                                 "detail": detail or ""})
+    except Exception as exc:
+        report["checks"].append({"name": name, "ok": False, "fatal": fatal,
+                                 "detail": "%s: %s" % (type(exc).__name__, exc)})
+
+def _numpy():
+    import numpy
+    report["packages"]["numpy"] = numpy.__version__
+    major = int(numpy.__version__.split(".")[0])
+    if major >= 2:
+        raise RuntimeError(
+            "numpy %s is too new; jwst 1.17.1 requires <2.0. "
+            "Fix: pip install --no-index 'numpy<2'" % numpy.__version__)
+    return numpy.__version__
+
+def _jwst():
+    import jwst
+    report["packages"]["jwst"] = getattr(jwst, "__version__", "?")
+    # jwst/stpipe/core.py imports this at module level; the +computecanada
+    # wheel omits it.
+    from jwst import __version_commit__  # noqa: F401
+    return report["packages"]["jwst"]
+
+def _crds_locate():
+    import crds
+    report["packages"]["crds"] = getattr(crds, "__version__", "?")
+    # Fails when CRDS is newer than the stdatamodels jwst permits.
+    from crds.jwst import locate  # noqa: F401
+    return report["packages"]["crds"]
+
+def _cv2():
+    # stcal.jump imports cv2 at module level, so JumpStep cannot run without
+    # it. On DRAC it comes from the opencv MODULE, never from pip.
+    import cv2
+    report["packages"]["cv2"] = cv2.__version__
+    return cv2.__file__
+
+def _stages():
+    from exotedrf.stage1 import run_stage1  # noqa: F401
+    from exotedrf.stage2 import run_stage2  # noqa: F401
+    from exotedrf.stage3 import run_stage3  # noqa: F401
+    import exotedrf, os as _os
+    report["packages"]["exotedrf"] = _os.path.dirname(exotedrf.__file__)
+    return report["packages"]["exotedrf"]
+
+def _run_dms():
+    import exotedrf, os as _os
+    p = _os.path.join(_os.path.dirname(exotedrf.__file__), "run_DMS.py")
+    if not _os.path.exists(p):
+        raise FileNotFoundError(p)
+    return p
+
+def _badpix_resume():
+    # exoTEDRF 2.3.1 raises UnboundLocalError when BadPixStep is fully
+    # resumed (every segment already on disk). Non-fatal for a fresh run,
+    # fatal for any rerun -- which is the normal mode under a walltime.
+    import exotedrf, os as _os, re
+    src = open(_os.path.join(_os.path.dirname(exotedrf.__file__),
+                             "stage2.py")).read()
+    body = src[src.index("class BadPixStep"):]
+    body = body[:body.index("class ", 10)] if "class " in body[10:] else body
+    if "to_flag = None" not in body.split("for i, segment")[0]:
+        raise RuntimeError(
+            "BadPixStep cannot be resumed (to_flag unbound). "
+            "Fix: python scripts/patchwork/patch_exotedrf_env.py")
+    return "resume guard present"
+
+def _pandas():
+    import pandas
+    report["packages"]["pandas"] = pandas.__version__
+    return pandas.__version__
+
+check("numpy < 2",            True,  _numpy)
+check("pandas",               True,  _pandas)
+check("jwst.__version_commit__", True, _jwst)
+check("crds.jwst.locate",     True,  _crds_locate)
+check("cv2 (JumpStep)",       True,  _cv2)
+check("exotedrf stages 1-3",  True,  _stages)
+check("run_DMS.py present",   True,  _run_dms)
+check("BadPixStep resumable", False, _badpix_resume)
+
+print("PATCHWORK_ENV_JSON " + json.dumps(report))
+"""
+
+
+def verify_exotedrf_environment(python: str | None = None,
+                                timeout: float = 300.0) -> dict[str, Any]:
+    """Preflight the exoTEDRF environment before committing hours of compute.
+
+    Runs every check inside the target interpreter in ONE subprocess and
+    returns a structured report. Each check corresponds to a failure mode
+    that has actually cost a job on DRAC Fir: numpy 2.x against jwst
+    1.17.1, a CRDS newer than the permitted stdatamodels, missing cv2
+    (JumpStep imports it at module level), the missing
+    ``jwst.__version_commit__`` in the +computecanada wheel, and the
+    exoTEDRF BadPixStep resume bug.
+    """
+    python = python or _exotedrf_python()
+    result = subprocess.run([python, "-c", _ENV_CHECK_SCRIPT],
+                            capture_output=True, text=True, timeout=timeout)
+
+    report: dict[str, Any] = {"python": python, "checks": [], "packages": {}}
+    for line in result.stdout.splitlines():
+        if line.startswith("PATCHWORK_ENV_JSON "):
+            report.update(json.loads(line[len("PATCHWORK_ENV_JSON "):]))
+            break
+    else:
+        report["checks"] = [{
+            "name": "interpreter runs", "ok": False, "fatal": True,
+            "detail": (result.stderr.strip()[-800:] or
+                       "no output from the environment check"),
+        }]
+
+    report["fatal_failures"] = [c for c in report["checks"]
+                                if not c["ok"] and c["fatal"]]
+    report["warnings"] = [c for c in report["checks"]
+                          if not c["ok"] and not c["fatal"]]
+    report["ok"] = not report["fatal_failures"]
+    return report
+
+
+def format_environment_report(report: dict[str, Any]) -> str:
+    lines = [f"exoTEDRF environment: {report['python']}"]
+    if report.get("version"):
+        lines.append(f"  python {report['version']}")
+    for name, value in sorted(report.get("packages", {}).items()):
+        lines.append(f"  {name:<12} {value}")
+    lines.append("")
+    for c in report["checks"]:
+        mark = "OK   " if c["ok"] else ("FAIL " if c["fatal"] else "WARN ")
+        lines.append(f"  {mark}{c['name']}")
+        if not c["ok"] or (c["detail"] and not c["ok"]):
+            for detail_line in str(c["detail"]).splitlines():
+                lines.append(f"         {detail_line}")
+    lines.append("")
+    lines.append("READY — safe to launch a reduction." if report["ok"]
+                 else "NOT READY — fix the FAIL items before launching.")
+    return "\n".join(lines)
 
 
 def _yaml_scalar(value: Any) -> str:
@@ -429,8 +591,10 @@ def run_reduction(
     st_met: float | None = None,
     planet_letter: str = "b",
     crds_cache_path: str | None = None,
+    crds_context: str = CRDS_CONTEXT,
     baseline_ints: list[int] | None = None,
     overrides: dict[str, Any] | None = None,
+    preflight: bool = True,
     log_callback=None,
 ) -> dict[str, Any]:
     """Run the uniform exoTEDRF Stage 1-3 reduction for one observation.
@@ -452,6 +616,22 @@ def run_reduction(
         baseline_ints = compute_baseline_ints(input_dir)
 
     python = _exotedrf_python()
+
+    # Preflight before committing hours of compute. Every check here maps to
+    # a failure that has already killed a job mid-reduction; finding them in
+    # seconds beats finding them after Stage 1.
+    if preflight:
+        env_report = verify_exotedrf_environment(python)
+        if not env_report["ok"]:
+            raise RuntimeError(
+                "exoTEDRF environment is not usable:\n\n"
+                + format_environment_report(env_report)
+            )
+        for warning in env_report["warnings"]:
+            print(f"[patchwork] WARNING: {warning['name']} — {warning['detail']}")
+    else:
+        env_report = None
+
     script_path = exotedrf_script_path(python, "run_DMS.py")
 
     manifest: dict[str, Any] = {
@@ -463,6 +643,11 @@ def run_reduction(
         # Which exoTEDRF actually ran. Must match whatever the optimizer
         # was swept against, or tuned parameters do not transfer.
         "exotedrf": exotedrf_version(python),
+        # Reference-file context actually in force. Unpinned CRDS resolves
+        # to "latest", so targets reduced weeks apart would silently use
+        # different reference files and no longer form a uniform survey.
+        "crds_context": crds_context,
+        "environment": env_report,
         "detectors": {},
     }
 
@@ -487,6 +672,8 @@ def run_reduction(
         env = dict(os.environ)
         env["CRDS_PATH"] = crds
         env["CRDS_SERVER_URL"] = "https://jwst-crds.stsci.edu"
+        if crds_context:
+            env["CRDS_CONTEXT"] = crds_context
 
         with log_path.open("w") as log:
             process = subprocess.Popen(
@@ -698,6 +885,42 @@ class ReduceNirspecG395hTso(BaseTool):
             planet_letter=self.planet_letter,
         )
         return _format_reduction_manifest(manifest)
+
+
+class VerifyPatchworkEnvironment(BaseTool):
+    """
+    Preflight the pinned exoTEDRF environment before committing hours of
+    compute to a reduction. Runs in seconds.
+
+    Checks, inside the exoTEDRF interpreter itself: numpy is <2 (jwst
+    1.17.1 breaks on 2.x), pandas present, ``jwst.__version_commit__``
+    importable (absent from some vendor wheels), ``crds.jwst.locate``
+    importable (fails when CRDS is newer than the stdatamodels jwst
+    permits), cv2 importable (stcal.jump imports it at module level, so
+    JumpStep cannot run without it), exoTEDRF Stages 1-3 importable,
+    run_DMS.py present, and the exoTEDRF BadPixStep resume guard applied.
+
+    Every one of these corresponds to a failure that has actually killed
+    a Patchwork job mid-reduction. Run it after building or changing an
+    environment, and after any pip install — pip silently reverts patched
+    files.
+
+    Fixes for anything reported are in
+    ``scripts/patchwork/patch_exotedrf_env.py``.
+
+    Example
+    -------
+        VerifyPatchworkEnvironment()
+    """
+
+    base_directory: str = StateField()
+
+    def _run(self) -> str:
+        try:
+            report = verify_exotedrf_environment()
+        except FileNotFoundError as exc:
+            return f"Cannot locate the exoTEDRF interpreter.\n{exc}"
+        return format_environment_report(report)
 
 
 class MakeUncalTestSubset(BaseTool):

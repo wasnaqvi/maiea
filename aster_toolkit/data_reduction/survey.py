@@ -56,6 +56,7 @@ except ModuleNotFoundError:
         return default
 
 from .exotedrf import (
+    CRDS_CONTEXT,
     inspect_uncal_directory,
     run_reduction,
 )
@@ -322,8 +323,17 @@ export PYTHONPATH={aster_repo}${{PYTHONPATH:+:$PYTHONPATH}}
 export ASTER_EXOTEDRF_PYTHON={exotedrf_python}
 export CRDS_PATH={crds_path}
 export CRDS_SERVER_URL=https://jwst-crds.stsci.edu
+# Pin the reference context so targets reduced weeks apart stay uniform.
+export CRDS_CONTEXT={crds_context}
 export ASTER_EXOTIC_LD_DATA={exotic_ld_data}
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+# Fail in seconds rather than hours if the exoTEDRF environment regressed
+# (pip installs silently revert the compatibility patches).
+python -c "
+from aster_toolkit.data_reduction.exotedrf import verify_exotedrf_environment, format_environment_report
+r = verify_exotedrf_environment(); print(format_environment_report(r))
+raise SystemExit(0 if r['ok'] else 1)" || exit 1
 
 python -m aster_toolkit.data_reduction.survey \\
     --manifest {manifest_path} \\
@@ -346,6 +356,7 @@ def write_fir_slurm_script(
     python_module: str = "python/3.13.2",
     exotedrf_python: str = "~/bin/exotedrf-python",
     crds_path: str = "~/scratch/crds_cache",
+    crds_context: str = CRDS_CONTEXT,
     exotic_ld_data: str = "~/scratch/exotic_ld_data",
     steps: str = "inspect,reduce,fit,combine",
 ) -> Path:
@@ -361,7 +372,7 @@ def write_fir_slurm_script(
         output_root=output_root, aster_env=aster_env, aster_repo=aster_repo,
         python_module=python_module,
         exotedrf_python=exotedrf_python, crds_path=crds_path,
-        exotic_ld_data=exotic_ld_data,
+        crds_context=crds_context, exotic_ld_data=exotic_ld_data,
         manifest_path=os.path.abspath(manifest_path), steps=steps,
     )
     path = Path(script_path) if script_path else (

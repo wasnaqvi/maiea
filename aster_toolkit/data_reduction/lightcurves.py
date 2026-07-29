@@ -209,6 +209,35 @@ def build_lightcurves(
             "ephemeris/duration or baseline_ints."
         )
 
+    # The transit must actually be in the data. If a stale ephemeris (or an
+    # unconverted MJD time axis) puts the propagated mid-transit outside the
+    # observation, every fit still "succeeds" -- but the Rp/Rs posterior is
+    # just the prior, giving a plausible-looking spectrum with error bars
+    # larger than the signal. Fail here, in milliseconds, rather than after
+    # ~100 nested-sampling runs.
+    half_window_hr = 0.5 * (float(np.nanmax(time)) - float(np.nanmin(time))) * 24
+    t_centre = 0.5 * (float(np.nanmin(time)) + float(np.nanmax(time)))
+    offset_hr = (t0_obs - t_centre) * 24
+    reach_hr = half_window_hr + 0.5 * (duration_hr or 0.0)
+    if abs(offset_hr) > reach_hr:
+        raise ValueError(
+            f"Propagated mid-transit is {offset_hr:+.2f} h from the centre of "
+            f"a {2 * half_window_hr:.2f} h observation — the transit is NOT in "
+            f"this data, so a fit would return the Rp/Rs prior rather than a "
+            f"measurement.\n"
+            f"  t0_obs = {t0_obs:.5f} BJD; data span {float(np.nanmin(time)):.5f} "
+            f"to {float(np.nanmax(time)):.5f}.\n"
+            f"  Check the ephemeris is current (a stale reference epoch "
+            f"propagated over many periods drifts by hours) and that the time "
+            f"axis is BJD, not MJD."
+        )
+    transit_coverage = (
+        min(1.0, max(0.0,
+            (min(offset_hr + 0.5 * duration_hr, half_window_hr)
+             - max(offset_hr - 0.5 * duration_hr, -half_window_hr)) / duration_hr))
+        if duration_hr else None
+    )
+
     def _normalize(f: np.ndarray, e: np.ndarray):
         base = np.nanmedian(f[oot], axis=0)
         return f / base, e / base
@@ -225,6 +254,7 @@ def build_lightcurves(
         "detector": detector.upper(),
         "time": time,
         "t0_obs": t0_obs,
+        "transit_coverage": transit_coverage,
         "oot_mask": oot,
         "wl_flux": wl_flux,
         "wl_err": wl_err,

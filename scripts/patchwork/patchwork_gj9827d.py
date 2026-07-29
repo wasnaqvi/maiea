@@ -63,13 +63,21 @@ NLIVE_WL = 400       # live points, white-light
 NLIVE_SP = 250       # live points, per spectroscopic channel
 BASELINE_FRAC = 0.20  # out-of-transit fraction per side
 
-# GJ 9827 d system parameters (NASA Exoplanet Archive).
+# GJ 9827 d system parameters (NASA Exoplanet Archive, pscomppars,
+# retrieved 2026-07-29).
+#
+# Use a RECENT reference epoch. The previous values here (t0 =
+# 2457740.96115, per = 6.20146980) were a 2016 epoch with a period 3.6e-4 d
+# from the current best fit; propagating that 440 epochs forward to 2024
+# accumulated ~3.8 h of error and put the model transit outside the
+# observation entirely. The archive epoch below is only ~33 epochs away.
 SYS = dict(
-    per=6.20146980,          # days
-    t0=2457740.96115,        # BJD_TDB reference epoch (propagated per visit)
+    per=6.20183000,          # days
+    t0=2460265.10196,        # BJD_TDB reference epoch (propagated per visit)
+    dur=1.2264,              # transit duration, hours
     inc=87.443,              # deg
-    rprs=0.03073,            # -> depth ~945 ppm
-    ars=20.003,
+    rprs=0.03093,            # -> depth ~957 ppm
+    ars=19.739,
     ecc=0.0,
     omega=90.0,
     teff=4340.0,
@@ -255,10 +263,62 @@ def find_spectra(tag: str, det: str) -> str | None:
 
 # ------------------------------------------------------ lightcurves
 
+MJD_TO_BJD_OFFSET = 2400000.5
+
+
+def to_bjd(time: np.ndarray) -> np.ndarray:
+    """exoTEDRF writes the Time extension in MJD; ephemerides are BJD.
+
+    Without this the propagated mid-transit lands up to half a period from
+    the data and the fit sees no transit at all -- it returns the Rp/Rs
+    prior, which looks like a plausible spectrum with enormous error bars.
+    """
+    time = np.asarray(time, dtype=float)
+    return time + MJD_TO_BJD_OFFSET if np.nanmedian(time) < 1e6 else time
+
+
 def propagate_t0(time: np.ndarray) -> float:
+    """Propagate the reference epoch to the transit nearest this visit.
+    ``time`` must already be BJD (see ``to_bjd``)."""
     tmid = float(np.nanmedian(np.asarray(time, dtype=float)))
     n = round((tmid - SYS["t0"]) / SYS["per"])
     return SYS["t0"] + n * SYS["per"]
+
+
+def check_transit_in_window(time: np.ndarray, t0_obs: float,
+                            label: str) -> float:
+    """Fail loudly if the propagated transit does not overlap the data.
+
+    A transit outside the observation is the single most expensive silent
+    failure in this pipeline: every fit still 'succeeds', but the Rp/Rs
+    posterior is just the prior (median depth ~1800 ppm, errors ~1500 ppm)
+    and the transmission spectrum is meaningless. Catch it in milliseconds
+    instead of after ~110 nested-sampling runs.
+    """
+    t = np.asarray(time, dtype=float)
+    tmid = 0.5 * (np.nanmin(t) + np.nanmax(t))
+    half_window_hr = 0.5 * (np.nanmax(t) - np.nanmin(t)) * 24
+    offset_hr = (t0_obs - tmid) * 24
+    reach_hr = half_window_hr + 0.5 * SYS["dur"]
+    if abs(offset_hr) > reach_hr:
+        raise SystemExit(
+            f"\n!! {label}: propagated mid-transit is {offset_hr:+.2f} h from "
+            f"the centre of a {2 * half_window_hr:.2f} h observation — the "
+            f"transit is NOT in this data.\n"
+            f"   t0_obs = {t0_obs:.5f}, data span "
+            f"{np.nanmin(t):.5f} to {np.nanmax(t):.5f} (BJD).\n"
+            f"   Fitting would return the Rp/Rs prior, not a measurement.\n"
+            f"   Check: (a) the SYS ephemeris is current — a stale epoch "
+            f"propagated over many periods drifts hours; (b) times were "
+            f"converted MJD -> BJD.\n"
+        )
+    coverage = min(1.0, max(0.0,
+                   (min(offset_hr + 0.5 * SYS["dur"], half_window_hr)
+                    - max(offset_hr - 0.5 * SYS["dur"], -half_window_hr))
+                   / SYS["dur"]))
+    print(f"   {label}: mid-transit {offset_hr:+.2f} h from window centre, "
+          f"{coverage * 100:.0f}% of the transit covered")
+    return coverage
 
 
 def bin_at_resolution(wave, flux, err, res=RES):
@@ -297,14 +357,15 @@ def bin_at_resolution(wave, flux, err, res=RES):
             np.column_stack(fbins), np.column_stack(ebins))
 
 
-def build_lightcurves(spectra_file: str, det: str, bl: list[int]) -> dict:
+def build_lightcurves(spectra_file: str, det: str, bl: list[int],
+                      label: str = "") -> dict:
     """White + spectroscopic lightcurves, normalized by the
     out-of-transit baseline (a global median would be biased low by the
     transit itself)."""
     wave = np.asarray(fits.getdata(spectra_file, 1), dtype=float)
     flux = np.asarray(fits.getdata(spectra_file, 3), dtype=float)
     err = np.asarray(fits.getdata(spectra_file, 4), dtype=float)
-    time = np.asarray(fits.getdata(spectra_file, 5), dtype=float)
+    time = to_bjd(fits.getdata(spectra_file, 5))
     if wave.ndim == 2:
         wave = np.nanmedian(wave, axis=0)
 
@@ -327,7 +388,9 @@ def build_lightcurves(spectra_file: str, det: str, bl: list[int]) -> dict:
     sp_flux, sp_err = normalize(bf, be)
 
     oot = np.concatenate([wl_flux[pre], wl_flux[post]])
-    return dict(time=time, t0_obs=propagate_t0(time),
+    t0_obs = propagate_t0(time)
+    coverage = check_transit_in_window(time, t0_obs, label)
+    return dict(time=time, t0_obs=t0_obs, transit_coverage=coverage,
                 wl_flux=wl_flux, wl_err=wl_err,
                 wave=bw, wave_err=bwe, sp_flux=sp_flux, sp_err=sp_err,
                 oot_scatter_ppm=float(np.nanstd(oot) * 1e6))
@@ -553,7 +616,7 @@ def phase_fit(raw_root: str, visits: dict, detectors: list,
                       f"(expected under {pipeline_dir(tag)}/Stage3/) "
                       "— run --phase reduce first. Skipping.")
                 continue
-            lc = build_lightcurves(spectra, det, bl)
+            lc = build_lightcurves(spectra, det, bl, f"{vname} {det}")
             print(f"{vname} {det}: {lc['time'].size} ints, {lc['wave'].size} "
                   f"channels, wl oot scatter={lc['oot_scatter_ppm']:.0f} ppm, "
                   f"t0_obs={lc['t0_obs']:.5f}", flush=True)

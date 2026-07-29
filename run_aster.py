@@ -149,6 +149,7 @@ from aster_toolkit import (
     DownloadDemographicJwstProducts,
     GetJwstProgramInfo,
     DiscoverPatchworkVisits,
+    VerifyPatchworkEnvironment,
     InspectNirspecG395hUncalData,
     ReduceNirspecG395hTso,
     MakeUncalTestSubset,
@@ -200,6 +201,7 @@ tools = [
 
     # Patchwork data reduction / fitting tools
     DiscoverPatchworkVisits(base_directory=base_directory),
+    VerifyPatchworkEnvironment(base_directory=base_directory),
     InspectNirspecG395hUncalData(base_directory=base_directory),
     ReduceNirspecG395hTso(base_directory=base_directory),
     MakeUncalTestSubset(base_directory=base_directory),
