@@ -55,14 +55,40 @@ adjudicates every flag you raise.
 
 ## PATHS
 
-| what | where |
-|---|---|
-| repo | `/home/wasi/aster/maiea` |
-| job scripts | `/home/wasi/patchwork/jobs/run_<SLUG>.sbatch` |
-| manifests | `/home/wasi/patchwork/manifests/<SLUG>.json` |
-| output root | `/home/wasi/scratch/patchwork` (PURGED PERIODICALLY) |
-| durable archive | `/project/def-ncowan/wasi/patchwork_reductions` |
-| exoTEDRF engine | `/home/wasi/exoTEDRF` (the `optimizer` branch) |
+| what | absolute path (use with the shell tool) | workspace link (use with ReadFileTool) |
+|---|---|---|
+| repo | `/home/wasi/aster/maiea` | — |
+| this brief + generator | `/home/wasi/aster/maiea/scripts/patchwork` | `patchwork_scripts/` |
+| job scripts | `/home/wasi/patchwork/jobs/run_<SLUG>.sbatch` | `jobs/` |
+| manifests | `/home/wasi/patchwork/manifests/<SLUG>.json` | `manifests/` |
+| output root | `/home/wasi/scratch/patchwork` (PURGED PERIODICALLY) | `results/` |
+| durable archive | `/project/def-ncowan/wasi/patchwork_reductions` | — |
+| exoTEDRF engine | `/home/wasi/exoTEDRF` (the `optimizer` branch) | — |
+
+### TOOL ACCESS — which tool reaches what
+
+`ReadFileTool`, `EditFileTool`, and `FileSearchTool` are **sandboxed to
+`workspace/`**: they reject any path resolving outside it, including
+absolute ones. `RunCommandTool` is **not** restricted — it is a real
+shell and reaches the whole filesystem. So:
+
+- **Reading products** (`patchwork_summary.json`,
+  `white_fit_summary.json`, `reduction_manifest.json`): use
+  `ReadFileTool` with the **workspace link** path, e.g.
+  `results/GJ_9827_d/patchwork_summary.json`.
+- **Everything else** — `sbatch`, `squeue`, `sacct`, `ls`, `rsync`, and
+  running the generator: use `RunCommandTool` with **absolute paths**.
+
+If a workspace link is missing, recreate it (links live under
+`workspace/`, which is gitignored, so a fresh checkout will not have
+them):
+
+```
+ln -sfn /home/wasi/aster/maiea/scripts/patchwork /home/wasi/aster/maiea/workspace/patchwork_scripts
+ln -sfn /home/wasi/patchwork/manifests /home/wasi/aster/maiea/workspace/manifests
+ln -sfn /home/wasi/patchwork/jobs      /home/wasi/aster/maiea/workspace/jobs
+ln -sfn /home/wasi/scratch/patchwork   /home/wasi/aster/maiea/workspace/results
+```
 
 ---
 
