@@ -465,6 +465,22 @@ def build_manifests(
         # figures can be labelled without re-reading headers; a planet
         # observed by two programs (K2-18 b) lists both.
         programs = sorted({f"GO {int(v['program'])}" for v in vs})
+
+        # Cache the archive ephemeris/orbit/stellar priors in the manifest.
+        # The fit still queries the archive at fit time (so priors cannot go
+        # stale), but compute nodes without internet fall back to this cache,
+        # and the cached (Rp/Rs)^2 is the expected-depth sanity check.
+        priors_cache = None
+        if resolve:
+            try:
+                from .juliet import fetch_transit_priors
+
+                priors_cache = fetch_transit_priors(planet)
+                priors_cache["_cached_utc"] = __import__("datetime").datetime.utcnow().strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                priors_cache = None
+
         manifests[planet] = {
             "planet_name": planet,
             "planet_letter": letter,
@@ -478,6 +494,7 @@ def build_manifests(
                 }
                 for v in sorted(vs, key=lambda v: v["visit_prefix"])
             },
+            "priors": priors_cache,
             "_provenance": {
                 "planet_source": vs[0].get("planet_source"),
                 "host_planets": vs[0].get("host_planets", []),

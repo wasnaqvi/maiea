@@ -508,7 +508,9 @@ FIR_OPTIMIZER_SBATCH_TEMPLATE = """\
 #SBATCH --time={time}
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --mem={mem}
-#SBATCH --output={output_root}/{slug}/optimizer/slurm-%x-%j.out
+# Submission-directory log: an --output path under the (not yet created)
+# output_root would leave the job with no log at all.
+#SBATCH --output=%x-%j.out
 
 # --- Patchwork optimizer (Class-2 rule) on DRAC Fir -----------------
 # One visit x one detector per job; NRS1/NRS2 are independent sweeps.

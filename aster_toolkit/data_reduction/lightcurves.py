@@ -44,7 +44,9 @@ except ModuleNotFoundError:
         return default
 
 
-PATCHWORK_STAGE4_VERSION = "1.0"
+# 1.1: final bin edge clipped to the wavelength cut (the last channel's
+# centre used to be reported outside the detector range).
+PATCHWORK_STAGE4_VERSION = "1.1"
 
 N_REFPIX_COLS = 5             # detector reference columns trimmed each edge
 DEFAULT_RESOLUTION = 100      # constant-R spectroscopic binning
@@ -130,6 +132,10 @@ def bin_at_resolution(wave: np.ndarray, flux: np.ndarray, flux_err: np.ndarray,
         e = [lo]
         while e[-1] < hi:
             e.append(e[-1] * (1 + 1.0 / resolution))
+        # Clip the final edge to the wavelength cut: otherwise the last
+        # channel's reported centre lies outside [lo, hi] even though its
+        # flux only comes from columns inside the cut.
+        e[-1] = hi
         edges = np.asarray(e)
 
     centers, half_widths, fbins, ebins = [], [], [], []
@@ -340,6 +346,100 @@ def trace_diagnostics(calints_files: list[str]) -> dict[str, np.ndarray]:
     }
 
 
+def pca_regressors(calints_files: list[str], *, n_components: int = 6,
+                   max_pixels: int = 1000) -> np.ndarray:
+    """COMPASS-style PCA systematics regressors from Stage 2 calints.
+
+    Following the COMPASS uniform reanalysis (Ahrer et al. 2025,
+    arXiv:2511.18196): the principal components of the *relative pixel
+    flux* timeseries RPF_ij(t) = F_ij(t) / sum_ij F_ij(t) trace changes
+    in the shape and position of the spectral trace that x/y-shift
+    regressors miss. Used as linear regressors they substantially reduce
+    red noise, most strongly on NRS1 and for few-group observations.
+
+    Deviation from the paper, for memory: the PCA runs on the
+    ``max_pixels`` brightest pixels (median flux) rather than every
+    pixel — a 21k-integration TSO over a full subarray would need >10 GB
+    otherwise, and the trace morphology signal lives in the bright
+    pixels. Each pixel series is mean-subtracted and variance-normalized
+    before the SVD; the returned temporal components (nints,
+    n_components) are ready for ``build_regressor_matrix``.
+    """
+    from astropy.io import fits
+
+    chunks = []
+    for f in calints_files:
+        with fits.open(f) as hdul:
+            cube = np.asarray(hdul["SCI"].data, dtype=float)
+        cube = np.where(np.isfinite(cube), cube, 0.0)
+        chunks.append(cube.reshape(cube.shape[0], -1))
+    X = np.concatenate(chunks, axis=0)                    # (nints, npix)
+
+    total = X.sum(axis=1, keepdims=True)
+    total[total == 0] = np.nan
+    X = X / total                                         # relative pixel flux
+
+    bright = np.argsort(np.nanmedian(X, axis=0))[::-1][:max_pixels]
+    X = X[:, bright]
+    X = X - np.nanmean(X, axis=0, keepdims=True)
+    std = np.nanstd(X, axis=0, keepdims=True)
+    std[std == 0] = 1.0
+    X = np.where(np.isfinite(X / std), X / std, 0.0)
+
+    # Temporal principal components: left singular vectors of (nints, npix).
+    U, s, _ = np.linalg.svd(X, full_matrices=False)
+    k = min(n_components, U.shape[1])
+    comps = U[:, :k] * s[:k]                              # scaled scores
+    # Standardize each component so the frozen theta priors apply.
+    med = np.nanmedian(comps, axis=0, keepdims=True)
+    mad = 1.4826 * np.nanmedian(np.abs(comps - med), axis=0, keepdims=True)
+    mad[mad == 0] = 1.0
+    return (comps - med) / mad
+
+
+def rednoise_beta(residuals: np.ndarray, time: np.ndarray,
+                  *, min_minutes: float = 5.0,
+                  max_minutes: float = 30.0) -> dict[str, float]:
+    """Time-correlated (red) noise diagnostic for a fit residual series.
+
+    Classic Pont, Zucker & Queloz (2006) beta: bin the residuals at a
+    range of timescales and compare the binned rms to the white-noise
+    expectation rms_1 / sqrt(n). beta ~ 1 means the errors are honest;
+    beta > 1 means depth uncertainties are underestimated by that
+    factor. The COMPASS G395H reanalysis finds real errors run ~5-12%
+    above the photon prediction, so recording this per fit is the
+    cheapest way to know when a target needs its error bars inflated.
+
+    Returns {"beta_median", "beta_max", "rms_unbinned_ppm"} with beta
+    evaluated over bins spanning ``min_minutes`` to ``max_minutes``.
+    """
+    r = np.asarray(residuals, dtype=float)
+    good = np.isfinite(r)
+    r = r[good]
+    t = np.asarray(time, dtype=float)[good]
+    if r.size < 50:
+        return {"beta_median": float("nan"), "beta_max": float("nan"),
+                "rms_unbinned_ppm": float("nan")}
+    rms1 = float(np.std(r))
+    cadence_min = float(np.median(np.diff(t))) * 24 * 60
+    betas = []
+    for minutes in np.linspace(min_minutes, max_minutes, 8):
+        n = max(2, int(round(minutes / cadence_min)))
+        if n >= r.size // 3:
+            break
+        m = r.size // n
+        binned = r[: m * n].reshape(m, n).mean(axis=1)
+        expected = rms1 / np.sqrt(n) * np.sqrt(m / max(1, m - 1))
+        if expected > 0:
+            betas.append(float(np.std(binned) / expected))
+    if not betas:
+        return {"beta_median": float("nan"), "beta_max": float("nan"),
+                "rms_unbinned_ppm": rms1 * 1e6}
+    return {"beta_median": float(np.median(betas)),
+            "beta_max": float(np.max(betas)),
+            "rms_unbinned_ppm": rms1 * 1e6}
+
+
 # -------------------- tilt events --------------------
 
 
@@ -356,8 +456,9 @@ def detect_tilt_events(
     At each interior integration i, compare the median of ``window``
     points after i to the median of ``window`` points before; a step
     exceeding ``threshold`` robust sigma (MAD of the difference series)
-    is an event. ``exclude_mask`` (True = ignore, e.g. in-transit points)
-    keeps ingress/egress from being flagged as steps.
+    is an event. ``exclude_mask`` is a KEEP mask (True = use this point;
+    False = ignore it, e.g. in-transit points) — pass the out-of-transit
+    mask so ingress/egress is never flagged as a step.
 
     Returns a list of ``{"index", "amplitude"}`` (amplitude in relative
     flux, positive = brightening), strongest first, merged so events are
@@ -412,12 +513,15 @@ def build_regressor_matrix(
     time: np.ndarray,
     diagnostics: dict[str, np.ndarray] | None = None,
     tilt_events: list[dict[str, float]] | None = None,
+    pca_components: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Assemble the juliet ``linear_regressors_lc`` matrix.
 
     Columns (each standardized to zero median / unit robust scale, so the
     frozen theta priors are comparable across targets):
-    time slope, [trace x, trace y, FWHM], [one step per tilt event].
+    time slope, [trace x, trace y, FWHM], [one step per tilt event],
+    [optional PCA components from ``pca_regressors`` — enabling these
+    changes the fit definition, see PATCHWORK_FIT_VERSION in juliet.py].
     Returns (matrix, column_names).
     """
     def _standardize(v: np.ndarray) -> np.ndarray:
@@ -439,6 +543,12 @@ def build_regressor_matrix(
     for j in range(steps.shape[1]):
         cols.append(steps[:, j])  # keep 0/1 — amplitude is the fit coefficient
         names.append(f"tilt_step_{j}")
+    if pca_components is not None and np.asarray(pca_components).size:
+        pca = np.asarray(pca_components, dtype=float)
+        if pca.shape[0] == time.size:
+            for j in range(pca.shape[1]):
+                cols.append(np.where(np.isfinite(pca[:, j]), pca[:, j], 0.0))
+                names.append(f"pca_{j}")
     return np.column_stack(cols), names
 
 

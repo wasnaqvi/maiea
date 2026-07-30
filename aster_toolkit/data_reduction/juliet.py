@@ -56,7 +56,9 @@ from .lightcurves import (
     detect_tilt_events,
     find_stage2_calints,
     load_stage3_spectra,
+    pca_regressors,
     propagate_t0,
+    rednoise_beta,
     trace_diagnostics,
 )
 
@@ -251,6 +253,94 @@ def compute_ld_coeffs(
             "q1": float(np.clip(q1, 0, 1)), "q2": float(np.clip(q2, 0, 1))}
 
 
+def compute_ld_coeffs_batch(
+    st_teff: float, st_logg: float, st_met: float,
+    ranges: list[tuple[float, float]],
+) -> list[dict[str, float] | None]:
+    """Quadratic -> Kipping LD coefficients for MANY wavelength ranges in
+    one pass. The per-channel loop in ``fit_transmission_spectrum`` used
+    to spawn one exoTEDRF-env subprocess per channel (~53 per detector,
+    each reloading the stellar grids from disk); this builds the
+    ``StellarLimbDarkening`` object once and evaluates every range.
+
+    Returns one entry per range, None where the computation failed
+    (-> uniform priors for that channel).
+    """
+    if any(a is None for a in (st_teff, st_logg, st_met)) or not ranges:
+        return [None] * len(ranges)
+
+    def _u_to_q(u1: float, u2: float) -> dict[str, float]:
+        s = u1 + u2
+        q1 = s**2
+        q2 = u1 / (2 * s) if s != 0 else 0.5
+        return {"u1": float(u1), "u2": float(u2),
+                "q1": float(np.clip(q1, 0, 1)),
+                "q2": float(np.clip(q2, 0, 1))}
+
+    def _in_process():
+        from exotic_ld import StellarLimbDarkening
+
+        sld = StellarLimbDarkening(
+            M_H=st_met, Teff=st_teff, logg=st_logg,
+            ld_model=LD_MODEL, ld_data_path=_ld_data_path(),
+        )
+        out = []
+        for w0, w1 in ranges:
+            try:
+                u1, u2 = sld.compute_quadratic_ld_coeffs(
+                    wavelength_range=[w0 * 1e4, w1 * 1e4], mode=LD_MODE)
+                out.append((float(u1), float(u2)))
+            except Exception:
+                out.append(None)
+        return out
+
+    def _subprocess():
+        from .exotedrf import _exotedrf_python
+
+        script = (
+            "import json, sys\n"
+            "from exotic_ld import StellarLimbDarkening\n"
+            "teff, logg, met, path = (float(sys.argv[1]), float(sys.argv[2]),\n"
+            "                         float(sys.argv[3]), sys.argv[4])\n"
+            "ranges = json.loads(sys.argv[5])\n"
+            f"sld = StellarLimbDarkening(M_H=met, Teff=teff, logg=logg,\n"
+            f"                           ld_model='{LD_MODEL}', ld_data_path=path)\n"
+            "out = []\n"
+            "for w0, w1 in ranges:\n"
+            "    try:\n"
+            "        u1, u2 = sld.compute_quadratic_ld_coeffs(\n"
+            f"            wavelength_range=[w0 * 1e4, w1 * 1e4], mode='{LD_MODE}')\n"
+            "        out.append([float(u1), float(u2)])\n"
+            "    except Exception:\n"
+            "        out.append(None)\n"
+            "print('LD_BATCH_JSON ' + json.dumps(out))\n"
+        )
+        result = subprocess.run(
+            [_exotedrf_python(), "-c", script,
+             str(st_teff), str(st_logg), str(st_met), _ld_data_path(),
+             json.dumps([[float(a), float(b)] for a, b in ranges])],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-500:])
+        for line in result.stdout.splitlines():
+            if line.startswith("LD_BATCH_JSON "):
+                return [tuple(v) if v else None
+                        for v in json.loads(line[len("LD_BATCH_JSON "):])]
+        raise RuntimeError("no LD_BATCH_JSON line in subprocess output")
+
+    pairs = None
+    for attempt in (_in_process, _subprocess):
+        try:
+            pairs = attempt()
+            break
+        except Exception:
+            continue
+    if pairs is None:
+        return [None] * len(ranges)
+    return [_u_to_q(*p) if p is not None else None for p in pairs]
+
+
 def _ld_prior_entries(instrument: str, ld: dict[str, float] | None) -> dict[str, dict]:
     """Truncated-normal (q1, q2) priors when ExoTiC-LD coefficients are
     available, uniform otherwise."""
@@ -373,9 +463,14 @@ def fit_white_lightcurve(
     results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
 
     posterior = results.posteriors["posterior_samples"]
+    # PCA detrending is not part of frozen v1.1 — stamp the version so
+    # PCA and non-PCA fits can never be silently mixed in one analysis.
+    fit_version = PATCHWORK_FIT_VERSION
+    if any(str(n).startswith("pca_") for n in (regressor_names or [])):
+        fit_version = f"{PATCHWORK_FIT_VERSION}+pca"
     summary: dict[str, Any] = {
         "instrument": instrument,
-        "fit_version": PATCHWORK_FIT_VERSION,
+        "fit_version": fit_version,
         "regressor_names": list(regressor_names or []),
         "ld_source": "exotic-ld" if ld is not None else "uniform",
         "ld_coeffs": ld,
@@ -398,7 +493,39 @@ def fit_white_lightcurve(
                             "minus": float(d[0] - d[1]), "plus": float(d[2] - d[0])}
 
     model = results.lc.evaluate(instrument)
-    summary["residual_rms_ppm"] = float(np.nanstd(lc["wl_flux"] - model) * 1e6)
+    residual = lc["wl_flux"] - model
+    summary["residual_rms_ppm"] = float(np.nanstd(residual) * 1e6)
+    # Red-noise diagnostic (Pont+2006 beta over 5-30 min bins). COMPASS
+    # finds real G395H errors run ~5-12% above the photon prediction;
+    # beta_median >> 1 here means this target's depth errors need
+    # inflating before population-level use.
+    summary["rednoise"] = rednoise_beta(residual, times)
+
+    # Sanity check against the archive depth: the prior-returning-fit
+    # failure mode produces ~1800 ppm with ~1500 ppm errors regardless of
+    # target. The transit-in-window guard removes the known cause, but a
+    # depth or uncertainty wildly inconsistent with (Rp/Rs)^2 from the
+    # archive should still be flagged loudly, not discovered in a paper.
+    rp_rs = priors.get("rp_rs")
+    if rp_rs:
+        expected_ppm = float(rp_rs) ** 2 * 1e6
+        measured = summary["depth_ppm"]["median"]
+        err = max(summary["depth_ppm"]["plus"], summary["depth_ppm"]["minus"])
+        suspect = bool(err > 0.5 * expected_ppm
+                       or abs(measured - expected_ppm)
+                       > max(5 * err, 0.5 * expected_ppm))
+        summary["depth_check"] = {
+            "expected_ppm_from_archive": expected_ppm,
+            "measured_ppm": measured,
+            "err_ppm": err,
+            "suspect": suspect,
+        }
+        if suspect:
+            print(f"[patchwork] WARNING ({instrument} {visit}): white-light "
+                  f"depth {measured:.0f} +/- {err:.0f} ppm vs archive "
+                  f"expectation {expected_ppm:.0f} ppm — check the fit "
+                  "before using this spectrum (see depth_check in "
+                  "white_fit_summary.json).")
 
     _plot_white_fit(
         results, lc, instrument, out,
@@ -566,6 +693,18 @@ def fit_transmission_spectrum(
 
     use_ld = stellar is not None and white_summary.get("ld_source") == "exotic-ld"
 
+    # One LD computation for every channel up front (single grid load)
+    # instead of one subprocess per channel.
+    channel_ld: list[dict[str, float] | None] = [None] * lc["wave"].size
+    if use_ld:
+        ranges = [
+            (float(lc["wave"][i] - lc["wave_err"][i]),
+             float(lc["wave"][i] + lc["wave_err"][i]))
+            for i in range(lc["wave"].size)
+        ]
+        channel_ld = compute_ld_coeffs_batch(
+            stellar["st_teff"], stellar["st_logg"], stellar["st_met"], ranges)
+
     rows = []
     for i in range(lc["wave"].size):
         f, e = lc["sp_flux"][:, i], lc["sp_err"][:, i]
@@ -573,12 +712,7 @@ def fit_transmission_spectrum(
         if good.sum() < 50:
             continue
 
-        ld = None
-        if use_ld:
-            w0 = lc["wave"][i] - lc["wave_err"][i]
-            w1 = lc["wave"][i] + lc["wave_err"][i]
-            ld = compute_ld_coeffs(stellar["st_teff"], stellar["st_logg"],
-                                   stellar["st_met"], w0, w1)
+        ld = channel_ld[i]
 
         prior_dict: dict[str, dict[str, Any]] = {
             key: {"distribution": "fixed", "hyperparameters": value}
@@ -717,27 +851,79 @@ def _plot_spectrum(rows: list[dict[str, float]], out: Path,
 # -------------------- Stage 6: visit combination + metrics --------------
 
 
-def combine_visit_spectra(csv_paths: list[str]) -> dict[str, np.ndarray]:
-    """Inverse-variance combine per-visit spectra (same binning scheme ->
-    same wavelength grid required). rms column: median across visits."""
+def combine_visit_spectra(csv_paths: list[str],
+                          *, match_rtol: float = 1e-3) -> dict[str, np.ndarray]:
+    """Inverse-variance combine per-visit spectra of one detector.
+
+    Visits reduced with the same Patchwork binning scheme share their
+    wavelength *edges*, but a channel can drop out of one visit and not
+    another (a bad column makes ``bin_at_resolution`` skip that bin), so
+    the per-visit grids are aligned channel-by-channel (centres matched
+    to ``match_rtol`` relative tolerance) rather than required to be
+    identical. Channels missing from a visit are combined from the
+    visits that do have them; ``n_visits_per_channel`` records how many
+    contributed to each. Truly incompatible grids (different binning
+    scheme, so essentially no channels align) still raise.
+    """
     specs = [read_spectrum_csv(p) for p in csv_paths]
-    ref = specs[0]["wave"]
-    for s in specs[1:]:
-        if s["wave"].size != ref.size or not np.allclose(s["wave"], ref, rtol=1e-4):
-            raise ValueError(
-                "Visit spectra are on different wavelength grids — they must "
-                "come from the same Patchwork binning scheme."
-            )
-    D = np.vstack([s["depth_ppm"] for s in specs])
-    E = np.vstack([s["depth_err_ppm"] for s in specs])
-    R = np.vstack([s["rms_ppm"] for s in specs])
+    if len(specs) == 1:
+        s = specs[0]
+        return {"wave": s["wave"], "wave_err": s["wave_err"],
+                "depth_ppm": s["depth_ppm"], "depth_err_ppm": s["depth_err_ppm"],
+                "rms_ppm": s["rms_ppm"], "n_visits": 1,
+                "n_visits_per_channel": np.ones(s["wave"].size, dtype=int)}
+
+    # Union grid: cluster channel centres across visits.
+    ref_waves: list[float] = []
+    for s in specs:
+        for w in s["wave"]:
+            if not any(abs(w - r) <= match_rtol * r for r in ref_waves):
+                ref_waves.append(float(w))
+    ref = np.asarray(sorted(ref_waves))
+
+    n_ch = ref.size
+    D = np.full((len(specs), n_ch), np.nan)
+    E = np.full((len(specs), n_ch), np.nan)
+    R = np.full((len(specs), n_ch), np.nan)
+    W = np.full(n_ch, np.nan)
+    matched_per_visit = []
+    for k, s in enumerate(specs):
+        matched = 0
+        for j, w in enumerate(s["wave"]):
+            i = int(np.argmin(np.abs(ref - w)))
+            if abs(ref[i] - w) <= match_rtol * w:
+                D[k, i], E[k, i], R[k, i] = (s["depth_ppm"][j],
+                                             s["depth_err_ppm"][j],
+                                             s["rms_ppm"][j])
+                if np.isnan(W[i]):
+                    W[i] = s["wave_err"][j]
+                matched += 1
+        matched_per_visit.append(matched)
+
+    # Same binning scheme -> visits overlap on nearly every channel. If
+    # fewer than half the union channels have >= 2 visits contributing,
+    # the grids do not actually align (different binning scheme).
+    n_contrib = np.isfinite(E).sum(axis=0)
+    if (n_contrib >= 2).sum() < 0.5 * n_ch:
+        raise ValueError(
+            "Visit spectra are on different wavelength grids (fewer than "
+            "half the channels align across visits) — they must come from "
+            "the same Patchwork binning scheme."
+        )
+
     with np.errstate(divide="ignore", invalid="ignore"):
         w = 1.0 / E**2
-        depth = np.nansum(D * w, axis=0) / np.nansum(w, axis=0)
-        err = np.sqrt(1.0 / np.nansum(w, axis=0))
-    return {"wave": ref, "wave_err": specs[0]["wave_err"],
+        w[~np.isfinite(w)] = 0.0
+        wsum = w.sum(axis=0)
+        depth = np.where(wsum > 0,
+                         np.nansum(np.where(w > 0, D, 0.0) * w, axis=0)
+                         / np.where(wsum > 0, wsum, 1.0), np.nan)
+        err = np.where(wsum > 0, np.sqrt(1.0 / np.where(wsum > 0, wsum, 1.0)),
+                       np.nan)
+    return {"wave": ref, "wave_err": W,
             "depth_ppm": depth, "depth_err_ppm": err,
-            "rms_ppm": np.nanmedian(R, axis=0), "n_visits": len(specs)}
+            "rms_ppm": np.nanmedian(R, axis=0), "n_visits": len(specs),
+            "n_visits_per_channel": (w > 0).sum(axis=0)}
 
 
 def detector_offset_ppm(nrs1: dict[str, np.ndarray],
@@ -830,10 +1016,31 @@ def prepare_visit_fit_inputs(
     n_bins: int | None = None,
     wave_min: float | None = None,
     wave_max: float | None = None,
+    fallback_priors: dict[str, Any] | None = None,
+    pca_detrending: bool = False,
 ) -> dict[str, Any]:
     """Shared Stage 4 -> Stage 5 preparation: archive priors, lightcurves,
-    trace diagnostics, tilt events, regressor matrix, white-band LD."""
-    priors = fetch_transit_priors(planet_name)
+    trace diagnostics, tilt events, regressor matrix, white-band LD.
+
+    Priors come from the NASA Exoplanet Archive at fit time (so they
+    cannot go stale); when the query fails (offline compute node) the
+    manifest-cached ``fallback_priors`` written by discover.py are used
+    instead, and ``priors_source`` records which one actually ran.
+
+    ``pca_detrending=True`` adds the COMPASS-style relative-pixel-flux
+    PCA regressors (Ahrer et al. 2025) — this CHANGES THE FIT DEFINITION
+    and is not part of frozen v1.1; the caller's fit summary is stamped
+    accordingly by ``build_regressor_matrix`` column names.
+    """
+    priors_source = "archive"
+    try:
+        priors = fetch_transit_priors(planet_name)
+    except Exception:
+        if not fallback_priors:
+            raise
+        priors = dict(fallback_priors)
+        priors.setdefault("planet_name", planet_name)
+        priors_source = "manifest-cache"
     spectra = load_stage3_spectra(spectra_path)
     lc = build_lightcurves(
         spectra,
@@ -848,6 +1055,7 @@ def prepare_visit_fit_inputs(
     )
 
     diagnostics = None
+    pca = None
     if decorrelate and reduction_dir:
         calints = find_stage2_calints(reduction_dir, instrument)
         if calints:
@@ -856,13 +1064,20 @@ def prepare_visit_fit_inputs(
                 if diagnostics[key].size != lc["time"].size:
                     diagnostics = None  # cube/spectra mismatch: skip, do not crash
                     break
+            if pca_detrending and diagnostics is not None:
+                try:
+                    pca = pca_regressors(calints)
+                    if pca.shape[0] != lc["time"].size:
+                        pca = None
+                except Exception:
+                    pca = None
 
     tilt_events = (
         detect_tilt_events(lc["wl_flux"], exclude_mask=lc["oot_mask"])
         if tilt_correction else []
     )
     regressors, regressor_names = build_regressor_matrix(
-        lc["time"], diagnostics, tilt_events
+        lc["time"], diagnostics, tilt_events, pca_components=pca
     )
 
     ld = None
@@ -874,9 +1089,11 @@ def prepare_visit_fit_inputs(
             wave_max if wave_max is not None else whi,
         )
 
-    return {"priors": priors, "lc": lc, "regressors": regressors,
-            "regressor_names": regressor_names, "tilt_events": tilt_events,
-            "ld": ld, "diagnostics_used": diagnostics is not None}
+    return {"priors": priors, "priors_source": priors_source, "lc": lc,
+            "regressors": regressors, "regressor_names": regressor_names,
+            "tilt_events": tilt_events, "ld": ld,
+            "diagnostics_used": diagnostics is not None,
+            "pca_used": pca is not None}
 
 
 # -------------------- orchestral tools --------------------
@@ -947,6 +1164,13 @@ class FitNirspecG395hWhiteLight(BaseTool):
         default="exotic-ld",
         description="'exotic-ld' for Gaussian (q1,q2) priors, 'uniform' to disable.",
     )
+    pca_detrending: bool = RuntimeField(
+        default=False,
+        description="Add COMPASS-style relative-pixel-flux PCA regressors "
+                    "(Ahrer et al. 2025). NOT part of frozen v1.1 — the fit "
+                    "version is stamped '+pca' so results are never silently "
+                    "mixed with the survey fits. Needs reduction_dir.",
+    )
     wave_min: float | None = RuntimeField(
         default=None, description="Optional lower wavelength cut in microns."
     )
@@ -967,6 +1191,7 @@ class FitNirspecG395hWhiteLight(BaseTool):
             ld_priors=self.ld_priors,
             wave_min=self.wave_min,
             wave_max=self.wave_max,
+            pca_detrending=self.pca_detrending,
         )
         summary = fit_white_lightcurve(
             prep["lc"],
@@ -996,6 +1221,18 @@ class FitNirspecG395hWhiteLight(BaseTool):
             f"  white depth = {d['median']:.0f} +{d['plus']:.0f} -{d['minus']:.0f} ppm; "
             f"residual rms = {summary['residual_rms_ppm']:.0f} ppm"
         )
+        rn = summary.get("rednoise") or {}
+        if rn.get("beta_median") == rn.get("beta_median"):  # not NaN
+            lines.append(
+                f"  red noise: beta_median = {rn['beta_median']:.2f} "
+                f"(beta > ~1.2 means depth errors need inflating)"
+            )
+        dc = summary.get("depth_check") or {}
+        if dc.get("suspect"):
+            lines.append(
+                f"  WARNING: depth inconsistent with archive expectation "
+                f"({dc['expected_ppm_from_archive']:.0f} ppm) — verify the fit."
+            )
         lines.append(
             "Now run FitNirspecG395hTransmissionSpectrum with the same "
             "spectra_path and this output_dir as white_fit_dir."

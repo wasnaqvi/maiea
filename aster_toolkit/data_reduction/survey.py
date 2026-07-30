@@ -173,9 +173,18 @@ def run_patchwork_target(
     root = Path(output_root) / slug
     root.mkdir(parents=True, exist_ok=True)
 
+    # Manifest-cached priors (written by discover.py): the offline
+    # fallback for compute nodes, and the expected-depth cross-check.
+    cached_priors = manifest.get("priors")
+
     stellar = manifest.get("stellar")
     if stellar is None and ("reduce" in steps or "fit" in steps):
-        priors = fetch_transit_priors(planet)
+        try:
+            priors = fetch_transit_priors(planet)
+        except Exception:
+            if not cached_priors:
+                raise
+            priors = cached_priors
         stellar = {k: priors[k] for k in ("st_teff", "st_logg", "st_met")}
 
     summary: dict[str, Any] = {
@@ -256,9 +265,13 @@ def run_patchwork_target(
                     continue
                 fit_dir = root / "fits" / vname / det.lower()
                 log(f"[{slug}] fitting {vname} {det} white light...")
+                if len(products) > 1:
+                    log(f"[{slug}] {vname} {det}: {len(products)} Stage 3 "
+                        f"products found; using {products[0]}")
                 prep = prepare_visit_fit_inputs(
                     products[0], planet,
                     instrument=det, reduction_dir=str(det_dir),
+                    fallback_priors=cached_priors,
                 )
                 white = fit_white_lightcurve(
                     prep["lc"], prep["priors"], fit_dir,
@@ -281,11 +294,19 @@ def run_patchwork_target(
                     "white_rms_ppm": white["residual_rms_ppm"],
                     "tilt_events": len(prep["tilt_events"]),
                     "ld_source": white["ld_source"],
+                    "priors_source": prep["priors_source"],
+                    "rednoise": white.get("rednoise"),
+                    "depth_check": white.get("depth_check"),
                     "n_channels": spec["n_bins"],
                     "median_depth_err_ppm": spec["median_depth_err_ppm"],
                     "median_channel_rms_ppm": spec["median_rms_ppm"],
                     "spectrum_csv": spec["spectrum_csv"],
                 }
+                if white.get("depth_check", {}) and white["depth_check"].get("suspect"):
+                    log(f"[{slug}] {vname} {det}: SUSPECT white-light depth "
+                        f"({white['depth_check']['measured_ppm']:.0f} ppm vs "
+                        f"archive {white['depth_check']['expected_ppm_from_archive']:.0f} "
+                        "ppm) — verify before using.")
 
     # -- combine ------------------------------------------------------
     if "combine" in steps:
@@ -324,6 +345,23 @@ def run_patchwork_target(
             summary["nrs1_nrs2_offset_ppm"] = detector_offset_ppm(
                 combined["NRS1"], combined["NRS2"]
             )
+
+        # Per-visit NRS1-NRS2 white-light t0 offset. COMPASS reports
+        # statistically significant transit-time offsets between the two
+        # detectors on some targets; record it as a survey health metric.
+        for vname in visit_dirs:
+            t0s = {}
+            for det in ("NRS1", "NRS2"):
+                ws = root / "fits" / vname / det.lower() / "white_fit_summary.json"
+                if ws.is_file():
+                    with ws.open() as fh:
+                        w = json.load(fh)
+                    if "t0_p1" in w:
+                        t0s[det] = w["t0_p1"]["median"]
+            if len(t0s) == 2:
+                summary["visits"].setdefault(vname, {})[
+                    "nrs1_nrs2_t0_offset_s"
+                ] = (t0s["NRS1"] - t0s["NRS2"]) * 86400.0
         if combined:
             n_vis = max(S["n_visits"] for S in combined.values())
             _plot_combined(
@@ -350,7 +388,10 @@ FIR_SBATCH_TEMPLATE = """\
 #SBATCH --time={time}
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --mem={mem}
-#SBATCH --output={output_root}/{slug}/slurm-%x-%j.out
+# Log to the SUBMISSION directory: an --output path under {output_root}/{slug}
+# does not exist before the first run, and SLURM kills a job with no log
+# at all when the --output directory is missing.
+#SBATCH --output=%x-%j.out
 
 # --- Patchwork on DRAC Fir ---------------------------------------
 # Load the module aster-env was built from. Stages 1-3 run in a separate
@@ -385,10 +426,14 @@ from aster_toolkit.data_reduction.exotedrf import verify_exotedrf_environment, f
 r = verify_exotedrf_environment(); print(format_environment_report(r))
 raise SystemExit(0 if r['ok'] else 1)" || exit 1
 
+# STEPS can be overridden at submit time WITHOUT regenerating the script:
+#   STEPS=inspect,reduce sbatch --export=ALL <script>
+# (set it in the submitting shell — SLURM's --export=NAME=VALUE splits on
+# the comma inside the value no matter how it is quoted).
 python -m aster_toolkit.data_reduction.survey \\
     --manifest {manifest_path} \\
     --output-root {output_root} \\
-    --steps {steps} $REFIT_FLAG
+    --steps "${{STEPS:-{steps}}}" $REFIT_FLAG
 """
 
 
