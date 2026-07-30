@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-ASTER (Agentic Science Toolkit for Exoplanet Research) is a refactored agentic system for exoplanet atmospheric research using TauREx spectral modeling. The system uses the `orchestral-ai` package to provide AI agents with tools for downloading exoplanet data, running forward models, and performing atmospheric retrievals.
+ASTER (Agentic Science Toolkit for Exoplanet Research) is a refactored agentic system for exoplanet atmospheric research. The system uses the `orchestral-ai` package to provide AI agents with tools for downloading exoplanet data, reducing raw JWST time-series observations, fitting transit light curves, running forward models, and performing atmospheric retrievals.
+
+Two largely independent halves:
+
+- **Atmospheric modeling** — TauREx forward models and retrievals, driven from an observed spectrum.
+- **Data reduction** — the *Patchwork* pipeline: raw JWST NIRSpec/G395H uncals to a transmission spectrum, via exoTEDRF (Stages 1-3) and juliet (Stages 5-6). See [JWST Data Reduction](#jwst-data-reduction--patchwork-aster_toolkitdata_reduction). This half runs on DRAC's **Fir** cluster, where the data and the pinned environments live.
 
 ## Skills System
 
@@ -18,15 +23,27 @@ ASTER includes specialized skill files in `workspace/skills/` that contain detai
 
 ## Environment Setup
 
-This project uses a Python virtual environment located at `aster-env/`:
+The environment differs by machine — check which one you are on before
+activating:
+
+**On DRAC Fir** (and anywhere the repo ships with `aster-env/`), a
+virtualenv at `aster-env/`:
 
 ```bash
-# Activate the virtual environment
 source aster-env/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
+
+**On the local Mac**, a conda environment named `exo` (there is no
+`aster-env/` directory here):
+
+```bash
+conda activate exo
+```
+
+Both provide `orchestral-ai`; note the numpy versions differ (Fir's
+aster-env is python 3.13, the Mac's `exo` is python 3.14 / numpy 2.x),
+so anything numerically sensitive should be checked on both.
 
 Key dependencies:
 - `orchestral-ai` - Agent framework
@@ -64,6 +81,15 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 **Data Acquisition** (`aster_toolkit/data_acquisition/`):
 - `exoarchive.py` - `GetExoplanetParameters` for TAP queries to NASA Exoplanet Archive
 - `exoarchive.py` - `DownloadDataset` for downloading and processing spectra from NASA archive
+- `mast.py` - MAST search/download of raw JWST products, plus `archive_tap_query()` (used by the reduction tools for ephemerides)
+
+**Data Reduction** (`aster_toolkit/data_reduction/`) — the Patchwork pipeline:
+- `discover.py` - `DiscoverPatchworkVisits`: index a raw tree, identify planets, write manifests
+- `exotedrf.py` - `ReduceNirspecG395hTso`, `InspectNirspecG395hUncalData`, `VerifyPatchworkEnvironment`, `MakeUncalTestSubset` (Stages 1-3)
+- `lightcurves.py` - `DetectNirspecTiltEvents` (Stage 4; pure numpy/astropy)
+- `juliet.py` - `FitNirspecG395hWhiteLight`, `FitNirspecG395hTransmissionSpectrum`, `CombineNirspecG395hVisits` (Stages 5-6)
+- `survey.py` - `RunPatchworkTarget`, `GeneratePatchworkFirJob` (end-to-end driver)
+- `optimize.py` - `OptimizeNirspecG395hReduction`, `SummarizeG395hOptimization`, `GenerateFirOptimizerJobs`
 
 ### TauREx Path Configuration
 
@@ -169,6 +195,198 @@ The `exoarchive.py` module provides access to NASA Exoplanet Archive data:
 - `process_wgets_file()` - Download IPAC tables from URLs
 - `process_downloads()` - Convert raw data to spectrum.dat format
 
+## JWST Data Reduction — Patchwork (`aster_toolkit/data_reduction/`)
+
+Uniform reduction of JWST NIRSpec/G395H BOTS time-series (raw uncals →
+transmission spectrum) for the Patchwork sub-Neptune survey. Chain:
+
+```
+uncals → inspect → exoTEDRF Stages 1-3 → Stage 4 lightcurves → juliet fits → visit combination
+```
+
+### Module map
+
+- **`discover.py`** — indexes a raw tree by **FITS headers only**;
+  directory names are untrustworthy (obsid-only folders, concatenated
+  multi-target names, duplicates). Filters to the survey definition
+  (G395H / F290LP / SUB2048 / NRS_BRIGHTOBJ), so target-acquisition
+  exposures and other gratings drop out on their own. Identifies each
+  visit's planet by archive cone search at the header pointing **plus a
+  transit-window overlap test** — a host may have several planets, and
+  the planet name drives the ephemeris, so a guess yields a confidently
+  wrong depth. Writes per-planet manifests with cached archive priors.
+- **`exotedrf.py`** — Stages 1-3 as a subprocess. Frozen
+  `PATCHWORK_G395H_CONFIG`, environment preflight, CRDS pinning,
+  per-visit baseline window.
+- **`lightcurves.py`** — Stage 4, pure numpy/astropy (runs in the main
+  ASTER env): MJD→BJD on load, out-of-transit normalization, constant-R
+  binning, trace diagnostics, tilt-event detection, PCA regressors,
+  red-noise beta, and the transit-in-window guard.
+- **`juliet.py`** — Stages 5-6: white-light then per-channel fits with
+  the orbit frozen to the white posterior; ExoTiC-LD priors; visit
+  combination; NRS1-NRS2 offset.
+- **`survey.py`** — manifest-driven driver (`inspect → reduce → fit →
+  combine`), restartable by step, plus the Fir sbatch generator.
+- **`optimize.py`** — wraps the exoTEDRF coordinate-descent optimizer as
+  a frozen, replayable rule generator (SHA-256 `omega_hash` per run).
+
+### exoTEDRF environment — the hard constraints
+
+**Two Python versions, unavoidable.** `orchestral` needs 3.12+; exoTEDRF
+pins `numpy<2` / `jwst==1.17.1` and lives on 3.11. They cannot be merged,
+so Stages 1-3 run as a **subprocess** in the pinned environment.
+
+**`ASTER_EXOTEDRF_PYTHON` must point at a WRAPPER, not an interpreter.**
+On DRAC, calling `<venv>/bin/python` by path leaves site-packages off
+`sys.path` on a compute node — virtualenvs must be *activated*. Use
+`scripts/patchwork/exotedrf-python`, which module-loads its own
+python/opencv, activates the venv, prepends the repo shadow, and execs.
+
+**`ASTER_EXOTEDRF_REPO` selects which stage code runs.** When set it is
+prepended to `PYTHONPATH` for every exoTEDRF subprocess, so a source
+checkout shadows the installed release. Patchwork runs the **`optimizer`
+branch**: reductions and optimizer sweeps must execute the *same* stage
+code or tuned parameters do not transfer. Unset → installed release.
+The tree actually used is recorded as `exotedrf.path` in every reduction
+manifest — it must match across all targets.
+
+Required environment on Fir:
+
+```bash
+export PYTHONPATH=~/aster/maiea${PYTHONPATH:+:$PYTHONPATH}
+export ASTER_EXOTEDRF_PYTHON=~/bin/exotedrf-python
+export ASTER_EXOTEDRF_REPO=~/exoTEDRF          # optimizer branch
+export CRDS_PATH=~/scratch/crds_cache
+export CRDS_SERVER_URL=https://jwst-crds.stsci.edu
+export CRDS_CONTEXT=jwst_1322.pmap             # pinned; part of the survey definition
+export ASTER_EXOTIC_LD_DATA=~/scratch/exotic_ld_data
+```
+
+**A cleared `PYTHONPATH=` is for pip installs ONLY, never at runtime** —
+at runtime it is how the `opencv` module delivers `cv2`, which
+`stcal.jump` imports at module level (so JumpStep cannot run without it).
+
+### Preflight — before committing any compute
+
+```bash
+python -c "from aster_toolkit.data_reduction.exotedrf import *; \
+           print(format_environment_report(verify_exotedrf_environment()))"
+```
+
+Must print **READY** *and* name the intended source tree. Eight checks,
+each traceable to a real failed job: `numpy<2`, pandas,
+`jwst.__version_commit__`, `crds.jwst.locate`, `cv2`, stages 1-3,
+`run_DMS.py`, BadPixStep resume guard. Also exposed as the
+`VerifyPatchworkEnvironment` tool, and wired into `run_reduction` so it
+raises before any compute.
+
+### Environment patches
+
+`scripts/patchwork/patch_exotedrf_env.py` applies import/resume fixes —
+**none touch numerics**. Re-run after ANY `pip install` touching jwst /
+stdatamodels / exotedrf, and after any `git pull` of the exoTEDRF
+checkout: pip silently reverts patched files. Patch the tree that will
+actually run — with `ASTER_EXOTEDRF_REPO` set, invoke it with
+`PYTHONPATH=$ASTER_EXOTEDRF_REPO` so it targets the checkout rather than
+site-packages.
+
+Non-standard items, recorded so a stock reproduction knows why they
+existed: numpy pinned 1.26.4; crds pinned 12.1.11; a
+`stdatamodels.exceptions` shim; `__version_commit__ = ""` appended to
+`jwst/__init__.py`; the BadPixStep resume guard; `PCAReconstructStep`
+skipped (diagnostic-only, crashes with sklearn ≥1.3); OpenCV from the
+`opencv/4.12.0` **module**, never pip (Alliance ships a deliberately
+failing dummy wheel).
+
+### Uniformity contract — frozen versions
+
+Changing any of these changes the survey definition. Bump the version,
+and never mix old and new products in one analysis.
+
+| constant | value | module |
+|---|---|---|
+| `PATCHWORK_CONFIG_VERSION` | 1.1 | `exotedrf.py` |
+| `PATCHWORK_STAGE4_VERSION` | 1.1 | `lightcurves.py` |
+| `PATCHWORK_FIT_VERSION` | 1.2 | `juliet.py` |
+| `PATCHWORK_OPTIMIZER_VERSION` | 1.0 | `optimize.py` |
+| `DEFAULT_RESOLUTION` | 100 | `lightcurves.py` |
+| `CRDS_CONTEXT` | `jwst_1322.pmap` | `exotedrf.py` |
+
+Fit v1.2 includes COMPASS-style relative-pixel-flux PCA regressors
+(Ahrer et al. 2025, arXiv:2511.18196); a fit that could not build them is
+stamped `1.2-nopca` and is **not** uniform with the rest.
+`extract_width` is fixed at 16 — never `'optimize'`, which silently
+breaks per-target uniformity. The `overrides` argument to
+`write_dms_config` / `run_reduction` exists for debugging single targets
+only; production survey reductions must not use it.
+
+### VERIFY PHYSICS, NOT EXIT CODES
+
+The two most expensive failures in this project both exited 0 and
+produced plausible-looking spectra:
+
+1. **The fit returns the prior.** ~1800 ppm for every target with tiny
+   scatter, errors larger than the signal, `b` and `a/Rs` sitting
+   mid-prior. Cause: the transit is not in the data — a stale ephemeris
+   or an unconverted MJD time axis. *Guarded*: `build_lightcurves`
+   refuses, reporting the offset and the data span.
+2. **juliet reloads old posteriors instead of refitting.** "COMPLETES"
+   in minutes and reproduces numbers to twelve decimal places.
+   *Guarded*: the fit step refuses when posteriors exist; clear with
+   `force_refit=True` (CLI `--force-refit`, sbatch `FORCE_REFIT=1`).
+
+Every white-light fit now also records `depth_check` (measured depth vs
+archive (Rp/Rs)², with a `suspect` flag) and `rednoise.beta_median`
+(Pont+2006; > ~1.2 means that target's depth errors need inflating).
+Check these, not the exit status.
+
+### Compute discipline
+
+- **Never run a reduction or fit in-process on a login node.**
+  `RunPatchworkTarget`, `ReduceNirspecG395hTso`, and the fit tools are
+  for local subset smoke tests (`MakeUncalTestSubset`) only; real targets
+  go through SLURM.
+- Reduce with **2 CPUs** — exoTEDRF Stage 1 is effectively
+  single-threaded, so a larger request only lengthens the queue wait.
+- Submit from a shell with **no venv active**: SLURM exports the
+  submitting environment and `module purge` cannot undo an activation.
+  From inside the GUI, wrap submissions in
+  `env -i HOME="$HOME" USER="$USER" bash -lc '...'`.
+- **Never two jobs writing one output directory** — it corrupts outputs.
+- Reduce is restartable (exoTEDRF skips completed stages); **the fit is
+  not**.
+- Measured rate: Stages 1+2+3 ≈ 20 min per visit × detector at 2753
+  integrations. Fits are hours and not resumable.
+
+### Campaign documents
+
+- **`scripts/patchwork/CAMPAIGN.md`** — the survey runbook: one-time
+  setup, wave order, per-target verification checklists, archiving.
+- **`scripts/patchwork/AGENT_BRIEF.md`** — self-contained operating
+  brief for an agent driving the campaign from the GUI (hard rules,
+  per-session protocol, checklists, escalation list). Note the orchestral
+  file tools are sandboxed to `workspace/`, so the brief documents which
+  tool reaches what.
+- **`scripts/patchwork/generate_survey_jobs.py`** — writes sized sbatch
+  scripts and prints the submission plan. **Single source of truth for
+  walltime and memory; never hand-write them.**
+- `scripts/patchwork/patchwork_gj9827d.py` — a single-target, as-is
+  baseline script. Do NOT generalize it to other targets; the toolkit is
+  the target-agnostic path and has the guards.
+
+### Testing
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/scripts/test_data_reduction.py -q
+```
+
+58 tests, no network and no exoTEDRF/juliet environment required. They
+cover the transit-in-window and force-refit guards, MJD→BJD conversion,
+constant-R binning, tilt detection (including that a real transit is not
+flagged), planet resolution, staging deduplication, and the
+frozen-config assertions. `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` avoids an
+unrelated `pkg_resources` breakage in the local pytest plugins.
+
 ## Common Workflows
 
 ### Running a Forward Model
@@ -188,6 +406,30 @@ The `exoarchive.py` module provides access to NASA Exoplanet Archive data:
 6. Review outputs: fit plot, corner plot, and posterior samples
 
 **Important**: The agent should read the skill file before running ANY retrieval to understand optimizer selection and parameter bounds.
+
+### Reducing a JWST NIRSpec/G395H Target (Patchwork)
+
+Full detail in `scripts/patchwork/CAMPAIGN.md`. The sequence:
+
+1. **Preflight** — `VerifyPatchworkEnvironment` must print READY and name
+   the intended exoTEDRF tree. Fix anything it flags with
+   `patch_exotedrf_env.py` before spending compute.
+2. **Discover** — `DiscoverPatchworkVisits` on the raw root (login node;
+   it queries the archive) writes one manifest per planet. Supply
+   `overrides` for any visit whose planet cannot be resolved; never guess.
+3. **Generate jobs** — `generate_survey_jobs.py` writes sized sbatch
+   scripts and prints the submission plan.
+4. **Reduce** — submit `STEPS=inspect,reduce` alone, 2 CPUs.
+5. **Verify the reduce** — 2 Stage 3 products per visit,
+   `segments_complete: true`, identical `exotedrf.path` and
+   `crds_context` across targets.
+6. **Fit** — only after step 5 passes; `FORCE_REFIT=1` on any rerun.
+7. **Verify the science** — depth vs archive expectation,
+   `depth_check.suspect`, `rednoise.beta_median`, `ld_source`,
+   `fit_version`, channel counts, NRS1-NRS2 offset.
+8. **Archive** to durable storage (scratch is purged). Never flatten the
+   directory tree: Stage 3 filenames repeat across visits, so the visit
+   is encoded only in the directory name.
 
 ### Downloading Spectra
 
@@ -246,8 +488,25 @@ When working with the agent system:
 
 ## Important Notes
 
+**TauREx**
 - Always use **absolute paths** for TauREx opacity/CIA configuration
 - Pressure units in TauREx are **Pascals** (Pa), not bars
 - For retrieval, use `"nestle"` optimizer by default (multinest requires complex installation)
+
+**Data reduction**
+- exoTEDRF writes the Time extension in **MJD**; ephemerides are **BJD**.
+  `load_stage3_spectra` converts on load — anything reading a Stage 3
+  product by another route must convert too. Getting this wrong costs
+  hours of offset and yields a fit that returns the prior.
+- Reduction pipeline paths are **absolute** everywhere; manifests are
+  copied between machines.
+- Preflight before compute; re-patch after any pip install or exoTEDRF
+  `git pull`.
+- Never edit the frozen config for a single target — that is a survey
+  definition change requiring a version bump.
+- Verify the depth against the archive expectation, not the exit code.
+
+**General**
 - The `.env` file contains API keys for LLM backends - never commit this file
-- Planet names in archive queries use format like `"WASP-39 b"` (space, lowercase designation)
+- Planet names in archive queries use format like `"WASP-39 b"` (space, lowercase designation). Some targets keep a TOI candidate designation (e.g. `TOI-836.01`) — do not "correct" these, the archive returns nothing for the tidier name.
+- The orchestral file tools (`ReadFileTool`, `EditFileTool`, `FileSearchTool`) are sandboxed to `base_directory` (`workspace/`) and reject absolute paths outside it; `RunCommandTool` is not restricted. Symlinks inside `workspace/` are followed out, since the check uses `abspath`, not `realpath`.
