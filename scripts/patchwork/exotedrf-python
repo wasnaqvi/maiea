@@ -39,6 +39,14 @@ if command -v module >/dev/null 2>&1; then
         >/dev/null 2>&1 || true
 fi
 
+# Run exoTEDRF from a source checkout when one is configured, so the
+# reduction and the optimizer sweep execute the SAME stage code. Without
+# this the optimizer (which only exists in the checkout) would tune
+# parameters against code the reductions never run.
+if [[ -n "${ASTER_EXOTEDRF_REPO:-}" ]]; then
+    export PYTHONPATH="${ASTER_EXOTEDRF_REPO/#\~/$HOME}${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 if [[ -f "$EXOTEDRF_ENV/bin/activate" ]]; then
     # shellcheck disable=SC1091
     source "$EXOTEDRF_ENV/bin/activate"

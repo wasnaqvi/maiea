@@ -162,6 +162,48 @@ def _exotedrf_python() -> str:
     return python
 
 
+DEFAULT_EXOTEDRF_REPO = "/Users/wasi/Desktop/exoTEDRF"
+
+
+def exotedrf_repo() -> str | None:
+    """Path to an exoTEDRF source checkout that should SHADOW the installed
+    package, or None to use whatever is installed in the environment.
+
+    Set ``ASTER_EXOTEDRF_REPO`` to run the survey from a source checkout
+    (e.g. the ``optimizer`` branch, which is the only place ``optimize.py``
+    exists). When set, it is prepended to PYTHONPATH for every exoTEDRF
+    subprocess, so the reduction and the optimizer sweep run the SAME stage
+    code — parameters tuned against one tree are not valid for another.
+
+    Returns None rather than raising when unset: running against the
+    installed release is a legitimate configuration.
+    """
+    repo = os.environ.get("ASTER_EXOTEDRF_REPO")
+    if not repo:
+        return None
+    repo = os.path.expanduser(repo)
+    if not (Path(repo) / "exotedrf" / "__init__.py").exists():
+        raise FileNotFoundError(
+            f"ASTER_EXOTEDRF_REPO={repo} does not contain an exotedrf/ "
+            "package. Point it at the root of an exoTEDRF checkout."
+        )
+    return repo
+
+
+def _subprocess_env(crds: str, crds_context: str | None = None) -> dict[str, str]:
+    """Environment for an exoTEDRF subprocess: CRDS settings plus the
+    source-checkout shadow, if one is configured."""
+    env = dict(os.environ)
+    env["CRDS_PATH"] = crds
+    env["CRDS_SERVER_URL"] = "https://jwst-crds.stsci.edu"
+    if crds_context:
+        env["CRDS_CONTEXT"] = crds_context
+    repo = exotedrf_repo()
+    if repo:
+        env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
 # Checks run inside the exoTEDRF environment. Each entry hard-won from a
 # real failure on DRAC Fir; see scripts/patchwork/patch_exotedrf_env.py.
 _ENV_CHECK_SCRIPT = r"""
@@ -272,10 +314,15 @@ def verify_exotedrf_environment(python: str | None = None,
     exoTEDRF BadPixStep resume bug.
     """
     python = python or _exotedrf_python()
-    result = subprocess.run([python, "-c", _ENV_CHECK_SCRIPT],
+    repo = exotedrf_repo()
+    env = dict(os.environ)
+    if repo:
+        env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run([python, "-c", _ENV_CHECK_SCRIPT], env=env,
                             capture_output=True, text=True, timeout=timeout)
 
-    report: dict[str, Any] = {"python": python, "checks": [], "packages": {}}
+    report: dict[str, Any] = {"python": python, "repo": repo,
+                              "checks": [], "packages": {}}
     for line in result.stdout.splitlines():
         if line.startswith("PATCHWORK_ENV_JSON "):
             report.update(json.loads(line[len("PATCHWORK_ENV_JSON "):]))
@@ -299,6 +346,7 @@ def format_environment_report(report: dict[str, Any]) -> str:
     lines = [f"exoTEDRF environment: {report['python']}"]
     if report.get("version"):
         lines.append(f"  python {report['version']}")
+    lines.append(f"  source       {report.get('repo') or '(installed release)'}")
     for name, value in sorted(report.get("packages", {}).items()):
         lines.append(f"  {name:<12} {value}")
     lines.append("")
@@ -616,6 +664,7 @@ def run_reduction(
         baseline_ints = compute_baseline_ints(input_dir)
 
     python = _exotedrf_python()
+    repo = exotedrf_repo()
 
     # Preflight before committing hours of compute. Every check here maps to
     # a failure that has already killed a job mid-reduction; finding them in
@@ -632,7 +681,8 @@ def run_reduction(
     else:
         env_report = None
 
-    script_path = exotedrf_script_path(python, "run_DMS.py")
+    script_path = exotedrf_script_path(python, "run_DMS.py",
+                                       extra_pythonpath=repo)
 
     manifest: dict[str, Any] = {
         "input_dir": str(input_dir),
@@ -642,7 +692,7 @@ def run_reduction(
         "baseline_ints": list(baseline_ints),
         # Which exoTEDRF actually ran. Must match whatever the optimizer
         # was swept against, or tuned parameters do not transfer.
-        "exotedrf": exotedrf_version(python),
+        "exotedrf": exotedrf_version(python, extra_pythonpath=repo),
         # Reference-file context actually in force. Unpinned CRDS resolves
         # to "latest", so targets reduced weeks apart would silently use
         # different reference files and no longer form a uniform survey.
@@ -669,11 +719,7 @@ def run_reduction(
         )
 
         log_path = det_dir / "reduction.log"
-        env = dict(os.environ)
-        env["CRDS_PATH"] = crds
-        env["CRDS_SERVER_URL"] = "https://jwst-crds.stsci.edu"
-        if crds_context:
-            env["CRDS_CONTEXT"] = crds_context
+        env = _subprocess_env(crds, crds_context)
 
         with log_path.open("w") as log:
             process = subprocess.Popen(

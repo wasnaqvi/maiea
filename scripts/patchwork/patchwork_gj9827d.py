@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Patchwork — GJ 9827 d, full NIRSpec/BOTS G395H reduction and as-is fit.
+"""Patchwork — GJ 9827 d, full NIRSpec/BOTS G395H reduction and baseline fit.
 
 Script port of ``GJ_9827d.ipynb``, for batch submission on DRAC Fir.
 
-This is the **as-is baseline** of the Patchwork plan: free quadratic limb
+This is the **baseline** fit of the Patchwork plan: free quadratic limb
 darkening, no decorrelation regressors, no tilt-event term. It is the
 reference the patched fit is compared against — not a replacement for
 ``aster_toolkit.data_reduction.survey``, which runs the frozen v1.1
@@ -87,12 +87,21 @@ SYS = dict(
 )
 SYS["b"] = SYS["ars"] * np.cos(np.radians(SYS["inc"]))
 
+# Patchwork house style for circulated figures: no grid (it competes with
+# error bars at these amplitudes), muted data, one strong accent for the model.
 PLOT_STYLE = {
-    "font.size": 11, "axes.titlesize": 12, "axes.labelsize": 11,
+    "font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12.5,
+    "xtick.labelsize": 11, "ytick.labelsize": 11,
+    "axes.grid": False,
     "axes.spines.top": False, "axes.spines.right": False,
-    "axes.grid": True, "grid.alpha": 0.25, "grid.linewidth": 0.5,
-    "legend.frameon": False,
+    "axes.linewidth": 1.0,
+    "legend.frameon": False, "legend.fontsize": 10.5,
+    "figure.dpi": 150,
 }
+DATA_COLOR = "#1A2F6B"     # deep navy
+BINNED_COLOR = "#0B1B45"   # darker navy for the binned overlay
+MODEL_COLOR = "#E8A33D"    # amber -- reads strongly over dense navy points
+PROGRAM = "GO 4098"
 
 
 def savefig(fig, stem: str) -> None:
@@ -432,31 +441,78 @@ def fit_white_light(juliet, lc: dict, vname: str, det: str) -> dict:
     return dict(orbit=orbit, depth=depth, rms=rms)
 
 
+def bin_series(x, y, n_bins=90):
+    """Equal-count binning for a readable overlay on dense photometry."""
+    idx = np.argsort(x)
+    x, y = np.asarray(x)[idx], np.asarray(y)[idx]
+    edges = np.linspace(0, x.size, n_bins + 1).astype(int)
+    bx, by, be = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        if b - a < 3:
+            continue
+        bx.append(np.mean(x[a:b])); by.append(np.mean(y[a:b]))
+        be.append(np.std(y[a:b], ddof=1) / np.sqrt(b - a))
+    return map(np.asarray, (bx, by, be))
+
+
 def plot_white(res, lc, vname, det, rms) -> None:
+    """White-light fit figure, formatted for circulation."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
 
     with plt.rc_context(PLOT_STYLE):
         t_hr = (lc["time"] - lc["t0_obs"]) * 24
         model = res.lc.evaluate(det)
         resid = lc["wl_flux"] - model
-        fig, (a1, a2) = plt.subplots(2, 1, figsize=(9, 6), sharex=True,
+        depth_ppm = (1.0 - model.min()) * 1e6
+
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(10.0, 6.4), sharex=True,
                                      height_ratios=[3, 1])
-        a1.errorbar(t_hr, lc["wl_flux"], yerr=lc["wl_err"], fmt="o", ms=3,
-                    color="#1a2f6b", elinewidth=0.7, alpha=0.8, label="data")
-        a1.plot(t_hr, model, color="crimson", lw=1.5, label="juliet best fit")
+
+        # Unbinned photometry, deliberately faint: it shows the true scatter
+        # without burying the model.
+        a1.plot(t_hr, lc["wl_flux"], "o", ms=2.4, mew=0, color=DATA_COLOR,
+                alpha=0.16, zorder=1, label="integrations")
+        bx, by, be = bin_series(t_hr, lc["wl_flux"])
+        a1.errorbar(bx, by, yerr=be, fmt="o", ms=5.0, mew=0,
+                    color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.2,
+                    capsize=0, alpha=0.95, zorder=3, label="binned")
+        a1.plot(t_hr, model, color=MODEL_COLOR, lw=2.6, zorder=4,
+                solid_capstyle="round", label="juliet transit model",
+                path_effects=[pe.Stroke(linewidth=4.6, foreground="white"),
+                              pe.Normal()])
         a1.set_ylabel("Relative flux")
-        a1.set_title(f"GJ 9827 d — {vname} {det} white light, "
-                     f"residual rms {rms:.0f} ppm")
-        a1.legend(fontsize=9)
-        a2.plot(t_hr, resid * 1e6, "o", ms=2.5, color="#1a2f6b", alpha=0.7)
-        a2.axhline(0, color="crimson", lw=1)
-        a2.set_xlabel("Time from mid-transit (h)")
-        a2.set_ylabel("Residual (ppm)")
+        a1.set_title(f"GJ 9827 d   ·   {PROGRAM}   ·   JWST NIRSpec/G395H "
+                     f"{det}   ·   visit {vname}", pad=12)
+        a1.legend(loc="lower left", ncol=3, columnspacing=1.4,
+                  handletextpad=0.5)
+        a1.annotate(f"depth {depth_ppm:.0f} ppm\nresidual rms {rms:.0f} ppm",
+                    xy=(0.985, 0.06), xycoords="axes fraction", ha="right",
+                    va="bottom", fontsize=10.5, color="#4E5866")
+
+        a2.plot(t_hr, resid * 1e6, "o", ms=2.4, mew=0, color=DATA_COLOR,
+                alpha=0.16, zorder=1)
+        rbx, rby, rbe = bin_series(t_hr, resid * 1e6)
+        a2.errorbar(rbx, rby, yerr=rbe, fmt="o", ms=4.5, mew=0,
+                    color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.1,
+                    capsize=0, alpha=0.95, zorder=3)
+        a2.axhline(0, color=MODEL_COLOR, lw=1.8, zorder=2)
+        a2.set_xlabel("Time from mid-transit  [h]")
+        a2.set_ylabel("Residual  [ppm]")
+        a2.set_ylim(-4 * rms, 4 * rms)
+
         fig.tight_layout()
         savefig(fig, f"gj9827d_whitelight_{vname}_{det.lower()}")
         plt.close(fig)
+
+    # Save the plotted series so the figure can be restyled later without
+    # refitting anything.
+    np.savetxt(f"gj9827d_whitelight_{vname}_{det.lower()}.csv",
+               np.column_stack([lc["time"], lc["wl_flux"], lc["wl_err"], model]),
+               delimiter=",", header="time_bjd,flux,flux_err,model",
+               comments="", fmt="%.10g")
 
 
 def fit_spectroscopic(juliet, lc: dict, orbit: dict,
@@ -520,7 +576,7 @@ def save_transpec(det: str, S: dict) -> str:
     path = f"gj9827d_{det.lower()}_transmission_spectrum.csv"
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow([f"# GJ 9827 d {det} G395H as-is (juliet, free LD, "
+        w.writerow([f"# GJ 9827 d {det} G395H baseline (juliet, free LD, "
                     f"R={RES}, {S['n_visits']} visit(s) combined)"])
         w.writerow(["wave_um", "wave_err_um", "depth_ppm", "depth_err_ppm",
                     "resid_rms_ppm"])
@@ -531,25 +587,63 @@ def save_transpec(det: str, S: dict) -> str:
 
 
 def plot_spectrum(combined: dict, published_csv: str | None) -> float | None:
+    """Transmission-spectrum figure, formatted for circulation.
+
+    The NIRSpec/G395H inter-detector gap is shaded and labelled so the eye
+    does not read across a wavelength range that was never observed.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = {"NRS1": "#1a2f6b", "NRS2": "crimson"}
+    colors = {"NRS1": DATA_COLOR, "NRS2": "#1B7F79"}
     with plt.rc_context(PLOT_STYLE):
-        fig, ax = plt.subplots(figsize=(10, 5))
-        edge = {}
-        for det, S in combined.items():
+        fig, ax = plt.subplots(figsize=(10.5, 5.2))
+        edge, all_d, all_e = {}, [], []
+
+        if {"NRS1", "NRS2"} <= set(combined):
+            m1 = np.isfinite(combined["NRS1"]["depth"])
+            m2 = np.isfinite(combined["NRS2"]["depth"])
+            gap_lo = combined["NRS1"]["wave"][m1].max()
+            gap_hi = combined["NRS2"]["wave"][m2].min()
+            ax.axvspan(gap_lo, gap_hi, color="#B9C2CC", alpha=0.30,
+                       zorder=0, lw=0)
+            ax.text(0.5 * (gap_lo + gap_hi), 0.035, "detector\ngap",
+                    transform=ax.get_xaxis_transform(), ha="center",
+                    va="bottom", fontsize=9.5, color="#4E5866",
+                    linespacing=1.15)
+
+        for det in ("NRS1", "NRS2"):
+            if det not in combined:
+                continue
+            S = combined[det]
             m = np.isfinite(S["depth"])
+            all_d.append(S["depth"][m]); all_e.append(S["depth_err"][m])
             ax.errorbar(S["wave"][m], S["depth"][m], xerr=S["wave_err"][m],
-                        yerr=S["depth_err"][m], fmt="o", ms=4, lw=0.8,
-                        color=colors.get(det, "gray"), label=det, alpha=0.85)
+                        yerr=S["depth_err"][m], fmt="o", ms=4.5, mew=0,
+                        color=colors[det], ecolor=colors[det],
+                        elinewidth=1.1, capsize=0, alpha=0.85, zorder=3,
+                        label=f"{det}  ({int(m.sum())} channels)")
             d = S["depth"][m]
             edge[det] = np.median(d[-5:] if det == "NRS1" else d[:5])
-        ax.set(xlabel="Wavelength (μm)",
-               ylabel=r"Transit depth $(R_p/R_s)^2$ (ppm)",
-               title="GJ 9827 d — Patchwork G395H, both visits combined (as-is)")
-        ax.legend(fontsize=9)
+
+        if all_d:
+            d = np.concatenate(all_d); e = np.concatenate(all_e)
+            wmean = np.sum(d / e ** 2) / np.sum(1 / e ** 2)
+            ax.axhline(wmean, color="#8A94A6", lw=1.2, ls="--", zorder=1,
+                       label=f"weighted mean  {wmean:.0f} ppm")
+            lo, hi = (d - e).min(), (d + e).max()
+            pad = 0.18 * (hi - lo)
+            ax.set_ylim(lo - pad, hi + pad)
+
+        n_vis = combined[next(iter(combined))].get("n_visits", len(ALL_VISITS))
+        ax.set_xlabel("Wavelength  [μm]")
+        ax.set_ylabel(r"Transit depth  $(R_{\rm p}/R_{\star})^{2}$  [ppm]")
+        ax.set_title(f"GJ 9827 d   ·   {PROGRAM}   ·   JWST NIRSpec/G395H   ·   "
+                     f"{n_vis} visit{'s' if n_vis != 1 else ''} combined, "
+                     f"R = {RES}", pad=12)
+        ax.legend(loc="upper left", ncol=3, columnspacing=1.4,
+                  handletextpad=0.5)
         fig.tight_layout()
         savefig(fig, "gj9827d_transmission_spectrum")
         plt.close(fig)
@@ -558,13 +652,16 @@ def plot_spectrum(combined: dict, published_csv: str | None) -> float | None:
                   if {"NRS1", "NRS2"} <= set(edge) else None)
 
         if published_csv and os.path.exists(published_csv):
-            fig, ax = plt.subplots(figsize=(10, 5))
-            for det, S in combined.items():
-                m = np.isfinite(S["depth"])
+            fig, ax = plt.subplots(figsize=(10.5, 5.2))
+            for det in ("NRS1", "NRS2"):
+                if det not in combined:
+                    continue
+                S = combined[det]; m = np.isfinite(S["depth"])
                 ax.errorbar(S["wave"][m], S["depth"][m],
-                            yerr=S["depth_err"][m], fmt="o", ms=4,
-                            color=colors.get(det, "gray"), alpha=0.85,
-                            label="Patchwork " + det)
+                            yerr=S["depth_err"][m], fmt="o", ms=4.5, mew=0,
+                            color=colors[det], ecolor=colors[det],
+                            elinewidth=1.1, capsize=0, alpha=0.85, zorder=3,
+                            label=f"Patchwork {det}")
             pub = np.genfromtxt(published_csv, delimiter=",", names=True,
                                 comments="#")
             cols = list(pub.dtype.names)
@@ -575,11 +672,15 @@ def plot_spectrum(combined: dict, published_csv: str | None) -> float | None:
                     if "depth" in c.lower() and "err" in c.lower()]
             ax.errorbar(pub[wcol], pub[dcol],
                         yerr=pub[ecol[0]] if ecol else None,
-                        fmt="s", ms=4, color="k", alpha=0.6,
-                        label="Published (GO 4098)")
-            ax.set(xlabel="Wavelength (μm)", ylabel="Transit depth (ppm)",
-                   title="GJ 9827 d — Patchwork vs published (GO 4098)")
-            ax.legend(fontsize=9)
+                        fmt="s", ms=4.5, mew=0, color="#4E5866",
+                        ecolor="#4E5866", elinewidth=1.1, capsize=0,
+                        alpha=0.75, zorder=2, label="published")
+            ax.set_xlabel("Wavelength  [μm]")
+            ax.set_ylabel(r"Transit depth  $(R_{\rm p}/R_{\star})^{2}$  [ppm]")
+            ax.set_title(f"GJ 9827 d   ·   {PROGRAM}   ·   "
+                         "Patchwork versus published", pad=12)
+            ax.legend(loc="upper left", ncol=3, columnspacing=1.4,
+                      handletextpad=0.5)
             fig.tight_layout()
             savefig(fig, "gj9827d_reproduction_check")
             plt.close(fig)
@@ -591,10 +692,42 @@ def plot_spectrum(combined: dict, published_csv: str | None) -> float | None:
 
 # ------------------------------------------------------------------ fit
 
+def existing_juliet_runs() -> list[str]:
+    """Directories of previous juliet fits in the current workdir."""
+    return sorted(d for d in glob.glob("juliet_*") if os.path.isdir(d))
+
+
+def clear_juliet_runs(dirs: list[str]) -> None:
+    import shutil
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def phase_fit(raw_root: str, visits: dict, detectors: list,
-              published_csv: str | None) -> dict:
+              published_csv: str | None, force_refit: bool = False) -> dict:
     """juliet Stages 5-6. Runs in the ASTER environment; reads the Stage 3
     products the reduce phase left on disk."""
+    # juliet LOADS existing posteriors from out_folder instead of refitting.
+    # After any change to the data, ephemeris, or priors that silently
+    # returns the previous run's answers -- a rerun that "completes" in
+    # minutes and reproduces the old numbers exactly.
+    stale = existing_juliet_runs()
+    if stale and force_refit:
+        print(f"Clearing {len(stale)} previous juliet run(s) before refitting.")
+        clear_juliet_runs(stale)
+    elif stale:
+        raise SystemExit(
+            f"\n!! {len(stale)} previous juliet run(s) found in this workdir "
+            f"(e.g. {stale[0]}).\n"
+            "   juliet will RELOAD those posteriors instead of refitting, so "
+            "any fix to the\n"
+            "   ephemeris, priors, or lightcurves would be silently ignored "
+            "and you would get\n"
+            "   the previous answers back.\n"
+            "   Re-run with --force-refit to delete them and fit properly, or "
+            "use a fresh --workdir.\n"
+        )
+
     try:
         import juliet
     except ImportError as exc:
@@ -628,7 +761,7 @@ def phase_fit(raw_root: str, visits: dict, detectors: list,
     if not sp_fits:
         raise SystemExit("No fits produced — nothing to combine.")
 
-    combined, summary = {}, {"planet": "GJ 9827 d", "mode": "as-is",
+    combined, summary = {}, {"planet": "GJ 9827 d", "mode": "baseline",
                              "resolution": RES, "detectors": {}}
     for det in detectors:
         specs = [sp_fits[(v, det)] for v in visits if (v, det) in sp_fits]
@@ -672,6 +805,10 @@ def main(argv=None) -> int:
     p.add_argument("--workdir", required=True,
                    help="All outputs are written here (created if missing).")
     p.add_argument("--phase", choices=["reduce", "fit", "all"], default="all")
+    p.add_argument("--force-refit", action="store_true",
+                   help="Delete previous juliet_* runs before fitting. Required "
+                        "when refitting the same workdir, because juliet "
+                        "reloads existing posteriors instead of refitting.")
     p.add_argument("--published-csv", default="published_gj9827d_g395h.csv",
                    help="Published GO 4098 spectrum for the overlay "
                         "(wave_um, depth_ppm, depth_err_ppm). Skipped if absent.")
@@ -713,7 +850,8 @@ def main(argv=None) -> int:
     if args.phase in ("reduce", "all"):
         phase_reduce(raw_root, visits, detectors)
     if args.phase in ("fit", "all"):
-        phase_fit(raw_root, visits, detectors, published)
+        phase_fit(raw_root, visits, detectors, published,
+                  force_refit=args.force_refit)
 
     print(f"\nDone. Outputs in {workdir}")
     return 0

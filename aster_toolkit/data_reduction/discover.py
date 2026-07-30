@@ -461,14 +461,20 @@ def build_manifests(
     manifests = {}
     for planet, vs in sorted(by_planet.items()):
         letter = planet.split()[-1] if len(planet.split()[-1]) == 1 else "b"
+        # Programs contributing to this planet, e.g. "GO 4098". Recorded so
+        # figures can be labelled without re-reading headers; a planet
+        # observed by two programs (K2-18 b) lists both.
+        programs = sorted({f"GO {int(v['program'])}" for v in vs})
         manifests[planet] = {
             "planet_name": planet,
             "planet_letter": letter,
+            "program": " + ".join(programs),
             "visits": {
                 f"o{v['observation']}": {
                     "raw_root": str(root),
                     "visit_prefix": v["visit_prefix"],
                     "sci_tag": v["sci_tag"],
+                    "program": f"GO {int(v['program'])}",
                 }
                 for v in sorted(vs, key=lambda v: v["visit_prefix"])
             },
@@ -589,7 +595,7 @@ def format_discovery_report(result: dict[str, Any]) -> str:
     incomplete = [v for v in visits if not v["complete"]]
     if incomplete:
         lines.append("")
-        lines.append("Incomplete segment sets — NOT science-usable as-is:")
+        lines.append("Incomplete segment sets — NOT science-usable:")
         for v in incomplete:
             for det, d in v["detectors"].items():
                 if not d["complete"]:

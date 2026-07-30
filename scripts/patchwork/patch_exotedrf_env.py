@@ -36,8 +36,19 @@ Patches
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Patch the tree that will actually RUN. When ASTER_EXOTEDRF_REPO is set the
+# toolkit shadows the installed release with that checkout, so the checkout
+# is what needs patching -- the exoTEDRF optimizer branch carries the same
+# BadPixStep resume bug as the PyPI build.
+_REPO = os.environ.get("ASTER_EXOTEDRF_REPO")
+if _REPO:
+    _REPO = os.path.expanduser(_REPO)
+    if (Path(_REPO) / "exotedrf" / "__init__.py").exists():
+        sys.path.insert(0, _REPO)
 
 
 def _package_dir(name: str) -> Path | None:
@@ -46,6 +57,19 @@ def _package_dir(name: str) -> Path | None:
     except ImportError:
         return None
     return Path(module.__file__).parent
+
+
+def _git_warning(path: Path) -> str:
+    """Patching a git working tree leaves it dirty; say so explicitly."""
+    for parent in [path, *path.parents]:
+        if (parent / ".git").exists():
+            return (
+                f"\nNOTE: {path} is inside the git checkout {parent}.\n"
+                "      These edits will show up in `git status`. Commit them\n"
+                "      to your fork so the fix survives a fresh clone, or\n"
+                "      re-run this script after every `git pull`."
+            )
+    return ""
 
 
 def patch_jwst_version_commit() -> str:
@@ -169,11 +193,18 @@ def main() -> int:
     for line in results:
         print(line)
 
+    pkg = _package_dir("exotedrf")
+    if pkg is not None:
+        note = _git_warning(pkg)
+        if note:
+            print(note)
+
     if any(r.startswith("SKIP") for r in results):
         print("\nOne or more patches were skipped -- read the notes above.")
         return 1
     print("\nEnvironment patched. Re-run after any pip install that touches "
-          "jwst, stdatamodels, or exotedrf.")
+          "jwst, stdatamodels, or exotedrf -- and after any git pull of the "
+          "exoTEDRF checkout.")
     return 0
 
 

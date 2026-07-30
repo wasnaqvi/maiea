@@ -15,7 +15,7 @@ spectroscopic residual rms).
 Uniformity contract (PATCHWORK_FIT_VERSION)
 -------------------------------------------
 Fitting choices are frozen module-wide. v1.1 (the "patched" fit of the
-Patchwork plan, superseding the as-is v1.0):
+Patchwork plan, superseding the v1.0 baseline):
 
 - Out-of-transit baseline normalization (ephemeris + literature duration).
 - ExoTiC-LD Gaussian priors on Kipping (q1, q2) from the stellar
@@ -30,7 +30,7 @@ Patchwork plan, superseding the as-is v1.0):
 - dynesty nested sampling; ecc fixed 0, omega 90.
 
 Set ``decorrelate=False, tilt_correction=False, ld_priors='uniform'`` to
-reproduce an as-is v1.0-style fit for comparison.
+reproduce the v1.0 baseline fit for comparison.
 
 NOTE: this module is named ``juliet.py`` but the fitting engine is the
 ``juliet`` package. ``_import_juliet()`` strips this file's directory
@@ -335,6 +335,8 @@ def fit_white_lightcurve(
     regressor_names: list[str] | None = None,
     ld: dict[str, float] | None = None,
     model_type: str = "transit",
+    program: str = "",
+    visit: str = "",
     n_live: int = N_LIVE_WHITE,
 ) -> dict[str, Any]:
     """Fit the white-light transit of one visit x detector with juliet.
@@ -378,6 +380,9 @@ def fit_white_lightcurve(
         "ld_source": "exotic-ld" if ld is not None else "uniform",
         "ld_coeffs": ld,
         "t0_obs": lc["t0_obs"],
+        "planet_name": priors.get("planet_name", ""),
+        "program": program,
+        "visit": visit,
     }
     keys = ["P_p1", "t0_p1", "p_p1", "b_p1", "a_p1",
             f"q1_{instrument}", f"q2_{instrument}", f"sigma_w_{instrument}"]
@@ -395,7 +400,11 @@ def fit_white_lightcurve(
     model = results.lc.evaluate(instrument)
     summary["residual_rms_ppm"] = float(np.nanstd(lc["wl_flux"] - model) * 1e6)
 
-    _plot_white_fit(results, lc, instrument, out)
+    _plot_white_fit(
+        results, lc, instrument, out,
+        title=figure_title(priors.get("planet_name", ""), instrument,
+                           program=program, visit=visit,
+                           suffix="white light"))
 
     with (out / "white_fit_summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
@@ -403,12 +412,55 @@ def fit_white_lightcurve(
     return summary
 
 
+# Patchwork house style for circulated figures: no grid (it competes with
+# error bars at these amplitudes), muted data, one strong accent for the model.
 _PLOT_STYLE = {
-    "font.size": 11, "axes.titlesize": 12, "axes.labelsize": 11,
+    "font.size": 12, "axes.titlesize": 13, "axes.labelsize": 12.5,
+    "xtick.labelsize": 11, "ytick.labelsize": 11,
+    "axes.grid": False,
     "axes.spines.top": False, "axes.spines.right": False,
-    "axes.grid": True, "grid.alpha": 0.25, "grid.linewidth": 0.5,
-    "legend.frameon": False,
+    "axes.linewidth": 1.0,
+    "legend.frameon": False, "legend.fontsize": 10.5,
+    "figure.dpi": 150,
 }
+DATA_COLOR = "#1A2F6B"      # deep navy
+BINNED_COLOR = "#0B1B45"
+MODEL_COLOR = "#E8A33D"     # amber -- reads strongly over dense navy points
+NRS2_COLOR = "#1B7F79"      # teal
+GAP_COLOR = "#B9C2CC"
+MEAN_COLOR = "#8A94A6"
+
+
+def figure_title(planet: str, instrument: str = "", *, program: str = "",
+                 visit: str = "", suffix: str = "") -> str:
+    """Standard Patchwork figure heading.
+
+    "GJ 9827 d   ·   GO 4098   ·   JWST NIRSpec/G395H NRS1   ·   visit o010"
+    Empty fields are dropped rather than left as blanks.
+    """
+    mode = "JWST NIRSpec/G395H"
+    if instrument:
+        mode += f" {instrument.upper()}"
+    parts = [p for p in (planet, program, mode) if p]
+    if visit:
+        parts.append(f"visit {visit}")
+    if suffix:
+        parts.append(suffix)
+    return "   ·   ".join(parts)
+
+
+def _bin_series(x, y, n_bins: int = 90):
+    """Equal-count binning for a readable overlay on dense photometry."""
+    idx = np.argsort(x)
+    x, y = np.asarray(x)[idx], np.asarray(y)[idx]
+    edges = np.linspace(0, x.size, n_bins + 1).astype(int)
+    bx, by, be = [], [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        if b - a < 3:
+            continue
+        bx.append(np.mean(x[a:b])); by.append(np.mean(y[a:b]))
+        be.append(np.std(y[a:b], ddof=1) / np.sqrt(b - a))
+    return map(np.asarray, (bx, by, be))
 
 
 def _savefig(fig, out: Path, stem: str) -> None:
@@ -417,42 +469,62 @@ def _savefig(fig, out: Path, stem: str) -> None:
     fig.savefig(out / f"{stem}.svg")
 
 
-def _plot_white_fit(results, lc, instrument: str, out: Path) -> None:
+def _plot_white_fit(results, lc, instrument: str, out: Path,
+                    title: str = "") -> None:
+    """White-light fit figure, formatted for circulation."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
 
     with plt.rc_context(_PLOT_STYLE):
-        times = lc["time"]
-        t_hr = (times - lc["t0_obs"]) * 24
+        t_hr = (lc["time"] - lc["t0_obs"]) * 24
         flux = lc["wl_flux"]
-        err = lc["wl_err"]
         model = results.lc.evaluate(instrument)
         residual = flux - model
-        sig = np.std(residual)
+        rms = float(np.nanstd(residual) * 1e6)
+        depth_ppm = (1.0 - float(np.nanmin(model))) * 1e6
 
-        fig, (ax1, ax2) = plt.subplots(
-            2, 1, figsize=(9, 6), sharex=True, height_ratios=[3, 1]
-        )
-        ax1.errorbar(t_hr, flux, yerr=err, fmt="o", ms=3, color="#1a2f6b",
-                     elinewidth=0.7, alpha=0.8, label="white lightcurve")
-        ax1.plot(t_hr, model, color="crimson", lw=1.5, label="juliet best fit")
-        core = np.percentile(flux, [0.5, 99.5])
-        pad = 5 * sig
-        ax1.set_ylim(min(core[0], model.min()) - pad, max(core[1], model.max()) + pad)
-        ax1.set_ylabel("Relative flux")
-        ax1.set_title(
-            f"{instrument} white lightcurve — residual rms {sig * 1e6:.0f} ppm"
-        )
-        ax1.legend(fontsize=9)
-        ax2.plot(t_hr, residual * 1e6, "o", ms=2.5, color="#1a2f6b", alpha=0.7)
-        ax2.axhline(0, color="crimson", lw=1)
-        ax2.set_ylim(-5 * sig * 1e6, 5 * sig * 1e6)
-        ax2.set_xlabel("Time from mid-transit (h)")
-        ax2.set_ylabel("Residual (ppm)")
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(10.0, 6.4), sharex=True,
+                                     height_ratios=[3, 1])
+        a1.plot(t_hr, flux, "o", ms=2.4, mew=0, color=DATA_COLOR, alpha=0.16,
+                zorder=1, label="integrations")
+        bx, by, be = _bin_series(t_hr, flux)
+        a1.errorbar(bx, by, yerr=be, fmt="o", ms=5.0, mew=0,
+                    color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.2,
+                    capsize=0, alpha=0.95, zorder=3, label="binned")
+        a1.plot(t_hr, model, color=MODEL_COLOR, lw=2.6, zorder=4,
+                solid_capstyle="round", label="juliet transit model",
+                path_effects=[pe.Stroke(linewidth=4.6, foreground="white"),
+                              pe.Normal()])
+        a1.set_ylabel("Relative flux")
+        a1.set_title(title or f"JWST NIRSpec/G395H {instrument} white light",
+                     pad=12)
+        a1.legend(loc="lower left", ncol=3, columnspacing=1.4,
+                  handletextpad=0.5)
+        a1.annotate(f"depth {depth_ppm:.0f} ppm\nresidual rms {rms:.0f} ppm",
+                    xy=(0.985, 0.06), xycoords="axes fraction", ha="right",
+                    va="bottom", fontsize=10.5, color="#4E5866")
+
+        a2.plot(t_hr, residual * 1e6, "o", ms=2.4, mew=0, color=DATA_COLOR,
+                alpha=0.16, zorder=1)
+        rbx, rby, rbe = _bin_series(t_hr, residual * 1e6)
+        a2.errorbar(rbx, rby, yerr=rbe, fmt="o", ms=4.5, mew=0,
+                    color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.1,
+                    capsize=0, alpha=0.95, zorder=3)
+        a2.axhline(0, color=MODEL_COLOR, lw=1.8, zorder=2)
+        a2.set_xlabel("Time from mid-transit  [h]")
+        a2.set_ylabel("Residual  [ppm]")
+        a2.set_ylim(-4 * rms, 4 * rms)
         fig.tight_layout()
         _savefig(fig, out, "white_lightcurve_fit")
         plt.close(fig)
+
+    # Save the plotted series so figures can be restyled without refitting.
+    np.savetxt(out / "white_lightcurve_series.csv",
+               np.column_stack([lc["time"], flux, lc["wl_err"], model]),
+               delimiter=",", header="time_bjd,flux,flux_err,model",
+               comments="", fmt="%.10g")
 
 
 def fit_transmission_spectrum(
@@ -463,6 +535,8 @@ def fit_transmission_spectrum(
     instrument: str = "NRS1",
     regressors: np.ndarray | None = None,
     stellar: dict[str, float] | None = None,
+    program: str = "",
+    visit: str = "",
     n_live: int = N_LIVE_SPEC,
 ) -> dict[str, Any]:
     """Fit every spectroscopic channel with the orbit (P, t0, b, a/Rs)
@@ -557,7 +631,10 @@ def fit_transmission_spectrum(
                 f"{r['depth_err']:.8f}  {r['wave_err']:.6f}\n"
             )
 
-    _plot_spectrum(rows, out, instrument)
+    _plot_spectrum(rows, out, instrument,
+                   planet=white_summary.get("planet_name", ""),
+                   program=program or white_summary.get("program", ""),
+                   visit=visit or white_summary.get("visit", ""))
     return {"spectrum_csv": str(csv_path), "spectrum_path": str(dat_path),
             "n_bins": len(rows), "rows": rows,
             "median_depth_err_ppm": float(np.nanmedian(
@@ -601,7 +678,9 @@ def read_spectrum_csv(path: str | os.PathLike[str]) -> dict[str, np.ndarray]:
             "rms_ppm": np.asarray(rms)}
 
 
-def _plot_spectrum(rows: list[dict[str, float]], out: Path, instrument: str) -> None:
+def _plot_spectrum(rows: list[dict[str, float]], out: Path,
+                   instrument: str, planet: str = "", program: str = "",
+                   visit: str = "") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -611,20 +690,25 @@ def _plot_spectrum(rows: list[dict[str, float]], out: Path, instrument: str) -> 
         depth = np.array([r["depth"] for r in rows]) * 1e6
         err = np.array([r["depth_err"] for r in rows]) * 1e6
         xerr = np.array([r["wave_err"] for r in rows])
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.errorbar(wave, depth, yerr=err, xerr=xerr, fmt="o", ms=4,
-                    color="#1a2f6b", ecolor="#1a2f6b", elinewidth=0.9,
-                    capsize=0, alpha=0.9)
-        med = np.median(depth)
-        ax.axhline(med, color="crimson", lw=1, alpha=0.6,
-                   label=f"median depth {med:.0f} ppm")
-        lo, hi = np.percentile(depth - err, 2), np.percentile(depth + err, 98)
-        span = hi - lo
-        ax.set_ylim(lo - 0.15 * span, hi + 0.15 * span)
-        ax.set_xlabel("Wavelength (μm)")
-        ax.set_ylabel("Transit depth (ppm)")
-        ax.set_title(f"Transmission spectrum — {instrument}, {len(rows)} channels")
-        ax.legend(fontsize=9)
+        color = DATA_COLOR if instrument.upper() == "NRS1" else NRS2_COLOR
+
+        fig, ax = plt.subplots(figsize=(10.5, 5.0))
+        ax.errorbar(wave, depth, yerr=err, xerr=xerr, fmt="o", ms=4.5, mew=0,
+                    color=color, ecolor=color, elinewidth=1.1, capsize=0,
+                    alpha=0.85, zorder=3,
+                    label=f"{instrument.upper()}  ({len(rows)} channels)")
+        wmean = np.sum(depth / err ** 2) / np.sum(1 / err ** 2)
+        ax.axhline(wmean, color=MEAN_COLOR, lw=1.2, ls="--", zorder=1,
+                   label=f"weighted mean  {wmean:.0f} ppm")
+        lo, hi = (depth - err).min(), (depth + err).max()
+        pad = 0.18 * (hi - lo)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.set_xlabel("Wavelength  [μm]")
+        ax.set_ylabel(r"Transit depth  $(R_{\rm p}/R_{\star})^{2}$  [ppm]")
+        ax.set_title(figure_title(planet, instrument, program=program,
+                                  visit=visit), pad=12)
+        ax.legend(loc="upper left", ncol=2, columnspacing=1.4,
+                  handletextpad=0.5)
         fig.tight_layout()
         _savefig(fig, out, "transmission_spectrum")
         plt.close(fig)
@@ -669,23 +753,58 @@ def detector_offset_ppm(nrs1: dict[str, np.ndarray],
 
 def _plot_combined(combined: dict[str, dict[str, np.ndarray]],
                    out: Path, title: str) -> None:
+    """Combined per-detector transmission spectrum, formatted for circulation.
+
+    The NIRSpec/G395H inter-detector gap is shaded and labelled so the eye
+    does not read across a wavelength range that was never observed.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    colors = {"NRS1": "#1a2f6b", "NRS2": "crimson"}
+    colors = {"NRS1": DATA_COLOR, "NRS2": NRS2_COLOR}
     with plt.rc_context(_PLOT_STYLE):
-        fig, ax = plt.subplots(figsize=(10, 5))
-        for det, S in combined.items():
+        fig, ax = plt.subplots(figsize=(10.5, 5.2))
+
+        if {"NRS1", "NRS2"} <= set(combined):
+            m1 = np.isfinite(combined["NRS1"]["depth_ppm"])
+            m2 = np.isfinite(combined["NRS2"]["depth_ppm"])
+            gap_lo = combined["NRS1"]["wave"][m1].max()
+            gap_hi = combined["NRS2"]["wave"][m2].min()
+            ax.axvspan(gap_lo, gap_hi, color=GAP_COLOR, alpha=0.30,
+                       zorder=0, lw=0)
+            ax.text(0.5 * (gap_lo + gap_hi), 0.035, "detector\ngap",
+                    transform=ax.get_xaxis_transform(), ha="center",
+                    va="bottom", fontsize=9.5, color="#4E5866",
+                    linespacing=1.15)
+
+        all_d, all_e = [], []
+        for det in ("NRS1", "NRS2"):
+            if det not in combined:
+                continue
+            S = combined[det]
             m = np.isfinite(S["depth_ppm"])
-            ax.errorbar(S["wave"][m], S["depth_ppm"][m],
-                        xerr=S["wave_err"][m], yerr=S["depth_err_ppm"][m],
-                        fmt="o", ms=4, lw=0.8, alpha=0.85,
-                        color=colors.get(det, "gray"), label=det)
-        ax.set_xlabel("Wavelength (μm)")
-        ax.set_ylabel("Transit depth (ppm)")
-        ax.set_title(title)
-        ax.legend(fontsize=9)
+            all_d.append(S["depth_ppm"][m]); all_e.append(S["depth_err_ppm"][m])
+            ax.errorbar(S["wave"][m], S["depth_ppm"][m], xerr=S["wave_err"][m],
+                        yerr=S["depth_err_ppm"][m], fmt="o", ms=4.5, mew=0,
+                        color=colors[det], ecolor=colors[det], elinewidth=1.1,
+                        capsize=0, alpha=0.85, zorder=3,
+                        label=f"{det}  ({int(m.sum())} channels)")
+
+        if all_d:
+            d = np.concatenate(all_d); e = np.concatenate(all_e)
+            wmean = np.sum(d / e ** 2) / np.sum(1 / e ** 2)
+            ax.axhline(wmean, color=MEAN_COLOR, lw=1.2, ls="--", zorder=1,
+                       label=f"weighted mean  {wmean:.0f} ppm")
+            lo, hi = (d - e).min(), (d + e).max()
+            pad = 0.18 * (hi - lo)
+            ax.set_ylim(lo - pad, hi + pad)
+
+        ax.set_xlabel("Wavelength  [μm]")
+        ax.set_ylabel(r"Transit depth  $(R_{\rm p}/R_{\star})^{2}$  [ppm]")
+        ax.set_title(title, pad=12)
+        ax.legend(loc="upper left", ncol=3, columnspacing=1.4,
+                  handletextpad=0.5)
         fig.tight_layout()
         _savefig(fig, out, "combined_transmission_spectrum")
         plt.close(fig)
@@ -780,7 +899,7 @@ class FitNirspecG395hWhiteLight(BaseTool):
     + trace x/y + FWHM (pass ``reduction_dir`` so Stage 2 calints can be
     read), one fitted step per detected tilt event, dynesty sampling.
     Set decorrelate/tilt_correction False and ld_priors='uniform' for an
-    as-is comparison fit.
+    baseline comparison fit.
 
     Outputs in ``output_dir``: juliet posteriors,
     ``white_lightcurve_fit.pdf/.svg``, ``white_fit_summary.json``

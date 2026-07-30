@@ -60,8 +60,10 @@ from .exotedrf import (
     inspect_uncal_directory,
     run_reduction,
 )
+from .lightcurves import DEFAULT_RESOLUTION
 from .juliet import (
     PATCHWORK_FIT_VERSION,
+    figure_title,
     combine_visit_spectra,
     detector_offset_ppm,
     fetch_transit_priors,
@@ -96,7 +98,7 @@ def stage_visit_uncals(
     """Resolve one manifest visit entry into a directory of that visit's
     uncal segments.
 
-    A plain string is used as-is. A ``{raw_root, visit_prefix}`` dict
+    A plain string is used unchanged. A ``{raw_root, visit_prefix}`` dict
     (needed when several visits share one download tree) is resolved by
     recursive glob and symlinked into ``staging_dir`` so exoTEDRF sees
     exactly one observation.
@@ -135,12 +137,25 @@ def stage_visit_uncals(
     return str(staging)
 
 
+def existing_fit_products(fit_dir: str | os.PathLike[str]) -> list[str]:
+    """Posterior files from a previous juliet run under ``fit_dir``.
+
+    juliet RELOADS posteriors from ``out_folder`` instead of refitting when it
+    finds them. That makes the fit step silently non-idempotent: after any
+    change to the data, ephemeris, or priors, a rerun returns the PREVIOUS
+    answers and "completes" in minutes. Detect it rather than trust it.
+    """
+    return sorted(glob.glob(os.path.join(str(fit_dir), "**", "*.pkl"),
+                            recursive=True))
+
+
 def run_patchwork_target(
     manifest: dict[str, Any],
     output_root: str | os.PathLike[str],
     *,
     steps: tuple[str, ...] | list[str] = ALL_STEPS,
     detectors: tuple[str, ...] = DETECTORS,
+    force_refit: bool = False,
     log=print,
 ) -> dict[str, Any]:
     """Run the Patchwork chain for one target. Restartable: each step
@@ -153,6 +168,7 @@ def run_patchwork_target(
     """
     planet = manifest["planet_name"]
     letter = manifest.get("planet_letter", planet.split()[-1])
+    program = manifest.get("program", "")   # e.g. "GO 4098"; used in figures
     slug = _slug(planet)
     root = Path(output_root) / slug
     root.mkdir(parents=True, exist_ok=True)
@@ -164,6 +180,7 @@ def run_patchwork_target(
 
     summary: dict[str, Any] = {
         "planet_name": planet,
+        "program": program,
         "fit_version": PATCHWORK_FIT_VERSION,
         "steps": list(steps),
         "visits": {},
@@ -207,6 +224,25 @@ def run_patchwork_target(
     # -- fit ----------------------------------------------------------
     if "fit" in steps:
         from .exotedrf import find_stage3_products
+        import shutil
+
+        # juliet reloads existing posteriors instead of refitting, so a rerun
+        # after any change silently returns the old answers. Refuse, or clear.
+        stale = existing_fit_products(root / "fits")
+        if stale and force_refit:
+            log(f"[{slug}] clearing {len(stale)} previous posterior file(s) "
+                "before refitting.")
+            shutil.rmtree(root / "fits", ignore_errors=True)
+        elif stale:
+            raise RuntimeError(
+                f"{len(stale)} posterior file(s) from a previous fit exist "
+                f"under {root / 'fits'} (e.g. {stale[0]}).\n"
+                "juliet would RELOAD those instead of refitting, so any change "
+                "to the ephemeris, priors, or lightcurves would be silently "
+                "ignored and you would get the previous answers back.\n"
+                "Pass force_refit=True (CLI: --force-refit) to delete them and "
+                "fit properly, or use a fresh output_root."
+            )
 
         for vname in visit_dirs:
             for det in detectors:
@@ -227,6 +263,7 @@ def run_patchwork_target(
                 white = fit_white_lightcurve(
                     prep["lc"], prep["priors"], fit_dir,
                     instrument=det,
+                    program=program, visit=vname,
                     regressors=prep["regressors"],
                     regressor_names=prep["regressor_names"],
                     ld=prep["ld"],
@@ -235,6 +272,7 @@ def run_patchwork_target(
                 spec = fit_transmission_spectrum(
                     prep["lc"], white, fit_dir / "spectro",
                     instrument=det,
+                    program=program, visit=vname,
                     regressors=prep["regressors"],
                     stellar=stellar,
                 )
@@ -287,8 +325,13 @@ def run_patchwork_target(
                 combined["NRS1"], combined["NRS2"]
             )
         if combined:
-            _plot_combined(combined, combined_dir,
-                           f"{planet} — Patchwork G395H transmission spectrum")
+            n_vis = max(S["n_visits"] for S in combined.values())
+            _plot_combined(
+                combined, combined_dir,
+                figure_title(planet, program=program,
+                             suffix=f"{n_vis} visit"
+                                    f"{'s' if n_vis != 1 else ''} combined, "
+                                    f"R = {DEFAULT_RESOLUTION}"))
 
     summary_path = root / "patchwork_summary.json"
     with summary_path.open("w") as fh:
@@ -321,12 +364,19 @@ source {aster_env}/bin/activate           # env with juliet + aster deps
 export PYTHONPATH={aster_repo}${{PYTHONPATH:+:$PYTHONPATH}}
 # Stages 1-3 run as a subprocess in the pinned exoTEDRF environment.
 export ASTER_EXOTEDRF_PYTHON={exotedrf_python}
+# Run exoTEDRF from the source checkout, so reductions and optimizer sweeps
+# execute the SAME stage code. Unset this to use the installed release.
+export ASTER_EXOTEDRF_REPO={exotedrf_repo}
 export CRDS_PATH={crds_path}
 export CRDS_SERVER_URL=https://jwst-crds.stsci.edu
 # Pin the reference context so targets reduced weeks apart stay uniform.
 export CRDS_CONTEXT={crds_context}
 export ASTER_EXOTIC_LD_DATA={exotic_ld_data}
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+# juliet reloads existing posteriors instead of refitting, so a rerun after any
+# change silently returns the OLD answers. FORCE_REFIT=1 deletes them first.
+REFIT_FLAG=""; [[ "${{FORCE_REFIT:-0}}" == "1" ]] && REFIT_FLAG="--force-refit"
 
 # Fail in seconds rather than hours if the exoTEDRF environment regressed
 # (pip installs silently revert the compatibility patches).
@@ -338,7 +388,7 @@ raise SystemExit(0 if r['ok'] else 1)" || exit 1
 python -m aster_toolkit.data_reduction.survey \\
     --manifest {manifest_path} \\
     --output-root {output_root} \\
-    --steps {steps}
+    --steps {steps} $REFIT_FLAG
 """
 
 
@@ -355,6 +405,7 @@ def write_fir_slurm_script(
     aster_repo: str = "~/aster/maiea",
     python_module: str = "python/3.13.2",
     exotedrf_python: str = "~/bin/exotedrf-python",
+    exotedrf_repo: str = "~/exoTEDRF",
     crds_path: str = "~/scratch/crds_cache",
     crds_context: str = CRDS_CONTEXT,
     exotic_ld_data: str = "~/scratch/exotic_ld_data",
@@ -371,7 +422,8 @@ def write_fir_slurm_script(
         account=account, slug=slug, time=time, cpus=cpus, mem=mem,
         output_root=output_root, aster_env=aster_env, aster_repo=aster_repo,
         python_module=python_module,
-        exotedrf_python=exotedrf_python, crds_path=crds_path,
+        exotedrf_python=exotedrf_python, exotedrf_repo=exotedrf_repo,
+        crds_path=crds_path,
         crds_context=crds_context, exotic_ld_data=exotic_ld_data,
         manifest_path=os.path.abspath(manifest_path), steps=steps,
     )
@@ -396,6 +448,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", default=",".join(ALL_STEPS),
                         help="Comma-separated subset of: inspect,reduce,fit,combine.")
     parser.add_argument("--detectors", default="NRS1,NRS2")
+    parser.add_argument("--force-refit", action="store_true",
+                        help="Delete previous posteriors before fitting. "
+                             "Required when refitting an existing output_root, "
+                             "because juliet reloads posteriors it finds.")
     args = parser.parse_args(argv)
 
     steps = tuple(s.strip() for s in args.steps.split(",") if s.strip())
@@ -408,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output_root,
         steps=steps,
         detectors=tuple(d.strip().upper() for d in args.detectors.split(",")),
+        force_refit=args.force_refit,
     )
     return 0
 
@@ -457,6 +514,12 @@ class RunPatchworkTarget(BaseTool):
         default="inspect,reduce,fit,combine",
         description="Comma-separated subset of inspect,reduce,fit,combine.",
     )
+    force_refit: bool = RuntimeField(
+        default=False,
+        description="Delete previous posteriors before fitting. Required when "
+                    "refitting an existing output_root — juliet reloads any "
+                    "posteriors it finds instead of refitting.",
+    )
     base_directory: str = StateField()
 
     def _run(self) -> str:
@@ -472,6 +535,7 @@ class RunPatchworkTarget(BaseTool):
             load_manifest(manifest_path),
             output_root,
             steps=tuple(s.strip() for s in self.steps.split(",") if s.strip()),
+            force_refit=self.force_refit,
             log=lines.append,
         )
         lines.append(f"Patchwork summary: {summary['summary_path']}")
@@ -528,6 +592,12 @@ class GeneratePatchworkFirJob(BaseTool):
         default="python/3.13.2",
         description="Module providing the python that aster_env was built from.",
     )
+    exotedrf_repo: str = RuntimeField(
+        default="~/exoTEDRF",
+        description="Fir path to the exoTEDRF checkout that shadows the "
+                    "installed release (keeps reductions and optimizer sweeps "
+                    "on one stage-code tree).",
+    )
     exotedrf_python: str = RuntimeField(
         default="~/bin/exotedrf-python",
         description="Path on Fir to the exoTEDRF interpreter. Prefer a wrapper "
@@ -555,6 +625,7 @@ class GeneratePatchworkFirJob(BaseTool):
             aster_repo=self.aster_repo,
             python_module=self.python_module,
             exotedrf_python=self.exotedrf_python,
+            exotedrf_repo=self.exotedrf_repo,
             steps=self.steps,
         )
         return (
