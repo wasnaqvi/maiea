@@ -579,6 +579,55 @@ class TestDmsConfig:
         assert PATCHWORK_G395H_CONFIG["oof_method"] == "scale-achromatic"
         assert PATCHWORK_G395H_CONFIG["OneOverFStep_int"] == "skip"
 
+    def test_optimizer_branch_required_keys_present(self):
+        """Every key run_DMS.py reads must be emitted.
+
+        The optimizer branch reads extract_width_soss2 and deepframe
+        unconditionally (run_DMS.py:192,198) even for NIRSpec. Omitting
+        either raised KeyError *after* Stage 2 finished — 18 jobs burned
+        ~14 h of compute and still reported COMPLETED 0:0.
+        """
+        # Keys run_DMS.py dereferences as config['<key>'] on the
+        # optimizer branch, minus those write_dms_config injects per call.
+        required = {
+            "baseline_ints", "centroids", "deepframe", "do_plots",
+            "extract_method", "extract_width", "extract_width_soss2",
+            "f277w", "flag_in_time", "flag_up_ramp", "force_redo",
+            "generate_lc", "generate_order0_mask", "hot_pixel_map",
+            "input_filetag", "jump_threshold", "miri_background_method",
+            "miri_background_width", "miri_drop_groups", "miri_trace_width",
+            "nirspec_mask_width", "observing_mode", "oof_method",
+            "outlier_maps", "pca_components", "remove_components",
+            "save_results", "soss_background_file", "soss_inner_mask_width",
+            "soss_outer_mask_width", "soss_specprofile", "soss_timeseries",
+            "soss_timeseries_o2", "space_outlier_threshold", "stage1_kwargs",
+            "stage2_kwargs", "stage3_kwargs", "superbias_method",
+            "time_jump_threshold", "time_outlier_threshold",
+        }
+        # Step toggles are read via config[step] in a loop.
+        required |= {
+            "DQInitStep", "EmiCorrStep", "SaturationStep", "ResetStep",
+            "SuperBiasStep", "RefPixStep", "DarkCurrentStep",
+            "OneOverFStep_grp", "LinearityStep", "JumpStep", "RampFitStep",
+            "GainScaleStep", "AssignWCSStep", "Extract2DStep",
+            "SourceTypeStep", "WaveCorrStep", "FlatFieldStep",
+            "OneOverFStep_int", "BackgroundStep", "TracingStep",
+            "BadPixStep", "PCAReconstructStep",
+        }
+        missing = required - set(PATCHWORK_G395H_CONFIG)
+        assert not missing, f"run_DMS.py would KeyError on: {sorted(missing)}"
+
+    def test_written_config_has_required_keys(self, tmp_path):
+        path = write_dms_config(
+            tmp_path / "run_DMS.yaml", input_dir="/data",
+            filter_detector="NRS1", crds_cache_path="/crds",
+            run_stages=[1, 2, 3],
+        )
+        text = path.read_text()
+        for key in ("extract_width_soss2", "deepframe", "run_stages",
+                    "st_teff", "planet_letter"):
+            assert f"{key} : " in text, key
+
 
 class TestInspectUncal:
     def _write_uncal(self, path, det, segnum, segtot):
@@ -727,6 +776,64 @@ class TestForceRefitGuard:
                              steps=("fit",), force_refit=True,
                              log=lambda *_: None)
         assert existing_fit_products(out / "Test_b" / "fits") == []
+
+
+class TestReduceFailurePropagates:
+    """A reduction that produces no Stage 3 product must fail the job.
+
+    18 jobs once exited 0 having died between Stage 2 and Stage 3; SLURM
+    reported COMPLETED and nothing downstream noticed.
+    """
+
+    def _manifest(self, tmp_path):
+        raw = tmp_path / "raw"
+        raw.mkdir(exist_ok=True)
+        return {"planet_name": "Test b", "planet_letter": "b",
+                "visits": {"o001": str(raw)},
+                "stellar": {"st_teff": 4000, "st_logg": 4.6, "st_met": 0.0}}
+
+    def _patch_run_reduction(self, monkeypatch, returncode, products):
+        import aster_toolkit.data_reduction.survey as survey_mod
+
+        def fake_run_reduction(input_dir, output_dir, **kw):
+            return {"detectors": {
+                det: {"returncode": returncode, "success": returncode == 0,
+                      "spectra_fullres": list(products),
+                      "log": f"{output_dir}/{det.lower()}/reduction.log"}
+                for det in kw.get("detectors", ["NRS1", "NRS2"])}}
+
+        monkeypatch.setattr(survey_mod, "run_reduction", fake_run_reduction)
+
+    def test_exit_zero_without_products_raises(self, tmp_path, monkeypatch):
+        # the real failure: run_DMS.py died after Stage 2, exit code lost
+        self._patch_run_reduction(monkeypatch, 0, [])
+        with pytest.raises(RuntimeError, match="reduction failed"):
+            run_patchwork_target(self._manifest(tmp_path), tmp_path / "out",
+                                 steps=("reduce",), log=lambda *_: None)
+
+    def test_nonzero_exit_raises(self, tmp_path, monkeypatch):
+        self._patch_run_reduction(monkeypatch, 1, [])
+        with pytest.raises(RuntimeError, match="reduction failed"):
+            run_patchwork_target(self._manifest(tmp_path), tmp_path / "out",
+                                 steps=("reduce",), log=lambda *_: None)
+
+    def test_success_with_products_does_not_raise(self, tmp_path, monkeypatch):
+        self._patch_run_reduction(monkeypatch, 0, ["/x/a_box_spectra_fullres.fits"])
+        summary = run_patchwork_target(
+            self._manifest(tmp_path), tmp_path / "out",
+            steps=("reduce",), log=lambda *_: None)
+        assert summary["visits"]["o001"]["reduction"]["NRS1"] is True
+
+    def test_failure_is_recorded_in_summary(self, tmp_path, monkeypatch):
+        self._patch_run_reduction(monkeypatch, 0, [])
+        out = tmp_path / "out"
+        with pytest.raises(RuntimeError):
+            run_patchwork_target(self._manifest(tmp_path), out,
+                                 steps=("reduce",), log=lambda *_: None)
+        # summary is written before raising, so the failure is diagnosable
+        with (out / "Test_b" / "patchwork_summary.json").open() as fh:
+            summary = json.load(fh)
+        assert summary["visits"]["o001"]["reduction"]["NRS1"] is False
 
 
 class TestFirScript:

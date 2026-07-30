@@ -135,6 +135,14 @@ PATCHWORK_G395H_CONFIG: dict[str, Any] = {
     "extract_method": "box",
     "extract_width": 16,          # fixed survey-wide (= nirspec_mask_width)
     "soss_specprofile": "None",
+    # SOSS order-2 aperture. Meaningless for NIRSpec, but the optimizer
+    # branch's run_DMS.py reads it UNCONDITIONALLY (run_DMS.py:192), so
+    # omitting it raises KeyError after Stage 2 completes — an expensive
+    # way to find out. The pip release does not have this parameter.
+    "extract_width_soss2": "None",
+    # Likewise read unconditionally at run_DMS.py:198. A precomputed deep
+    # frame; None means Stage 3 builds its own.
+    "deepframe": "None",
     "stage3_kwargs": {},
     # --- General ---
     "save_results": True,

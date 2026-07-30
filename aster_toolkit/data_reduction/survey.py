@@ -215,6 +215,13 @@ def run_patchwork_target(
 
     # -- reduce -------------------------------------------------------
     if "reduce" in steps:
+        # A reduction that exits 0 but writes no Stage 3 product is a
+        # FAILURE, not a success: exoTEDRF's run_DMS.py can die after
+        # Stage 2 (e.g. a config key the installed branch requires) and
+        # still leave the job looking COMPLETED. Collect every failure,
+        # then raise — so the SLURM job exits nonzero and the campaign
+        # cannot advance to the fit step on empty inputs.
+        failures: list[str] = []
         for vname, vdir in visit_dirs.items():
             log(f"[{slug}] reducing {vname} (Stages 1-3, both detectors)...")
             m = run_reduction(
@@ -226,9 +233,29 @@ def run_patchwork_target(
                 st_met=stellar.get("st_met"),
                 planet_letter=letter,
             )
-            summary["visits"].setdefault(vname, {})["reduction"] = {
-                det: e["success"] for det, e in m["detectors"].items()
-            }
+            entry = {}
+            for det, e in m["detectors"].items():
+                produced = bool(e.get("spectra_fullres"))
+                entry[det] = e["success"] and produced
+                if not entry[det]:
+                    failures.append(
+                        f"{vname} {det}: exit {e['returncode']}, "
+                        f"{len(e.get('spectra_fullres') or [])} Stage 3 "
+                        f"product(s) — see {e['log']}"
+                    )
+            summary["visits"].setdefault(vname, {})["reduction"] = entry
+
+        if failures:
+            summary_path = root / "patchwork_summary.json"
+            with summary_path.open("w") as fh:
+                json.dump(summary, fh, indent=2)
+            raise RuntimeError(
+                f"[{slug}] reduction failed for {len(failures)} "
+                f"visit x detector combination(s):\n  "
+                + "\n  ".join(failures)
+                + "\nThe last lines of the reduction.log name the cause. "
+                  "Do NOT submit the fit step until this is resolved."
+            )
 
     # -- fit ----------------------------------------------------------
     if "fit" in steps:
