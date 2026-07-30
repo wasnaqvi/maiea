@@ -49,6 +49,13 @@ except ModuleNotFoundError:
 PATCHWORK_STAGE4_VERSION = "1.1"
 
 N_REFPIX_COLS = 5             # detector reference columns trimmed each edge
+# Survey-frozen binning (decision Wasi 2026-07-30): one resolution for
+# every Patchwork target. R=100 is the standard presentation for
+# sub-Neptune G395H transmission spectra (e.g. the K2-18 b reanalysis,
+# arXiv:2501.18477, primary R~100; CO2 4.3 um and CH4 3.3 um bands are
+# broad against it) and gives ~29 NRS1 + ~24 NRS2 channels. COMPASS
+# (arXiv:2511.18196) publishes at R~200 — rebin THEIR spectra to R=100
+# for overlays, never mix binnings within Patchwork.
 DEFAULT_RESOLUTION = 100      # constant-R spectroscopic binning
 MJD_TO_BJD_OFFSET = 2400000.5
 

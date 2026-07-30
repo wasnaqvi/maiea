@@ -62,10 +62,18 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "TOI_776_c":  ("4:00:00", "30:00:00", "48G", "24G", 3, ""),
     "TOI_836_b":  ("6:00:00", "30:00:00", "48G", "24G", 3, ""),
     "K2_18_b":    ("4:00:00", "2-12:00:00", "48G", "24G", 4,
-                   "4 visits across GO 2372 + GO 2722: combining across programs "
-                   "is a SCIENCE DECISION — confirm before treating as one measurement"),
+                   "cross-program 4-visit combine APPROVED (Wasi 2026-07-30)"),
     "TOI_561_b":  ("12:00:00", "15:00:00", "64G", "32G", 4,
                    "21228 integrations in one visit; watch MaxRSS, raise mem if OOM"),
+    # GO 4126 observed TOI-125 b AND c, one transit each (proposal
+    # abstract, ADS 2023jwst.prop.4126F). Manifest overrides:
+    #   --override jw04126101001="TOI-125 b" --override jw04126201001="TOI-125 c"
+    # If the b/c <-> obs 101/201 assignment is swapped, the fit-time
+    # transit-in-window guard refuses loudly — then swap the overrides.
+    "TOI_125_b":  ("3:00:00", "15:00:00", "48G", "24G", 2,
+                   "ID from GO 4126 abstract; guard catches a b/c swap"),
+    "TOI_125_c":  ("3:00:00", "15:00:00", "48G", "24G", 2,
+                   "ID from GO 4126 abstract; guard catches a b/c swap"),
 }
 
 EXPECTED_DEPTH_PPM = {
@@ -73,6 +81,9 @@ EXPECTED_DEPTH_PPM = {
     "TOI_836_01": 1274, "GJ_3090_b": 1436, "GJ_9827_d": 957, "GJ_357_b": 955,
     "TOI_776_b": 999, "TOI_1231_b": 4914, "L_98_59_d": 2116, "TOI_270_c": 3136,
     "TOI_270_b": 942, "LTT_3780_c": 3352, "TOI_1468_c": 2767, "GJ_1214_b": 13430,
+    # TOI-125 b/c: approximate, from 2.73/2.76 Re on a ~0.85 Rsun host —
+    # the per-fit depth_check against the archive (Rp/Rs)^2 is authoritative.
+    "TOI_125_b": 870, "TOI_125_c": 890,
 }
 
 

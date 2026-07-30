@@ -14,7 +14,10 @@ spectroscopic residual rms).
 
 Uniformity contract (PATCHWORK_FIT_VERSION)
 -------------------------------------------
-Fitting choices are frozen module-wide. v1.1 (the "patched" fit of the
+Fitting choices are frozen module-wide. v1.2 = v1.1 plus the
+COMPASS-style relative-pixel-flux PCA regressors (6 components, Ahrer
+et al. 2025, arXiv:2511.18196) as part of the frozen definition; fits
+without them are stamped "-nopca". v1.1 (the "patched" fit of the
 Patchwork plan, superseding the v1.0 baseline):
 
 - Out-of-transit baseline normalization (ephemeris + literature duration).
@@ -100,7 +103,12 @@ def _import_juliet():
 
 
 # Frozen survey-wide fitting settings. Bump the version if any change.
-PATCHWORK_FIT_VERSION = "1.1"
+# v1.2 (decision Wasi 2026-07-30): COMPASS-style relative-pixel-flux PCA
+# regressors (Ahrer et al. 2025, arXiv:2511.18196) are part of the frozen
+# fit definition. A fit where the PCA components could not be built
+# (no Stage 2 calints) is stamped "1.2-nopca" so it is never silently
+# mixed with the survey fits.
+PATCHWORK_FIT_VERSION = "1.2"
 SAMPLER = "dynesty"
 N_LIVE_WHITE = 500
 N_LIVE_SPEC = 300
@@ -463,11 +471,12 @@ def fit_white_lightcurve(
     results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
 
     posterior = results.posteriors["posterior_samples"]
-    # PCA detrending is not part of frozen v1.1 — stamp the version so
-    # PCA and non-PCA fits can never be silently mixed in one analysis.
+    # PCA detrending is part of frozen v1.2. A fit without the PCA
+    # columns (calints unavailable, or the as-is escape hatch) is
+    # stamped so it can never be silently mixed with the survey fits.
     fit_version = PATCHWORK_FIT_VERSION
-    if any(str(n).startswith("pca_") for n in (regressor_names or [])):
-        fit_version = f"{PATCHWORK_FIT_VERSION}+pca"
+    if not any(str(n).startswith("pca_") for n in (regressor_names or [])):
+        fit_version = f"{PATCHWORK_FIT_VERSION}-nopca"
     summary: dict[str, Any] = {
         "instrument": instrument,
         "fit_version": fit_version,
@@ -1017,7 +1026,7 @@ def prepare_visit_fit_inputs(
     wave_min: float | None = None,
     wave_max: float | None = None,
     fallback_priors: dict[str, Any] | None = None,
-    pca_detrending: bool = False,
+    pca_detrending: bool = True,
 ) -> dict[str, Any]:
     """Shared Stage 4 -> Stage 5 preparation: archive priors, lightcurves,
     trace diagnostics, tilt events, regressor matrix, white-band LD.
@@ -1027,10 +1036,10 @@ def prepare_visit_fit_inputs(
     manifest-cached ``fallback_priors`` written by discover.py are used
     instead, and ``priors_source`` records which one actually ran.
 
-    ``pca_detrending=True`` adds the COMPASS-style relative-pixel-flux
-    PCA regressors (Ahrer et al. 2025) — this CHANGES THE FIT DEFINITION
-    and is not part of frozen v1.1; the caller's fit summary is stamped
-    accordingly by ``build_regressor_matrix`` column names.
+    The COMPASS-style relative-pixel-flux PCA regressors (Ahrer et al.
+    2025) are part of the frozen v1.2 fit and on by default; a fit
+    without them is version-stamped "-nopca" downstream. Disabling
+    (``pca_detrending=False``) is the escape hatch for comparison fits.
     """
     priors_source = "archive"
     try:
@@ -1165,11 +1174,11 @@ class FitNirspecG395hWhiteLight(BaseTool):
         description="'exotic-ld' for Gaussian (q1,q2) priors, 'uniform' to disable.",
     )
     pca_detrending: bool = RuntimeField(
-        default=False,
-        description="Add COMPASS-style relative-pixel-flux PCA regressors "
-                    "(Ahrer et al. 2025). NOT part of frozen v1.1 — the fit "
-                    "version is stamped '+pca' so results are never silently "
-                    "mixed with the survey fits. Needs reduction_dir.",
+        default=True,
+        description="COMPASS-style relative-pixel-flux PCA regressors "
+                    "(Ahrer et al. 2025) — part of the frozen v1.2 survey "
+                    "fit (needs reduction_dir). Disable only for comparison "
+                    "fits; the fit version is then stamped '-nopca'.",
     )
     wave_min: float | None = RuntimeField(
         default=None, description="Optional lower wavelength cut in microns."

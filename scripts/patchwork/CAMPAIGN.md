@@ -1,10 +1,23 @@
 # Patchwork G395H survey campaign — runbook (2026-07-30)
 
-Full uniform reduction of every G395H sub-Neptune on Fir (16 planets,
-25 usable visits), on the **exoTEDRF optimizer branch**
-(`ASTER_EXOTEDRF_REPO=~/exoTEDRF`), with the frozen Patchwork config
-v1.1 and fit v1.1. GJ 9827 d's earlier PyPI-exotedrf reduction was a
-test run — it is REDONE here on the optimizer branch for uniformity.
+Full uniform reduction of every G395H sub-Neptune on Fir (18 planets
+with TOI-125 b & c, 27 usable visits), on the **exoTEDRF optimizer
+branch** (`ASTER_EXOTEDRF_REPO=~/exoTEDRF`), with the frozen Patchwork
+config v1.1 and **fit v1.2** (PCA detrending included). GJ 9827 d's
+earlier PyPI-exotedrf reduction was a test run — it is REDONE here on
+the optimizer branch for uniformity.
+
+Survey decisions locked 2026-07-30 (Wasi):
+- **K2-18 b**: combine all 4 visits across GO 2372 + GO 2722.
+- **TOI-125**: include both planets. GO 4126 ("Comparative Atmospheric
+  Chemistry Within One System") observed TOI-125 **b and c**, one
+  transit each — override jw04126101001="TOI-125 b",
+  jw04126201001="TOI-125 c". If the assignment is swapped the
+  transit-in-window guard refuses at fit time; swap the overrides.
+- **PCA detrending**: survey default, fit version 1.2.
+- **Binning**: R=100 for every target, frozen (standard for sub-Neptune
+  G395H spectra, e.g. arXiv:2501.18477; COMPASS publishes at R~200 —
+  rebin theirs for overlays, never Patchwork's).
 
 Companion to `session_summary_2026-07-29.txt` (the hard-won operational
 detail lives there; this file is the campaign sequence).
@@ -42,12 +55,12 @@ New guards / diagnostics:
   fall back to the cache offline (`priors_source` recorded).
 - **NRS1–NRS2 white-light t0 offset** recorded per visit in the combine
   step (COMPASS sees significant offsets on some targets).
-- **PCA detrending (opt-in, NOT v1.1)**: COMPASS-style relative-pixel-
-  flux PCA regressors (`pca_detrending=True` on the white-light tool).
-  Any fit using it is stamped `1.1+pca` so it can never be silently
-  mixed with survey fits. Off by default — enabling it survey-wide is a
-  fit-definition change for Wasi to decide after an A/B on a Wave 1
-  target.
+- **PCA detrending — SURVEY DEFAULT (fit v1.2, decision Wasi
+  2026-07-30)**: COMPASS-style relative-pixel-flux PCA regressors
+  (6 components) are part of the frozen fit definition. A fit where the
+  components could not be built (no Stage 2 calints, or the as-is
+  escape hatch) is stamped `1.2-nopca` and must not be mixed with
+  survey fits.
 
 ## 1. One-time setup on Fir (before anything)
 
@@ -80,10 +93,19 @@ python -m aster_toolkit.data_reduction.discover \
     --manifest-dir ~/patchwork/manifests
 ```
 
-TOI-125 (2 visits) stays blocked on a planet name — resolve via APT,
-then add `--override jw04126101001="TOI-125 x" --override
-jw04126201001="TOI-125 x"` and rerun. (All three TOI-125 planets are
-sub-Neptunes; resolving this takes the in-demographic count 12 -> 13.)
+Include the TOI-125 overrides (GO 4126 observed b and c):
+
+```bash
+python -m aster_toolkit.data_reduction.discover \
+    --raw-root /project/def-ncowan/wasi/jwst_raw \
+    --manifest-dir ~/patchwork/manifests \
+    --override jw04126101001="TOI-125 b" \
+    --override jw04126201001="TOI-125 c"
+```
+
+Sanity check the assignment in the discovery report (predicted transit
+offsets); a swapped b/c is also caught loudly by the fit-time
+transit-in-window guard — then swap the overrides and refit.
 
 ## 3. Generate the job scripts + submission plan
 
@@ -100,11 +122,11 @@ This prints every sbatch command, sized per target, in order:
 - **Wave 1** (validate the path end-to-end at low cost):
   TOI-1468 c, LTT 3780 c, TOI-270 c, TOI-1231 b
 - **Wave 2**: GJ 1214 b (easiest sanity check, ~13430 ppm), TOI-270 b,
-  L 98-59 d, GJ 357 b, TOI-776 b, TOI-836.01
+  L 98-59 d, GJ 357 b, TOI-776 b, TOI-836.01, TOI-125 b, TOI-125 c
 - **Wave 3** (multi-visit): GJ 9827 d (redo), GJ 3090 b, TOI-776 c,
   TOI-836 b
-- **Wave 4**: K2-18 b (cross-program combine = Wasi's call BEFORE the
-  combine step), TOI-561 b (21k integrations; watch MaxRSS)
+- **Wave 4**: K2-18 b (4-visit cross-program combine, approved),
+  TOI-561 b (21k integrations; watch MaxRSS)
 
 Rules that have already cost jobs: submit with NO venv active; absolute
 sbatch paths; never two jobs on one workdir; REDUCE alone first
