@@ -83,6 +83,20 @@ Also verify `ASTER_EXOTEDRF_REPO=~/exoTEDRF` is exported in `~/.bashrc`
 (the optimizer-branch checkout is the survey's reduction engine) and
 the ExoTiC-LD mps1 grids exist at `$ASTER_EXOTIC_LD_DATA`.
 
+**If you will drive the campaign from the ASTER GUI**, one more one-time
+step — without it every shell command the agent runs returns *empty*, and
+the agent will invent results from the blank:
+
+```bash
+echo 'set enable-bracketed-paste off' >> ~/.inputrc
+```
+
+Fir's shell otherwise wraps command output in bracketed-paste ANSI
+escapes (`\x1b[?2004l`), and those control characters do not survive into
+the model's context. Do **not** instead add a non-interactive guard to
+`~/.bashrc` — the `ASTER_EXOTEDRF_*` exports live there and the
+`bash -lc` submission pattern needs them sourced.
+
 ## 2. Regenerate manifests (login node — needs the archive)
 
 The priors cache is new; regenerate so every manifest carries it:
