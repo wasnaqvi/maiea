@@ -42,6 +42,15 @@ from aster_toolkit.data_reduction.survey import (  # noqa: E402
 # slug -> (reduce_walltime, fit_walltime, reduce_mem, fit_mem, wave, note)
 # Waves: 1 = cheap single-visit validation, 2 = remaining single-visit,
 # 3 = multi-visit, 4 = large / needs a human decision first.
+#
+# MEASURED (2026-07-30, Wave 1, Stage 3 only with Stages 1-2 cached):
+#   TOI-1468 c  1278 ints  5.8 G  5m14
+#   LTT 3780 c  1543 ints  7.0 G  5m14
+#   TOI-270 c   1763 ints  7.7 G  5m26
+#   TOI-1231 b  2726 ints 11.4 G  6m00
+# => Stage 3 MaxRSS ~ 0.65 G + 4 MB per integration; Stage 3 itself is
+# ~5 min. The reduce_mem values below are sized for a COLD run (Stages
+# 1-3), which is why they exceed these numbers.
 SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "TOI_1468_c": ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
     "LTT_3780_c": ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
@@ -67,9 +76,16 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "K2_18_b":    ("8:00:00", "2-12:00:00", "48G", "24G", 4,
                    "cross-program 4-visit combine APPROVED (Wasi 2026-07-30); "
                    "TIMED OUT at 4 h on the first attempt"),
-    "TOI_561_b":  ("24:00:00", "15:00:00", "64G", "32G", 4,
+    # Memory raised 64G -> 128G. MEASURED Stage 3 MaxRSS on Wave 1 scales
+    # ~linearly with integration count (0.65 G + ~4 MB/integration over
+    # 1278-2726 ints: 5.8/7.0/7.7/11.4 G). Extrapolated to this target's
+    # 21228 integrations that is ~86 G — past the old 64 G request, and an
+    # OOM would land AFTER up to 24 h of Stages 1-2. The extrapolation is
+    # 8x beyond the measured range and may flatten if exoTEDRF chunks by
+    # segment, but headroom is far cheaper than a lost day.
+    "TOI_561_b":  ("24:00:00", "15:00:00", "128G", "32G", 4,
                    "21228 integrations in one visit; TIMED OUT at 12 h on the "
-                   "first attempt; watch MaxRSS, raise mem if OOM"),
+                   "first attempt; mem extrapolated from Wave 1 MaxRSS"),
     # GO 4126 observed TOI-125 b AND c, one transit each (proposal
     # abstract, ADS 2023jwst.prop.4126F). Manifest overrides:
     #   --override jw04126101001="TOI-125 b" --override jw04126201001="TOI-125 c"
