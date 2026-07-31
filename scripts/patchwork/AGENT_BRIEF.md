@@ -1,17 +1,15 @@
 # Patchwork campaign — agent operating brief
 
 **READ THIS WHOLE FILE FIRST.** Your file reader returns ~100 lines per
-call. This file is longer than that. Call it again with an offset until
-you have reached the end. Do not act on a partial read, and do not claim
-to have read it in full until you have seen the final line.
+call and this file is longer; call it again with an offset until you
+reach the end. Do not act on a partial read or claim a full one.
 
-**Do not ask permission to execute the PROTOCOL.** It is a standing
-instruction from Wasi. Execute the next eligible action and report what
-happened. Ask only when a STOP condition below is met.
+**Do not ask permission to execute the PROTOCOL** — it is a standing
+instruction from Wasi. Execute the next eligible action and report.
+Ask only when a STOP condition below is met.
 
-**Never invent a result.** If a command returns empty output, say
-"command returned no output" and stop. Blank output means the tool
-failed, not that the answer is nothing.
+**Never invent a result.** Empty output means the tool failed, not that
+the answer is nothing. Say "command returned no output" and stop.
 
 You operate the Patchwork JWST NIRSpec/G395H sub-Neptune survey on DRAC
 **Fir**: submit, monitor, verify, archive. The science is frozen; Wasi
@@ -32,11 +30,9 @@ adjudicates every flag you raise.
    env -i HOME="$HOME" USER="$USER" bash -lc '<VARS> sbatch --export=ALL <FLAGS> <ABSOLUTE_SCRIPT>'
    ```
 
-   **The `env -i` wrapper is ONLY for `sbatch`.** It strips PATH, so
-   `python` inside it is the bare system interpreter with no aster-env
-   and no numpy. Everything else — the generator, `squeue`, `sacct`,
-   `ls`, `rsync` — runs as a PLAIN command in the normal shell, where
-   aster-env is already active. Wrapping those breaks them.
+   **`env -i` is ONLY for `sbatch`.** It strips PATH, so `python` inside
+   it has no aster-env and no numpy. The generator, `squeue`, `sacct`,
+   `ls`, `rsync` all run as PLAIN commands — wrapping them breaks them.
 
 3. **Absolute sbatch paths only.**
 
@@ -53,13 +49,12 @@ adjudicates every flag you raise.
 
 ## PATHS
 
-`RunCommandTool` is unrestricted — use **absolute paths**. `ReadFileTool`
-is sandboxed to `workspace/` — use the **link** column.
+`RunCommandTool` is unrestricted — **absolute paths**. `ReadFileTool` is
+sandboxed to `workspace/` — use the **link** column.
 
 | what | absolute | link |
 |---|---|---|
-| repo | `/home/wasi/aster/maiea` | — |
-| briefs + generator | `/home/wasi/aster/maiea/scripts/patchwork` | `patchwork_scripts/` |
+| repo / briefs / generator | `/home/wasi/aster/maiea` (`scripts/patchwork`) | `patchwork_scripts/` |
 | job scripts | `/home/wasi/patchwork/jobs/run_<SLUG>.sbatch` | `jobs/` |
 | manifests | `/home/wasi/patchwork/manifests/<SLUG>.json` | `manifests/` |
 | output root | `/home/wasi/scratch/patchwork` (PURGED) | `results/` |
@@ -68,8 +63,8 @@ is sandboxed to `workspace/` — use the **link** column.
 
 ## PROTOCOL — run this every session
 
-**Step 0 — assess.** Run each and report the RAW output; if any returns
-nothing, stop and say so:
+**Step 0 — assess.** Run each, report RAW output; if any returns nothing,
+stop and say so:
 
 ```
 squeue -u $USER
