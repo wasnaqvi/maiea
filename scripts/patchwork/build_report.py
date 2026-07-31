@@ -97,11 +97,18 @@ def markdown_to_pdf(md_path: Path, out_path: Path) -> Path:
                             alignment=TA_LEFT, spaceAfter=6),
         "li": ParagraphStyle("li", fontName=base, fontSize=9, leading=13,
                              leftIndent=14, bulletIndent=4, spaceAfter=3),
-        "cell": ParagraphStyle("cell", fontName=base, fontSize=6.4,
-                               leading=8.0),
-        "cellh": ParagraphStyle("cellh", fontName=bold, fontSize=6.4,
-                                leading=8.0, textColor=colors.white),
     }
+
+    def _cell_styles(ncol: int):
+        """Table text scales with column count — a 6-column table should
+        not be set at the size a 12-column one needs."""
+        size = 9.0 if ncol <= 5 else 8.0 if ncol <= 7 else 7.0 if ncol <= 9 \
+            else 6.0
+        return (ParagraphStyle(f"c{ncol}", fontName=base, fontSize=size,
+                               leading=size * 1.28),
+                ParagraphStyle(f"ch{ncol}", fontName=bold, fontSize=size,
+                               leading=size * 1.28,
+                               textColor=colors.HexColor(_INK)))
 
     flow = []
     lines = md_path.read_text().splitlines()
@@ -131,32 +138,40 @@ def markdown_to_pdf(md_path: Path, out_path: Path) -> Path:
             ncol = max(len(r) for r in rows)
             rows = [r + [""] * (ncol - len(r)) for r in rows]
 
-            # Column widths from content length, clamped so no column
-            # collapses and none dominates.
+            # Column widths from content length, but never narrower than
+            # the longest unbreakable TOKEN in the column -- otherwise a
+            # name like "TOI-1231" gets hyphen-broken mid-word.
             weights = []
             for c in range(ncol):
-                longest = max(len(re.sub(r"<[^>]+>|\*\*|`", "", r[c]))
-                              for r in rows)
-                weights.append(min(max(longest, 8), 34))
+                cells = [re.sub(r"<[^>]+>|\*\*|`", "", r[c]) for r in rows]
+                longest = max(len(x) for x in cells)
+                longest_word = max((len(w) for x in cells
+                                    for w in re.split(r"[\s/]+", x)), default=1)
+                weights.append(min(max(longest, 1.6 * longest_word, 10), 30))
             total = sum(weights)
             widths = [avail * w / total for w in weights]
 
+            cell_st, head_st = _cell_styles(ncol)
             data = [[Paragraph(_inline(c, mono),
-                               st["cellh"] if ri == 0 else st["cell"])
+                               head_st if ri == 0 else cell_st)
                      for c in row] for ri, row in enumerate(rows)]
             tbl = Table(data, colWidths=widths, repeatRows=1)
+            # Booktabs-style: horizontal rules only. Vertical grid lines
+            # and row shading make a scientific table look like a
+            # spreadsheet; rules alone read better and print cleaner.
             tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(_INK)),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor(_RULE)),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-                 [colors.white, colors.HexColor("#F4F6F9")]),
-                ("LEFTPADDING", (0, 0), (-1, -1), 3),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LINEABOVE", (0, 0), (-1, 0), 1.1, colors.HexColor(_INK)),
+                ("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.HexColor(_INK)),
+                ("LINEBELOW", (0, -1), (-1, -1), 1.1, colors.HexColor(_INK)),
+                ("LINEBELOW", (0, 1), (-1, -2), 0.25,
+                 colors.HexColor(_RULE)),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ]))
-            flow += [Spacer(1, 4), tbl, Spacer(1, 8)]
+            flow += [Spacer(1, 6), tbl, Spacer(1, 10)]
             continue
 
         # ---- headings / rules / lists / paragraphs ----
