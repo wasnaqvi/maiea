@@ -229,6 +229,35 @@ tools = [
 if llm_provider == 'openai':
     tools.insert(5, WebSearchTool())
 
+# Tool profiles. All ~28 schemas are sent on EVERY request; the Patchwork
+# tools have long docstrings, so the full set costs ~11k tokens before the
+# conversation starts -- enough to exhaust a 30k TPM tier in one turn.
+#
+# 'campaign' loads only what scripts/patchwork/AGENT_BRIEF.md needs. It
+# also OMITS RunPatchworkTarget, ReduceNirspecG395hTso and the fit tools,
+# so the brief's first hard rule (never run hours of compute in-process on
+# a login node) is enforced structurally rather than by instruction.
+CAMPAIGN_TOOLS = {
+    'RunCommandTool',            # sbatch / squeue / sacct / ls / rsync
+    'ReadFileTool',              # the brief, and the JSON products
+    'FileSearchTool',
+    'VerifyPatchworkEnvironment',  # the preflight gate
+    'TodoRead', 'TodoWrite',
+}
+
+
+def _tool_name(tool):
+    return getattr(tool, '__name__', None) or type(tool).__name__
+
+
+tool_profile = os.getenv('ASTER_TOOL_PROFILE', 'full').lower()
+if tool_profile == 'campaign':
+    tools = [t for t in tools if _tool_name(t) in CAMPAIGN_TOOLS]
+elif tool_profile != 'full':
+    raise SystemExit(
+        f"Unknown ASTER_TOOL_PROFILE={tool_profile!r}. Use 'full' or 'campaign'."
+    )
+
 hooks = [DangerousCommandHook()]
 
 
