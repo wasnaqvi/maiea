@@ -32,6 +32,12 @@ adjudicates every flag you raise.
    env -i HOME="$HOME" USER="$USER" bash -lc '<VARS> sbatch --export=ALL <FLAGS> <ABSOLUTE_SCRIPT>'
    ```
 
+   **The `env -i` wrapper is ONLY for `sbatch`.** It strips PATH, so
+   `python` inside it is the bare system interpreter with no aster-env
+   and no numpy. Everything else — the generator, `squeue`, `sacct`,
+   `ls`, `rsync` — runs as a PLAIN command in the normal shell, where
+   aster-env is already active. Wrapping those breaks them.
+
 3. **Absolute sbatch paths only.**
 
 4. **Never two jobs on one target.** Check `squeue -u $USER` first.
@@ -80,10 +86,11 @@ queued/running/done/verified | archived | BLOCKED`.
 `/home/wasi/exoTEDRF` as the source. If it names the installed release,
 STOP and report — the optimizer branch is not the engine.
 
-**Step 2 — get the sizing.** Never hand-write walltime or memory:
+**Step 2 — get the sizing.** Never hand-write walltime or memory. Run
+this as a PLAIN command — no `env -i` wrapper, it needs aster-env:
 
 ```
-env -i HOME="$HOME" USER="$USER" bash -lc 'python /home/wasi/aster/maiea/scripts/patchwork/generate_survey_jobs.py --manifest-dir /home/wasi/patchwork/manifests --output-root /home/wasi/scratch/patchwork --job-dir /home/wasi/patchwork/jobs --mail-user naqviw802@gmail.com'
+python /home/wasi/aster/maiea/scripts/patchwork/generate_survey_jobs.py --manifest-dir /home/wasi/patchwork/manifests --output-root /home/wasi/scratch/patchwork --job-dir /home/wasi/patchwork/jobs --mail-user naqviw802@gmail.com
 ```
 
 It prints the wave order, each target's expected depth, and the exact
