@@ -258,7 +258,21 @@ elif tool_profile != 'full':
         f"Unknown ASTER_TOOL_PROFILE={tool_profile!r}. Use 'full' or 'campaign'."
     )
 
-hooks = [DangerousCommandHook()]
+# DangerousCommandHook substring-matches a literal pattern list. Its
+# default includes the bare word 'format', intended for disk formatting
+# but which also matches '--format=' -- so it blocks `sacct --format`,
+# `squeue --format`, `git log --format`, and anything else that reports
+# in a chosen layout. Disk formatting is already covered by 'mkfs', so
+# the bare pattern is dropped and the rest kept verbatim.
+hooks = [DangerousCommandHook(patterns=[
+    'rm -rf /',
+    'rm -rf /*',
+    'dd if=',
+    'mkfs',
+    '> /dev/',
+    ':(){:|:&};:',        # fork bomb
+    'cat /etc/passwd',
+])]
 
 
 def build_agent():
