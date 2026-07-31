@@ -168,9 +168,19 @@ base_directory = 'workspace'
 os.makedirs(base_directory, exist_ok=True)
 llm_provider = get_llm_provider()
 
+# The persistent shell keeps state (cd, exports) between calls, but it
+# drives a pexpect session that syncs on a prompt marker -- on a cluster
+# login node the MOTD and .bashrc chatter desync that marker and every
+# command then returns EMPTY output. An agent that cannot read its own
+# command output invents results, which is worse than losing shell state.
+# No documented ASTER workflow depends on persistence (the reduction
+# tooling uses absolute paths throughout), so default to off.
+# Set ASTER_PERSISTENT_SHELL=1 to restore the old behavior.
+persistent_shell = os.getenv('ASTER_PERSISTENT_SHELL', '0') == '1'
+
 tools = [
     # File and command tools
-    RunCommandTool(base_directory=base_directory, persistent=True),
+    RunCommandTool(base_directory=base_directory, persistent=persistent_shell),
     WriteFileTool(base_directory=base_directory),
     ReadFileTool(base_directory=base_directory, show_line_numbers=True),
     EditFileTool(base_directory=base_directory),
