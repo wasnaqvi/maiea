@@ -540,7 +540,8 @@ def fit_white_lightcurve(
         results, lc, instrument, out,
         title=figure_title(priors.get("planet_name", ""), instrument,
                            program=program, visit=visit,
-                           suffix="white light"))
+                           suffix="white light"),
+        depth_ppm=summary["depth_ppm"]["median"])
 
     with (out / "white_fit_summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
@@ -606,8 +607,16 @@ def _savefig(fig, out: Path, stem: str) -> None:
 
 
 def _plot_white_fit(results, lc, instrument: str, out: Path,
-                    title: str = "") -> None:
-    """White-light fit figure, formatted for circulation."""
+                    title: str = "", depth_ppm: float | None = None) -> None:
+    """White-light fit figure, formatted for circulation.
+
+    ``depth_ppm`` is the transit depth from the posterior (median of
+    p^2). Pass it — do NOT infer the depth from ``min(model)``, which
+    also contains the linear-systematics trend and any tilt-step
+    offsets. On a visit with strong systematics the two disagree badly
+    (TOI-270 c: 7249 ppm from the model minimum vs 5230 ppm from the
+    posterior), and the figure would misreport the measurement.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -619,12 +628,21 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
         model = results.lc.evaluate(instrument)
         residual = flux - model
         rms = float(np.nanstd(residual) * 1e6)
-        depth_ppm = (1.0 - float(np.nanmin(model))) * 1e6
+        if depth_ppm is None:  # fallback only; see docstring
+            depth_ppm = (1.0 - float(np.nanmin(model))) * 1e6
 
         fig, (a1, a2) = plt.subplots(2, 1, figsize=(10.0, 6.4), sharex=True,
                                      height_ratios=[3, 1])
-        a1.plot(t_hr, flux, "o", ms=2.4, mew=0, color=DATA_COLOR, alpha=0.16,
-                zorder=1, label="integrations")
+        # Per-integration errors, drawn as a separate faint layer under
+        # more opaque markers. One errorbar() call with a single alpha
+        # either buries the binned series (bars too strong) or hides the
+        # uncertainties (markers too weak); splitting them shows the
+        # scatter is consistent with the quoted error without mush.
+        a1.errorbar(t_hr, flux, yerr=lc["wl_err"], fmt="none",
+                    ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
+                    alpha=0.18, zorder=1)
+        a1.plot(t_hr, flux, "o", ms=2.4, mew=0, color=DATA_COLOR, alpha=0.38,
+                zorder=2, label="integrations")
         bx, by, be = _bin_series(t_hr, flux)
         a1.errorbar(bx, by, yerr=be, fmt="o", ms=5.0, mew=0,
                     color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.2,
@@ -642,8 +660,11 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
                     xy=(0.985, 0.06), xycoords="axes fraction", ha="right",
                     va="bottom", fontsize=10.5, color="#4E5866")
 
+        a2.errorbar(t_hr, residual * 1e6, yerr=lc["wl_err"] * 1e6, fmt="none",
+                    ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
+                    alpha=0.18, zorder=1)
         a2.plot(t_hr, residual * 1e6, "o", ms=2.4, mew=0, color=DATA_COLOR,
-                alpha=0.16, zorder=1)
+                alpha=0.38, zorder=2)
         rbx, rby, rbe = _bin_series(t_hr, residual * 1e6)
         a2.errorbar(rbx, rby, yerr=rbe, fmt="o", ms=4.5, mew=0,
                     color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.1,
