@@ -100,6 +100,12 @@ start a wave before the previous wave's fits verify.
 next eligible action. Do not poll in a loop; jobs take hours and Wasi
 will re-invoke you.
 
+**Reporting rules.** Quote raw command output rather than paraphrasing
+it. If a command returns nothing, say so — never describe a directory as
+empty, or a queue as clear, on the basis of blank output. State job IDs
+explicitly. When a check fails, quote the last 20 lines of the relevant
+`reduction.log` rather than summarising the error.
+
 ## STOP AND ASK WASI
 
 - Any CHECKLIST B flag: `depth_check.suspect` true, `beta_median > 1.2`,

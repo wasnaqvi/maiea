@@ -61,10 +61,15 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "GJ_3090_b":  ("3:00:00", "30:00:00", "48G", "24G", 3, ""),
     "TOI_776_c":  ("4:00:00", "30:00:00", "48G", "24G", 3, ""),
     "TOI_836_b":  ("6:00:00", "30:00:00", "48G", "24G", 3, ""),
-    "K2_18_b":    ("4:00:00", "2-12:00:00", "48G", "24G", 4,
-                   "cross-program 4-visit combine APPROVED (Wasi 2026-07-30)"),
-    "TOI_561_b":  ("12:00:00", "15:00:00", "64G", "32G", 4,
-                   "21228 integrations in one visit; watch MaxRSS, raise mem if OOM"),
+    # Walltimes raised 2026-07-30 after both TIMED OUT during Stages 1-2
+    # at the original 4 h / 12 h. Measured: every other target finished
+    # Stages 1-2 in 27 min - 2 h; these two are the outliers by volume.
+    "K2_18_b":    ("8:00:00", "2-12:00:00", "48G", "24G", 4,
+                   "cross-program 4-visit combine APPROVED (Wasi 2026-07-30); "
+                   "TIMED OUT at 4 h on the first attempt"),
+    "TOI_561_b":  ("24:00:00", "15:00:00", "64G", "32G", 4,
+                   "21228 integrations in one visit; TIMED OUT at 12 h on the "
+                   "first attempt; watch MaxRSS, raise mem if OOM"),
     # GO 4126 observed TOI-125 b AND c, one transit each (proposal
     # abstract, ADS 2023jwst.prop.4126F). Manifest overrides:
     #   --override jw04126101001="TOI-125 b" --override jw04126201001="TOI-125 c"
