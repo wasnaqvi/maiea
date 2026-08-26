@@ -6,3 +6,6 @@ orchestral-ai
 corner
 pymultinest
 taurex_ultranest
+# Stage 6.5 unocculted-spot retrieval (contamination.py). Stage 5.5 is
+# pure numpy, so the fit step does not need this.
+emcee
