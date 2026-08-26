@@ -56,12 +56,14 @@ from .lightcurves import (
     G395H_WAVE_RANGES,
     build_lightcurves,
     build_regressor_matrix,
-    detect_tilt_events,
+    detect_tilt_events,  # noqa: F401 — re-export; find_tilt_events superseded it
     find_stage2_calints,
+    find_tilt_events,
     load_stage3_spectra,
     pca_regressors,
     propagate_t0,
     rednoise_beta,
+    tilt_transition_keep_mask,
     trace_diagnostics,
 )
 
@@ -108,7 +110,12 @@ def _import_juliet():
 # fit definition. A fit where the PCA components could not be built
 # (no Stage 2 calints) is stamped "1.2-nopca" so it is never silently
 # mixed with the survey fits.
-PATCHWORK_FIT_VERSION = "1.2"
+# v1.3 (referee feedback 2026-08-03): the Stage 5.5 occulted-spot scan
+# (contamination.py) is part of the frozen fit — confirmed spot and
+# facula crossings are masked and the lightcurve is refit. A fit where
+# the scan did not run is stamped "1.3-noscan". The stamps compose:
+# "1.3-nopca-noscan" is possible and is not a survey fit.
+PATCHWORK_FIT_VERSION = "1.3"
 SAMPLER = "dynesty"
 N_LIVE_WHITE = 500
 N_LIVE_SPEC = 300
@@ -120,6 +127,68 @@ THETA_BOUNDS = [-0.1, 0.1]    # uniform prior on every linear regressor coeff
 
 # Back-compat alias (pre-Stage4 name).
 load_extracted_spectra = load_stage3_spectra
+
+
+# -------------------- published same-band depths --------------------
+
+# The automatic depth check used to compare every white-light depth
+# against the archive (Rp/Rs)^2, which for these targets comes from TESS
+# discovery photometry — a different bandpass. Limb darkening differs
+# between the optical and 3-5 um, and unocculted spots change the two
+# bands by different amounts, so a healthy G395H depth routinely sits
+# 10-15% from the TESS value and the check fired on healthy targets
+# survey-wide (referee feedback, 2026-08-03). A cross-band comparison
+# can only ever be indicative.
+#
+# Where a published *same-band* (JWST G395H) depth exists, compare
+# against that instead and keep the tolerance tight. Depths in ppm,
+# errors as published; keys are archive planet names, with aliases
+# resolved by ``published_depth_reference``.
+PUBLISHED_G395H_DEPTHS: dict[str, dict[str, Any]] = {
+    "LTT 3780 c": {
+        "depth_ppm": 3434.0, "err_ppm": 73.0,
+        "reference": "A JWST Transmission Spectrum of the Temperate "
+                     "Sub-Neptune TOI-732 c, ApJL (2025), arXiv:2512.15844",
+        "note": "GO 3557; NIRSpec G395H + MIRI LRS, 0.9-12 um.",
+    },
+    "TOI-1231 b": {
+        "depth_ppm": 5571.0, "err_ppm": 21.0,
+        "reference": "Sarkar et al. (2026), arXiv:2607.00973",
+        "note": "GO 3557; NIRISS SOSS + NIRSpec G395H. They model the "
+                "spot crossings with SPOTROD and fit one white lightcurve "
+                "from NRS1+NRS2 combined; Patchwork masks the crossings "
+                "and fits the detectors separately.",
+    },
+}
+
+# Names the archive and the literature disagree on. Left side is any
+# name a caller might pass; right side is the PUBLISHED_G395H_DEPTHS key.
+_PLANET_ALIASES = {
+    "TOI-732 c": "LTT 3780 c",
+    "TOI-732.02": "LTT 3780 c",
+}
+
+# Fractional tolerance before a depth is called out. Same-band: a real
+# 3-sigma disagreement with a published G395H depth is worth stopping
+# for. Cross-band: only a gross failure (the prior-returning fit, which
+# lands ~1800 ppm regardless of target) should trigger anything.
+SAME_BAND_TOL_FRAC = 0.10
+CROSS_BAND_TOL_FRAC = 0.35
+
+
+def published_depth_reference(planet_name: str) -> dict[str, Any] | None:
+    """Published same-band (JWST G395H) transit depth for a planet, or None.
+
+    Add entries to ``PUBLISHED_G395H_DEPTHS`` as the literature grows;
+    every entry needs a citation, because this value is what the survey
+    validates itself against.
+    """
+    if not planet_name:
+        return None
+    key = planet_name.strip()
+    key = _PLANET_ALIASES.get(key, key)
+    entry = PUBLISHED_G395H_DEPTHS.get(key)
+    return dict(entry, planet_name=key) if entry else None
 
 
 # -------------------- archive priors --------------------
@@ -423,6 +492,103 @@ def _white_priors(
 # -------------------- fitting --------------------
 
 
+def evaluate_depth_check(
+    measured_ppm: float,
+    err_ppm: float,
+    priors: dict[str, Any],
+    *,
+    planet_name: str = "",
+) -> dict[str, Any]:
+    """Compare a white-light depth against the best available reference.
+
+    Reference selection, in order:
+
+    1. A published JWST/G395H depth for this planet
+       (``PUBLISHED_G395H_DEPTHS``) — the same bandpass, same physics.
+       Tolerance ``SAME_BAND_TOL_FRAC``, and a disagreement is flagged.
+    2. The archive (Rp/Rs)^2, which for the Patchwork targets is TESS
+       discovery photometry. This is a *different band*: limb darkening
+       differs, and unocculted spots on an M dwarf change the optical and
+       infrared depths by different amounts. Measured G395H depths in
+       Patchwork 1 ran +0.3% to +14% from the TESS value on targets whose
+       fits were independently verified as healthy, so a cross-band
+       comparison flags healthy targets and cannot be called "suspect".
+       Tolerance ``CROSS_BAND_TOL_FRAC``, and the status stays
+       ``indicative``.
+
+    Either way an error bar larger than half the expected depth is a
+    hard failure — that is the signature of a fit that returned its
+    prior, and it does not depend on the bandpass.
+
+    Returns the check dict stored in ``white_fit_summary.json``:
+    ``status`` is one of ``ok``, ``suspect`` (same-band disagreement or a
+    prior-returning fit), ``indicative`` (cross-band, informational), or
+    ``unavailable``. ``suspect`` is kept as a boolean for back-compat
+    and is True only for ``status == 'suspect'``.
+    """
+    published = published_depth_reference(planet_name)
+    if published:
+        expected = float(published["depth_ppm"])
+        expected_err = float(published.get("err_ppm") or 0.0)
+        band, source = "same-band", published["reference"]
+        tol_frac = SAME_BAND_TOL_FRAC
+    elif priors.get("rp_rs"):
+        expected = float(priors["rp_rs"]) ** 2 * 1e6
+        expected_err = 0.0
+        band, source = "cross-band", "NASA Exoplanet Archive (Rp/Rs)^2, optical"
+        tol_frac = CROSS_BAND_TOL_FRAC
+    else:
+        return {"status": "unavailable", "suspect": False,
+                "reason": "No published G395H depth and no archive Rp/Rs."}
+
+    # Combined scale for the disagreement: the fit error, the published
+    # error, and the tolerance floor. Without the floor a target with a
+    # 21 ppm published error and a 6 ppm fit error is "5 sigma off" at a
+    # 0.5% difference that no one would question.
+    scale = np.hypot(err_ppm, expected_err)
+    sigma_off = abs(measured_ppm - expected) / scale if scale > 0 else float("inf")
+    frac_off = abs(measured_ppm - expected) / expected if expected else float("inf")
+
+    returned_prior = err_ppm > 0.5 * expected
+    disagrees = frac_off > tol_frac and sigma_off > 3.0
+
+    if returned_prior:
+        status = "suspect"
+    elif band == "same-band" and disagrees:
+        status = "suspect"
+    elif band == "cross-band" and disagrees:
+        status = "indicative"
+    else:
+        status = "ok"
+
+    return {
+        "status": status,
+        "suspect": status == "suspect",
+        "band": band,
+        "reference_source": source,
+        "expected_ppm": expected,
+        "expected_err_ppm": expected_err,
+        "measured_ppm": float(measured_ppm),
+        "err_ppm": float(err_ppm),
+        "difference_ppm": float(measured_ppm - expected),
+        "difference_frac": float(measured_ppm / expected - 1.0) if expected else None,
+        "difference_sigma": float(sigma_off),
+        "tolerance_frac": tol_frac,
+        "returned_prior": bool(returned_prior),
+        # Kept so nothing downstream that reads the old key breaks.
+        "expected_ppm_from_archive": expected,
+    }
+
+
+def _apply_keep_mask(arrays: dict[str, np.ndarray], keep: np.ndarray | None):
+    """Subset parallel per-integration arrays by a KEEP mask."""
+    if keep is None:
+        return arrays
+    keep = np.asarray(keep, dtype=bool)
+    return {k: (v[keep] if getattr(v, "shape", (0,))[:1] == keep.shape else v)
+            for k, v in arrays.items()}
+
+
 def fit_white_lightcurve(
     lc: dict[str, Any],
     priors: dict[str, Any],
@@ -436,6 +602,11 @@ def fit_white_lightcurve(
     program: str = "",
     visit: str = "",
     n_live: int = N_LIVE_WHITE,
+    keep_mask: np.ndarray | None = None,
+    anomaly_scan: dict[str, Any] | None = None,
+    tilt_report: dict[str, Any] | None = None,
+    n_spot_masked: int = 0,
+    n_tilt_masked: int = 0,
 ) -> dict[str, Any]:
     """Fit the white-light transit of one visit x detector with juliet.
 
@@ -443,6 +614,14 @@ def fit_white_lightcurve(
     posterior summary (medians + 1-sigma), residual rms, and metadata
     (regressors used, LD source, tilt events) — the orbit is frozen to
     this in the spectroscopic fits.
+
+    ``keep_mask`` (True = use this integration) drops the occulted
+    spot/facula crossings found by the Stage 5.5 scan
+    (``contamination.anomaly_keep_mask``). Pass ``anomaly_scan`` — the
+    ``anomaly_report.json`` payload — so the summary records what was
+    masked and why; without it the fit is version-stamped ``-noscan``,
+    because a fit that never looked for crossings is not uniform with
+    one that looked and found none.
     """
     if model_type != "transit":
         raise NotImplementedError(
@@ -459,13 +638,29 @@ def fit_white_lightcurve(
         regressors, regressor_names = build_regressor_matrix(times)
     n_reg = regressors.shape[1]
 
+    keep = (np.ones(times.size, dtype=bool) if keep_mask is None
+            else np.asarray(keep_mask, dtype=bool))
+    if keep.size != times.size:
+        raise ValueError(
+            f"keep_mask has {keep.size} entries but the lightcurve has "
+            f"{times.size} integrations."
+        )
+    n_masked = int((~keep).sum())
+    if keep.sum() < 50:
+        raise ValueError(
+            f"The anomaly mask leaves only {int(keep.sum())} of {times.size} "
+            "integrations. Masking that much of a visit is not a correction — "
+            "inspect the Stage 5.5 scan; the event is probably instrumental "
+            "or the whole visit is bad."
+        )
+
     prior_dict = _white_priors(priors, lc["t0_obs"], instrument, n_reg, ld)
     dataset = juliet.load(
         priors=prior_dict,
-        t_lc={instrument: times},
-        y_lc={instrument: lc["wl_flux"]},
-        yerr_lc={instrument: lc["wl_err"]},
-        linear_regressors_lc={instrument: regressors},
+        t_lc={instrument: times[keep]},
+        y_lc={instrument: lc["wl_flux"][keep]},
+        yerr_lc={instrument: lc["wl_err"][keep]},
+        linear_regressors_lc={instrument: regressors[keep]},
         out_folder=str(out),
     )
     results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
@@ -476,7 +671,12 @@ def fit_white_lightcurve(
     # stamped so it can never be silently mixed with the survey fits.
     fit_version = PATCHWORK_FIT_VERSION
     if not any(str(n).startswith("pca_") for n in (regressor_names or [])):
-        fit_version = f"{PATCHWORK_FIT_VERSION}-nopca"
+        fit_version = f"{fit_version}-nopca"
+    # v1.3: the Stage 5.5 occulted-spot scan is part of the frozen fit.
+    # "scan ran and found nothing" and "scan never ran" are different
+    # states and must not share a version stamp.
+    if anomaly_scan is None:
+        fit_version = f"{fit_version}-noscan"
     summary: dict[str, Any] = {
         "instrument": instrument,
         "fit_version": fit_version,
@@ -487,6 +687,43 @@ def fit_white_lightcurve(
         "planet_name": priors.get("planet_name", ""),
         "program": program,
         "visit": visit,
+        "spot_handling": {
+            "scan_ran": anomaly_scan is not None,
+            "method": "mask" if anomaly_scan is not None else None,
+            "n_masked": int(n_spot_masked),
+            "frac_masked": float(n_spot_masked / max(1, times.size)),
+            "contam_version": (anomaly_scan or {}).get("contam_version"),
+            "events": [
+                {k: e.get(k) for k in
+                 ("kind", "confirmed", "amplitude_ppm", "peak_sigma",
+                  "hours_from_mid", "amplitude_ratio", "achromatic")}
+                for e in (anomaly_scan or {}).get("events", [])
+            ],
+        },
+        # Tilt events are CORRECTED, not masked: one Heaviside step
+        # regressor each, amplitude free (and free per channel
+        # downstream, since the flux change is pixel-dependent and can
+        # go either way). Only the few integrations at the transition
+        # are dropped.
+        "tilt_handling": {
+            "search_ran": tilt_report is not None,
+            "method": ("heaviside step regressor + transition mask"
+                       if tilt_report is not None else None),
+            "n_events": len(((tilt_report or {}).get("events")) or []),
+            "n_transition_masked": int(n_tilt_masked),
+            "searched_diagnostics": bool(
+                (tilt_report or {}).get("diagnostics_available")),
+            "sources_searched": (tilt_report or {}).get("sources_searched"),
+            "rate_warning": (tilt_report or {}).get("rate_warning"),
+            "events": [
+                {k: e.get(k) for k in
+                 ("index", "amplitude_ppm", "hours_from_mid", "in_transit",
+                  "n_sources", "sources")}
+                for e in ((tilt_report or {}).get("events") or [])
+            ],
+        },
+        "n_masked_total": n_masked,
+        "n_used": int(keep.sum()),
     }
     keys = ["P_p1", "t0_p1", "p_p1", "b_p1", "a_p1",
             f"q1_{instrument}", f"q2_{instrument}", f"sigma_w_{instrument}"]
@@ -502,46 +739,64 @@ def fit_white_lightcurve(
                             "minus": float(d[0] - d[1]), "plus": float(d[2] - d[0])}
 
     model = results.lc.evaluate(instrument)
-    residual = lc["wl_flux"] - model
+    residual = lc["wl_flux"][keep] - model
     summary["residual_rms_ppm"] = float(np.nanstd(residual) * 1e6)
+
+    # Stage 5.5 reads these back to scan for occulted-spot crossings
+    # without refitting. Indices are the ORIGINAL integration numbers, so
+    # a mask derived from a scan of these residuals lines up with the
+    # full Stage 4 lightcurve even when this fit was already masked.
+    np.savez(
+        out / "white_lightcurve_residuals.npz",
+        detector=np.asarray(instrument),
+        index=np.flatnonzero(keep),
+        n_total=np.asarray(times.size),
+        time=times[keep],
+        flux=lc["wl_flux"][keep],
+        flux_err=lc["wl_err"][keep],
+        model=model,
+        residual=residual,
+        oot_mask=lc["oot_mask"][keep],
+        t0_obs=np.asarray(lc["t0_obs"]),
+        n_integrations_full=np.asarray(times.size),
+    )
     # Red-noise diagnostic (Pont+2006 beta over 5-30 min bins). COMPASS
     # finds real G395H errors run ~5-12% above the photon prediction;
     # beta_median >> 1 here means this target's depth errors need
     # inflating before population-level use.
     summary["rednoise"] = rednoise_beta(residual, times)
 
-    # Sanity check against the archive depth: the prior-returning-fit
-    # failure mode produces ~1800 ppm with ~1500 ppm errors regardless of
-    # target. The transit-in-window guard removes the known cause, but a
-    # depth or uncertainty wildly inconsistent with (Rp/Rs)^2 from the
-    # archive should still be flagged loudly, not discovered in a paper.
-    rp_rs = priors.get("rp_rs")
-    if rp_rs:
-        expected_ppm = float(rp_rs) ** 2 * 1e6
-        measured = summary["depth_ppm"]["median"]
-        err = max(summary["depth_ppm"]["plus"], summary["depth_ppm"]["minus"])
-        suspect = bool(err > 0.5 * expected_ppm
-                       or abs(measured - expected_ppm)
-                       > max(5 * err, 0.5 * expected_ppm))
-        summary["depth_check"] = {
-            "expected_ppm_from_archive": expected_ppm,
-            "measured_ppm": measured,
-            "err_ppm": err,
-            "suspect": suspect,
-        }
-        if suspect:
-            print(f"[patchwork] WARNING ({instrument} {visit}): white-light "
-                  f"depth {measured:.0f} +/- {err:.0f} ppm vs archive "
-                  f"expectation {expected_ppm:.0f} ppm — check the fit "
-                  "before using this spectrum (see depth_check in "
-                  "white_fit_summary.json).")
+    # Sanity check against the best available reference depth. Prefers a
+    # published same-band (G395H) value; falls back to the archive
+    # optical (Rp/Rs)^2, which can only ever be indicative. See
+    # evaluate_depth_check.
+    check = evaluate_depth_check(
+        summary["depth_ppm"]["median"],
+        max(summary["depth_ppm"]["plus"], summary["depth_ppm"]["minus"]),
+        priors,
+        planet_name=priors.get("planet_name", ""),
+    )
+    summary["depth_check"] = check
+    if check["status"] == "suspect":
+        print(f"[patchwork] WARNING ({instrument} {visit}): white-light "
+              f"depth {check['measured_ppm']:.0f} +/- {check['err_ppm']:.0f} "
+              f"ppm vs {check['band']} reference {check['expected_ppm']:.0f} "
+              f"ppm ({check['difference_sigma']:.1f} sigma) — "
+              f"{check['reference_source']}. Check the fit before using this "
+              "spectrum (see depth_check in white_fit_summary.json).")
+    elif check["status"] == "indicative" and check.get("difference_frac") is not None:
+        print(f"[patchwork] note ({instrument} {visit}): white-light depth is "
+              f"{check['difference_frac'] * 100:+.1f}% from the optical "
+              "archive value. Different bandpass — informational only, not a "
+              "problem in itself.")
 
     _plot_white_fit(
         results, lc, instrument, out,
         title=figure_title(priors.get("planet_name", ""), instrument,
                            program=program, visit=visit,
                            suffix="white light"),
-        depth_ppm=summary["depth_ppm"]["median"])
+        depth_ppm=summary["depth_ppm"]["median"],
+        keep=keep)
 
     with (out / "white_fit_summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
@@ -600,14 +855,16 @@ def _bin_series(x, y, n_bins: int = 90):
     return map(np.asarray, (bx, by, be))
 
 
-def _savefig(fig, out: Path, stem: str) -> None:
+def _savefig(fig, out: Path, stem: str) -> str:
     # Patchwork figure rule: PDF + SVG, nothing else.
     fig.savefig(out / f"{stem}.pdf")
     fig.savefig(out / f"{stem}.svg")
+    return str(out / f"{stem}.pdf")
 
 
 def _plot_white_fit(results, lc, instrument: str, out: Path,
-                    title: str = "", depth_ppm: float | None = None) -> None:
+                    title: str = "", depth_ppm: float | None = None,
+                    keep: np.ndarray | None = None) -> None:
     """White-light fit figure, formatted for circulation.
 
     ``depth_ppm`` is the transit depth from the posterior (median of
@@ -616,6 +873,10 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
     offsets. On a visit with strong systematics the two disagree badly
     (TOI-270 c: 7249 ppm from the model minimum vs 5230 ppm from the
     posterior), and the figure would misreport the measurement.
+
+    ``keep`` is the Stage 5.5 anomaly mask. Masked integrations are
+    still drawn, greyed out, because a figure that silently omits them
+    hides the very thing the mask was applied for.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -623,8 +884,11 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
     import matplotlib.patheffects as pe
 
     with plt.rc_context(_PLOT_STYLE):
-        t_hr = (lc["time"] - lc["t0_obs"]) * 24
-        flux = lc["wl_flux"]
+        keep = (np.ones(lc["time"].size, dtype=bool) if keep is None
+                else np.asarray(keep, dtype=bool))
+        t_hr_all = (lc["time"] - lc["t0_obs"]) * 24
+        t_hr = t_hr_all[keep]
+        flux = lc["wl_flux"][keep]
         model = results.lc.evaluate(instrument)
         residual = flux - model
         rms = float(np.nanstd(residual) * 1e6)
@@ -638,7 +902,11 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
         # either buries the binned series (bars too strong) or hides the
         # uncertainties (markers too weak); splitting them shows the
         # scatter is consistent with the quoted error without mush.
-        a1.errorbar(t_hr, flux, yerr=lc["wl_err"], fmt="none",
+        if not keep.all():
+            a1.plot(t_hr_all[~keep], lc["wl_flux"][~keep], "x", ms=3.6,
+                    color=GAP_COLOR, alpha=0.9, zorder=1,
+                    label="masked (spot crossing)")
+        a1.errorbar(t_hr, flux, yerr=lc["wl_err"][keep], fmt="none",
                     ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
                     alpha=0.18, zorder=1)
         a1.plot(t_hr, flux, "o", ms=2.4, mew=0, color=DATA_COLOR, alpha=0.38,
@@ -660,7 +928,7 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
                     xy=(0.985, 0.06), xycoords="axes fraction", ha="right",
                     va="bottom", fontsize=10.5, color="#4E5866")
 
-        a2.errorbar(t_hr, residual * 1e6, yerr=lc["wl_err"] * 1e6, fmt="none",
+        a2.errorbar(t_hr, residual * 1e6, yerr=lc["wl_err"][keep] * 1e6, fmt="none",
                     ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
                     alpha=0.18, zorder=1)
         a2.plot(t_hr, residual * 1e6, "o", ms=2.4, mew=0, color=DATA_COLOR,
@@ -679,7 +947,8 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
 
     # Save the plotted series so figures can be restyled without refitting.
     np.savetxt(out / "white_lightcurve_series.csv",
-               np.column_stack([lc["time"], flux, lc["wl_err"], model]),
+               np.column_stack([lc["time"][keep], flux,
+                                lc["wl_err"][keep], model]),
                delimiter=",", header="time_bjd,flux,flux_err,model",
                comments="", fmt="%.10g")
 
@@ -695,11 +964,19 @@ def fit_transmission_spectrum(
     program: str = "",
     visit: str = "",
     n_live: int = N_LIVE_SPEC,
+    keep_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Fit every spectroscopic channel with the orbit (P, t0, b, a/Rs)
     frozen to the white-light posterior medians. Free per channel: Rp/Rs,
     (q1, q2) with per-channel ExoTiC-LD priors when ``stellar`` is given,
     mflux, jitter, and the linear regressor coefficients.
+
+    ``keep_mask`` must be the SAME Stage 5.5 mask used for the white fit
+    that produced ``white_summary``. A spot crossing masked in the white
+    fit but left in the channels would put the orbit and the depths on
+    different data, and the crossing's chromatic signature would print
+    straight onto the transmission spectrum — which is the shape a
+    retrieval reads as an atmosphere.
 
     Writes ``transmission_spectrum.csv`` (ppm, with per-channel residual
     rms) and ``transmission_spectrum.dat`` (fractional depth, TauREx
@@ -735,10 +1012,18 @@ def fit_transmission_spectrum(
         channel_ld = compute_ld_coeffs_batch(
             stellar["st_teff"], stellar["st_logg"], stellar["st_met"], ranges)
 
+    keep = (np.ones(times.size, dtype=bool) if keep_mask is None
+            else np.asarray(keep_mask, dtype=bool))
+    if keep.size != times.size:
+        raise ValueError(
+            f"keep_mask has {keep.size} entries but the lightcurve has "
+            f"{times.size} integrations."
+        )
+
     rows = []
     for i in range(lc["wave"].size):
         f, e = lc["sp_flux"][:, i], lc["sp_err"][:, i]
-        good = np.isfinite(f) & np.isfinite(e)
+        good = np.isfinite(f) & np.isfinite(e) & keep
         if good.sum() < 50:
             continue
 
@@ -777,17 +1062,25 @@ def fit_transmission_spectrum(
         })
 
     csv_path = out / "transmission_spectrum.csv"
+    # Stamp the version the WHITE fit carries, not the module constant:
+    # that one already records -nopca / -noscan, and the spectroscopic
+    # fit inherits both conditions from it.
+    fit_version = white_summary.get("fit_version", PATCHWORK_FIT_VERSION)
+    spot = white_summary.get("spot_handling") or {}
     write_spectrum_csv(csv_path, rows, header=(
-        f"Patchwork juliet fit v{PATCHWORK_FIT_VERSION}, "
+        f"Patchwork juliet fit v{fit_version}, "
         f"instrument={instrument}, ld={white_summary.get('ld_source')}, "
-        f"regressors={','.join(white_summary.get('regressor_names', []))}"
+        f"regressors={','.join(white_summary.get('regressor_names', []))}, "
+        f"masked_integrations={int((~keep).sum())}"
+        + (f", spot_events={len(spot.get('events') or [])}" if spot else "")
     ))
 
     dat_path = out / "transmission_spectrum.dat"
     with dat_path.open("w") as handle:
         handle.write(
             "# wavelength_um  transit_depth  depth_err  bin_half_width_um\n"
-            f"# Patchwork juliet fit v{PATCHWORK_FIT_VERSION}, instrument={instrument}\n"
+            f"# Patchwork juliet fit v{fit_version}, instrument={instrument}, "
+            f"masked_integrations={int((~keep).sum())}\n"
         )
         for r in rows:
             handle.write(
@@ -801,6 +1094,8 @@ def fit_transmission_spectrum(
                    visit=visit or white_summary.get("visit", ""))
     return {"spectrum_csv": str(csv_path), "spectrum_path": str(dat_path),
             "n_bins": len(rows), "rows": rows,
+            "fit_version": fit_version,
+            "n_masked": int((~keep).sum()),
             "median_depth_err_ppm": float(np.nanmedian(
                 [r["depth_err"] for r in rows]) * 1e6) if rows else None,
             "median_rms_ppm": float(np.nanmedian(
@@ -1048,6 +1343,7 @@ def prepare_visit_fit_inputs(
     wave_max: float | None = None,
     fallback_priors: dict[str, Any] | None = None,
     pca_detrending: bool = True,
+    anomaly_report: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Shared Stage 4 -> Stage 5 preparation: archive priors, lightcurves,
     trace diagnostics, tilt events, regressor matrix, white-band LD.
@@ -1061,6 +1357,13 @@ def prepare_visit_fit_inputs(
     2025) are part of the frozen v1.2 fit and on by default; a fit
     without them is version-stamped "-nopca" downstream. Disabling
     (``pca_detrending=False``) is the escape hatch for comparison fits.
+
+    ``anomaly_report`` is the ``anomaly_report.json`` from a Stage 5.5
+    scan (``contamination.DetectLightCurveAnomalies``). When given, the
+    integrations it marks for this detector are dropped from both the
+    white and the spectroscopic fits, and the scan payload is carried
+    through so the fit summary records what was masked. Without it the
+    fit is stamped "-noscan".
     """
     priors_source = "archive"
     try:
@@ -1102,13 +1405,34 @@ def prepare_visit_fit_inputs(
                 except Exception:
                     pca = None
 
-    tilt_events = (
-        detect_tilt_events(lc["wl_flux"], exclude_mask=lc["oot_mask"])
-        if tilt_correction else []
-    )
+    # Tilt events are searched in the TRACE DIAGNOSTICS, not just the
+    # flux: a mirror-segment tilt changes the PSF first, so the FWHM and
+    # the PCA components carry it without any transit signal in the way,
+    # and an event during transit stays visible. See find_tilt_events.
+    tilt_report = None
+    tilt_events: list[dict[str, Any]] = []
+    if tilt_correction:
+        tilt_report = find_tilt_events(
+            lc["wl_flux"],
+            diagnostics=diagnostics,
+            pca_components=pca,
+            oot_mask=lc["oot_mask"],
+            time=lc["time"],
+            t0_obs=lc["t0_obs"],
+            detector=instrument,
+        )
+        tilt_events = tilt_report["events"]
+        if tilt_report.get("rate_warning"):
+            print(f"[patchwork] WARNING ({instrument}): "
+                  f"{tilt_report['rate_warning']}")
+
     regressors, regressor_names = build_regressor_matrix(
         lc["time"], diagnostics, tilt_events, pca_components=pca
     )
+    # The integration straddling a tilt is a blend of both PSF states and
+    # no Heaviside describes it; drop those few points and step-correct
+    # the rest. Everything else is preserved.
+    tilt_keep = tilt_transition_keep_mask(lc["time"].size, tilt_events)
 
     ld = None
     if ld_priors == "exotic-ld":
@@ -1119,11 +1443,47 @@ def prepare_visit_fit_inputs(
             wave_max if wave_max is not None else whi,
         )
 
+    scan = None
+    keep_mask = tilt_keep
+    n_spot_masked = 0
+    if anomaly_report:
+        scan, spot_keep = load_anomaly_mask(
+            anomaly_report, instrument, lc["time"].size)
+        n_spot_masked = int((~spot_keep).sum())
+        keep_mask = keep_mask & spot_keep
+
     return {"priors": priors, "priors_source": priors_source, "lc": lc,
             "regressors": regressors, "regressor_names": regressor_names,
-            "tilt_events": tilt_events, "ld": ld,
+            "tilt_events": tilt_events, "tilt_report": tilt_report,
+            "tilt_keep_mask": tilt_keep,
+            "n_tilt_masked": int((~tilt_keep).sum()),
+            "ld": ld,
             "diagnostics_used": diagnostics is not None,
-            "pca_used": pca is not None}
+            "pca_used": pca is not None,
+            "keep_mask": keep_mask, "anomaly_scan": scan,
+            "n_spot_masked": n_spot_masked,
+            "n_masked": int((~keep_mask).sum())}
+
+
+def load_anomaly_mask(
+    report_path: str | os.PathLike[str],
+    instrument: str,
+    n_integrations: int,
+) -> tuple[dict[str, Any], np.ndarray]:
+    """Read a Stage 5.5 ``anomaly_report.json`` into (payload, keep mask).
+
+    The report stores explicit integration indices rather than a packed
+    boolean array so it stays readable and diffable — the mask is a
+    scientific decision, and someone will want to check it by eye.
+    """
+    with open(report_path) as handle:
+        payload = json.load(handle)
+    idx = (payload.get("mask_indices") or {}).get(instrument.upper(), [])
+    keep = np.ones(int(n_integrations), dtype=bool)
+    idx = [i for i in idx if 0 <= int(i) < int(n_integrations)]
+    if idx:
+        keep[np.asarray(idx, dtype=int)] = False
+    return payload, keep
 
 
 # -------------------- orchestral tools --------------------
@@ -1201,6 +1561,14 @@ class FitNirspecG395hWhiteLight(BaseTool):
                     "fit (needs reduction_dir). Disable only for comparison "
                     "fits; the fit version is then stamped '-nopca'.",
     )
+    anomaly_report: str | None = RuntimeField(
+        default=None,
+        description="Path to a Stage 5.5 anomaly_report.json from "
+                    "DetectLightCurveAnomalies. Masks the confirmed spot/"
+                    "facula crossings it lists. Omit on the first pass (the "
+                    "scan needs this fit's residuals); the fit is then "
+                    "stamped '-noscan'.",
+    )
     wave_min: float | None = RuntimeField(
         default=None, description="Optional lower wavelength cut in microns."
     )
@@ -1222,6 +1590,8 @@ class FitNirspecG395hWhiteLight(BaseTool):
             wave_min=self.wave_min,
             wave_max=self.wave_max,
             pca_detrending=self.pca_detrending,
+            anomaly_report=(_resolve(self.anomaly_report, self.base_directory)
+                            if self.anomaly_report else None),
         )
         summary = fit_white_lightcurve(
             prep["lc"],
@@ -1231,6 +1601,11 @@ class FitNirspecG395hWhiteLight(BaseTool):
             regressors=prep["regressors"],
             regressor_names=prep["regressor_names"],
             ld=prep["ld"],
+            keep_mask=prep["keep_mask"],
+            anomaly_scan=prep["anomaly_scan"],
+            tilt_report=prep["tilt_report"],
+            n_spot_masked=prep["n_spot_masked"],
+            n_tilt_masked=prep["n_tilt_masked"],
         )
         lines = [
             f"White-light fit complete for {self.planet_name} ({self.instrument}).",
@@ -1238,8 +1613,44 @@ class FitNirspecG395hWhiteLight(BaseTool):
             f"  regressors: {', '.join(summary['regressor_names'])}"
             + ("" if prep["diagnostics_used"] else " (trace diagnostics unavailable)"),
             f"  LD priors: {summary['ld_source']}",
-            f"  tilt events: {len(prep['tilt_events'])}",
+            f"  fit version: {summary['fit_version']}",
         ]
+        th = summary["tilt_handling"]
+        if th["n_events"]:
+            lines.append(
+                f"  tilt events: {th['n_events']} — corrected with a fitted "
+                f"Heaviside step each; {th['n_transition_masked']} transition "
+                "integration(s) dropped."
+            )
+            for e in th["events"]:
+                where = (f"{e['hours_from_mid']:+.2f} h from mid-transit"
+                         if e.get("hours_from_mid") is not None else "")
+                lines.append(
+                    f"    index {e['index']} ({where}"
+                    + (", IN TRANSIT" if e.get("in_transit") else "")
+                    + f"): {e['amplitude_ppm']:+.0f} ppm, seen in "
+                    + ", ".join(e.get("sources") or [])
+                )
+        else:
+            lines.append("  tilt events: none"
+                         + ("" if th["searched_diagnostics"] else
+                            " (NO trace diagnostics — flux-only search, an "
+                            "in-transit tilt would be invisible; pass "
+                            "reduction_dir)"))
+        if th.get("rate_warning"):
+            lines.append(f"  WARNING: {th['rate_warning']}")
+        if prep["anomaly_scan"] is None:
+            lines.append(
+                "  Stage 5.5 spot scan: NOT RUN — run "
+                "DetectLightCurveAnomalies on this output_dir, then refit "
+                "with anomaly_report=<its anomaly_report.json> and "
+                "force_refit. A '-noscan' fit is not uniform with the survey."
+            )
+        else:
+            lines.append(
+                f"  Stage 5.5 spot scan: {prep['n_spot_masked']} "
+                "integration(s) masked."
+            )
         for key in ["t0_p1", "p_p1", "b_p1", "a_p1"]:
             if key in summary:
                 s = summary[key]
@@ -1258,11 +1669,21 @@ class FitNirspecG395hWhiteLight(BaseTool):
                 f"(beta > ~1.2 means depth errors need inflating)"
             )
         dc = summary.get("depth_check") or {}
-        if dc.get("suspect"):
+        if dc.get("status") == "suspect":
             lines.append(
-                f"  WARNING: depth inconsistent with archive expectation "
-                f"({dc['expected_ppm_from_archive']:.0f} ppm) — verify the fit."
+                f"  WARNING: depth {dc['measured_ppm']:.0f} ppm vs "
+                f"{dc['band']} reference {dc['expected_ppm']:.0f} ppm "
+                f"({dc['difference_sigma']:.1f} sigma; {dc['reference_source']})"
+                " — verify the fit."
             )
+        elif dc.get("status") == "indicative":
+            lines.append(
+                f"  depth check: {dc['difference_frac'] * 100:+.1f}% from the "
+                "optical archive value (different bandpass — indicative only)."
+            )
+        elif dc.get("status") == "ok":
+            lines.append(f"  depth check: consistent with the {dc['band']} "
+                         f"reference ({dc['expected_ppm']:.0f} ppm).")
         lines.append(
             "Now run FitNirspecG395hTransmissionSpectrum with the same "
             "spectra_path and this output_dir as white_fit_dir."
@@ -1344,6 +1765,12 @@ class FitNirspecG395hTransmissionSpectrum(BaseTool):
     wave_max: float | None = RuntimeField(
         default=None, description="Optional upper wavelength cut in microns."
     )
+    anomaly_report: str | None = RuntimeField(
+        default=None,
+        description="Stage 5.5 anomaly_report.json. MUST be the same report "
+                    "used for the white fit — the orbit and the channel "
+                    "depths have to come from the same integrations.",
+    )
     base_directory: str = StateField()
 
     def _run(self) -> str:
@@ -1369,7 +1796,25 @@ class FitNirspecG395hTransmissionSpectrum(BaseTool):
             n_bins=self.n_bins,
             wave_min=self.wave_min,
             wave_max=self.wave_max,
+            anomaly_report=(_resolve(self.anomaly_report, self.base_directory)
+                            if self.anomaly_report else None),
         )
+        # The channels must see exactly the integrations the orbit was
+        # fitted on. Catch the mismatch here rather than in a spectrum
+        # nobody can explain six months later.
+        white_masked = white_summary.get("n_masked_total")
+        if white_masked is None:  # summary from a pre-v1.3 fit
+            white_masked = (white_summary.get("spot_handling") or {}).get(
+                "n_masked", 0)
+        if int(white_masked) != int(prep["n_masked"]):
+            raise ValueError(
+                f"The white fit used {white_masked} masked integration(s) but "
+                f"this run masks {prep['n_masked']}. Pass the same "
+                "anomaly_report used for the white fit (or none, if the white "
+                "fit used none), and the same tilt_correction setting — the "
+                "frozen orbit and the channel depths must come from the same "
+                "data."
+            )
         stellar = {k: prep["priors"][k] for k in ("st_teff", "st_logg", "st_met")}
         result = fit_transmission_spectrum(
             prep["lc"],
@@ -1378,9 +1823,12 @@ class FitNirspecG395hTransmissionSpectrum(BaseTool):
             instrument=self.instrument,
             regressors=prep["regressors"],
             stellar=stellar if self.ld_priors == "exotic-ld" else None,
+            keep_mask=prep["keep_mask"],
         )
         return (
-            f"Transmission spectrum complete: {result['n_bins']} channels.\n"
+            f"Transmission spectrum complete: {result['n_bins']} channels "
+            f"(fit v{result['fit_version']}, {result['n_masked']} integration(s) "
+            "masked).\n"
             f"  median depth error: {result['median_depth_err_ppm']:.0f} ppm; "
             f"median channel rms: {result['median_rms_ppm']:.0f} ppm\n"
             f"CSV (for visit combining): {result['spectrum_csv']}\n"

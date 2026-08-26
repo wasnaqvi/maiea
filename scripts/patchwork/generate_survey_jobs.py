@@ -21,6 +21,12 @@ reduce products verify (see CAMPAIGN.md checklist).
 Walltimes are ~2x the estimate. 2 CPUs for reduce (Stage 1 is
 effectively single-threaded; bigger requests only lengthen queue waits
 and burn fairshare).
+
+Fit v1.3 adds a second white-light fit per visit x detector (pass 1
+feeds the Stage 5.5 spot scan, pass 2 fits the masked lightcurve). A
+white fit is one nested-sampling run against the ~30-60 of the
+spectroscopic step, so this is a few percent on the fit walltime — well
+inside the 2x margin. The values below were NOT raised for it.
 """
 
 from __future__ import annotations

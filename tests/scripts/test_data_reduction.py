@@ -24,8 +24,13 @@ from aster_toolkit.data_reduction.lightcurves import (  # noqa: E402
     bin_at_resolution,
     build_lightcurves,
     build_regressor_matrix,
+    TILT_TRANSITION_MASK,
     detect_tilt_events,
+    find_tilt_events,
     load_stage3_spectra,
+    match_tilt_events,
+    step_statistic,
+    tilt_transition_keep_mask,
     oot_mask_from_baseline,
     oot_mask_from_ephemeris,
     pca_regressors,
@@ -34,10 +39,26 @@ from aster_toolkit.data_reduction.lightcurves import (  # noqa: E402
     step_regressors,
 )
 from aster_toolkit.data_reduction.juliet import (  # noqa: E402
+    CROSS_BAND_TOL_FRAC,
     combine_visit_spectra,
     detector_offset_ppm,
+    evaluate_depth_check,
+    load_anomaly_mask,
+    published_depth_reference,
     read_spectrum_csv,
     write_spectrum_csv,
+)
+from aster_toolkit.data_reduction.contamination import (  # noqa: E402
+    ANOMALY_MASK_PAD,
+    PATCHWORK_CONTAM_VERSION,
+    anomaly_keep_mask,
+    contamination_backends,
+    contamination_factor,
+    detect_lightcurve_anomalies,
+    match_detector_anomalies,
+    planck,
+    remap_anomaly_report,
+    running_mean,
 )
 from aster_toolkit.data_reduction.discover import (  # noqa: E402
     group_visits,
@@ -850,3 +871,731 @@ class TestFirScript:
         assert "verify_exotedrf_environment" in text
         assert "--manifest" in text
         assert "FORCE_REFIT" in text
+
+
+# -------------------- Stage 5.5: stellar contamination --------------------
+
+
+def synthetic_residuals(n=1200, noise=150e-6, bump_amp=0.0, bump_i0=500,
+                        bump_width=40, step_amp=0.0, step_i=500, seed=0):
+    """White-light fit residuals with an optional in-transit bump (spot
+    crossing) or step (tilt event), on a series whose transit spans
+    integrations 400-800."""
+    rng = np.random.default_rng(seed)
+    time = 2460500.0 + np.arange(n) * (20.0 / 86400)
+    resid = rng.normal(0, noise, n)
+    if bump_amp:
+        centre = bump_i0 + bump_width / 2
+        resid = resid + bump_amp * np.exp(
+            -0.5 * ((np.arange(n) - centre) / (bump_width / 2.5)) ** 2)
+    if step_amp:
+        resid = resid + step_amp * (np.arange(n) >= step_i)
+    oot = np.ones(n, dtype=bool)
+    oot[400:800] = False
+    return time, resid, oot
+
+
+class TestRunningMean:
+    def test_preserves_a_constant(self):
+        x = np.full(200, 3.0)
+        out = running_mean(x, 15)
+        assert np.allclose(out[10:-10], 3.0)
+
+    def test_averages_noise_down(self):
+        rng = np.random.default_rng(0)
+        x = rng.normal(0, 1.0, 5000)
+        out = running_mean(x, 25)
+        # sqrt(n) suppression, loose bounds for the finite sample
+        assert 0.15 < np.nanstd(out) < 0.30
+
+    def test_stays_aligned_with_an_even_window(self):
+        # An even window would shift every feature half an integration
+        # early; the function forces it odd. A boxcar over a delta gives
+        # a plateau, so use a peaked feature to get a unique maximum.
+        x = np.exp(-0.5 * ((np.arange(101.0) - 50) / 6.0) ** 2)
+        assert int(np.nanargmax(running_mean(x, 10))) == 50
+        assert int(np.nanargmax(running_mean(x, 11))) == 50
+
+    def test_thin_windows_are_nan_not_noisy(self):
+        # Positions with fewer than half a window of finite points must
+        # not return a noisy partial average — that is where a false
+        # anomaly would most easily appear.
+        x = np.arange(100.0)
+        x[:90] = np.nan
+        out = running_mean(x, 15)
+        assert np.isnan(out[:88]).all()
+        assert np.isfinite(out[95])
+
+
+class TestAnomalyDetection:
+    def test_recovers_an_injected_spot_crossing(self):
+        t, r, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert rep["anomalies"], "injected 600 ppm bump not detected"
+        top = rep["anomalies"][0]
+        assert top["kind"] == "spot_crossing"
+        assert top["sign"] == 1
+        assert top["in_transit_frac"] > 0.9
+        # the flagged run must overlap the injected bump
+        assert top["index_start"] < 540 < top["index_end"] + 60
+
+    def test_clean_residuals_flag_nothing(self):
+        t, r, oot = synthetic_residuals(seed=3)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert rep["anomalies"] == []
+
+    def test_a_real_transit_is_not_an_anomaly(self):
+        # Residuals of a GOOD fit contain no transit; the guard that
+        # matters is that the in-transit region is not flagged merely for
+        # being in transit.
+        t, r, oot = synthetic_residuals(seed=7)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert not any(a["in_transit_frac"] > 0.5 for a in rep["anomalies"])
+
+    def test_a_step_is_labelled_persistent_not_spot(self):
+        t, r, oot = synthetic_residuals(step_amp=800e-6, step_i=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert rep["anomalies"]
+        top = rep["anomalies"][0]
+        assert top["persistent"] is True
+        assert top["kind"] == "step"
+
+    def test_an_in_transit_step_is_found_at_all(self):
+        # The failure this guards: an in-transit tilt leaves the
+        # out-of-transit points at two levels, so a naive noise scale
+        # measures the step height instead of the noise and the event
+        # hides itself. This is the TOI-270 c case.
+        for seed in (0, 4, 9):
+            t, r, oot = synthetic_residuals(step_amp=800e-6, step_i=500,
+                                            seed=seed)
+            rep = detect_lightcurve_anomalies(t, r, oot_mask=oot)
+            steps = [a for a in rep["anomalies"] if a["kind"] == "step"]
+            assert steps, f"in-transit step missed (seed {seed})"
+            assert steps[0]["index_start"] < 500 < steps[0]["index_end"]
+
+    def test_step_amplitude_is_the_level_shift(self):
+        # Reporting the mean over the flagged span would halve it (the
+        # span covers both lobes of the detrended feature).
+        t, r, oot = synthetic_residuals(step_amp=800e-6, step_i=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot)
+        step = [a for a in rep["anomalies"] if a["kind"] == "step"][0]
+        assert step["amplitude_ppm"] == pytest.approx(800, rel=0.15)
+
+    def test_classification_is_stable_across_noise_seeds(self):
+        for seed in (0, 4, 9):
+            for amp, expect in ((600e-6, "spot_crossing"),
+                                (-600e-6, "facula_crossing")):
+                t, r, oot = synthetic_residuals(bump_amp=amp, bump_i0=500,
+                                                seed=seed)
+                rep = detect_lightcurve_anomalies(t, r, oot_mask=oot)
+                kinds = [a["kind"] for a in rep["anomalies"]
+                         if a["in_transit_frac"] > 0.5]
+                assert expect in kinds, f"{expect} missed (seed {seed})"
+
+    def test_detrend_lobes_are_merged_into_one_event(self):
+        # Removing the long-window trend splits one feature into lobes.
+        # Reported separately they would carry the wrong amplitude, and a
+        # wing beside a real crossing would itself be masked.
+        t, r, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot)
+        in_tr = [a for a in rep["anomalies"] if a["in_transit_frac"] > 0.5]
+        assert len(in_tr) == 1
+
+    def test_two_separated_crossings_stay_separate(self):
+        t, r, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        r = r + 500e-6 * np.exp(-0.5 * ((np.arange(r.size) - 700) / 16.0) ** 2)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot)
+        peaks = sorted(a["index_start"] for a in rep["anomalies"]
+                       if a["in_transit_frac"] > 0.5)
+        assert len(peaks) == 2
+
+    def test_facula_crossing_is_negative(self):
+        t, r, oot = synthetic_residuals(bump_amp=-600e-6, bump_i0=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert rep["anomalies"][0]["kind"] == "facula_crossing"
+        assert rep["anomalies"][0]["sign"] == -1
+
+    def test_no_noise_scale_returns_a_note_not_a_crash(self):
+        t = 2460500.0 + np.arange(300) * (20.0 / 86400)
+        rep = detect_lightcurve_anomalies(t, np.zeros(300),
+                                          oot_mask=np.ones(300, bool))
+        assert rep["anomalies"] == [] and "note" in rep
+
+    def test_mismatched_lengths_raise(self):
+        with pytest.raises(ValueError):
+            detect_lightcurve_anomalies(np.arange(10.0), np.arange(9.0))
+
+
+class TestCrossDetectorConfirmation:
+    def _pair(self, amp1, amp2, i0_2=500, seed=1):
+        t, r1, oot = synthetic_residuals(bump_amp=amp1, bump_i0=500, seed=seed)
+        _, r2, _ = synthetic_residuals(bump_amp=amp2, bump_i0=i0_2, seed=seed + 1)
+        return (detect_lightcurve_anomalies(t, r1, oot_mask=oot, detector="NRS1"),
+                detect_lightcurve_anomalies(t, r2, oot_mask=oot, detector="NRS2"))
+
+    def test_coincident_bump_is_confirmed_as_a_spot(self):
+        a, b = self._pair(600e-6, 400e-6)
+        merged = match_detector_anomalies({"NRS1": a, "NRS2": b})
+        top = merged[0]
+        assert top["kind"] == "spot_crossing" and top["confirmed"]
+        assert set(top["detectors"]) == {"NRS1", "NRS2"}
+
+    def test_amplitude_ratio_is_chromatic_for_a_real_spot(self):
+        a, b = self._pair(600e-6, 400e-6)
+        top = match_detector_anomalies({"NRS1": a, "NRS2": b})[0]
+        # Spot contrast falls to the infrared: NRS2/NRS1 well below 1.
+        assert 0.5 < top["amplitude_ratio"] < 0.85
+        assert top["achromatic"] is False
+
+    def test_equal_amplitudes_are_flagged_achromatic(self):
+        a, b = self._pair(600e-6, 600e-6)
+        top = match_detector_anomalies({"NRS1": a, "NRS2": b})[0]
+        assert top["amplitude_ratio"] > 0.9 and top["achromatic"] is True
+
+    def test_detector_order_does_not_change_the_ratio(self):
+        a, b = self._pair(600e-6, 400e-6)
+        forward = match_detector_anomalies({"NRS1": a, "NRS2": b})[0]
+        reversed_ = match_detector_anomalies({"NRS2": b, "NRS1": a})[0]
+        assert forward["amplitude_ratio"] == pytest.approx(
+            reversed_["amplitude_ratio"])
+
+    def test_single_detector_event_is_never_confirmed(self):
+        t, r1, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        _, r2, _ = synthetic_residuals(seed=11)
+        a = detect_lightcurve_anomalies(t, r1, oot_mask=oot, detector="NRS1")
+        b = detect_lightcurve_anomalies(t, r2, oot_mask=oot, detector="NRS2")
+        merged = match_detector_anomalies({"NRS1": a, "NRS2": b})
+        assert all(not m["confirmed"] for m in merged)
+        assert merged[0].get("single_detector") is True
+
+    def test_far_apart_events_do_not_match(self):
+        # 400 integrations at 20 s is ~2.2 h apart, far beyond the tolerance
+        a, b = self._pair(600e-6, 600e-6, i0_2=100)
+        merged = match_detector_anomalies({"NRS1": a, "NRS2": b})
+        assert all(len(m["detectors"]) == 1 for m in merged)
+
+
+class TestAnomalyMask:
+    def test_masks_a_confirmed_spot_with_padding(self):
+        t, r1, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        _, r2, _ = synthetic_residuals(bump_amp=400e-6, bump_i0=500, seed=2)
+        a = detect_lightcurve_anomalies(t, r1, oot_mask=oot, detector="NRS1")
+        b = detect_lightcurve_anomalies(t, r2, oot_mask=oot, detector="NRS2")
+        merged = match_detector_anomalies({"NRS1": a, "NRS2": b})
+        keep = anomaly_keep_mask(t.size, merged, detector="NRS1")
+        entry = merged[0]["detectors"]["NRS1"]
+        assert not keep[entry["index_start"]:entry["index_end"] + 1].any()
+        # padding removes the smoothed-in wings the run itself misses
+        assert not keep[entry["index_start"] - ANOMALY_MASK_PAD]
+        assert keep[:300].all() and keep[900:].all()
+
+    def test_does_not_mask_tilt_steps(self):
+        t, r, oot = synthetic_residuals(step_amp=800e-6, step_i=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        merged = match_detector_anomalies({"NRS1": rep})
+        keep = anomaly_keep_mask(t.size, merged, detector="NRS1")
+        assert keep.all(), "tilt steps are fitted with a step term, not masked"
+
+    def test_does_not_mask_unconfirmed_events(self):
+        t, r, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        merged = match_detector_anomalies({"NRS1": rep})   # one detector only
+        assert anomaly_keep_mask(t.size, merged, detector="NRS1").all()
+
+    def test_both_detectors_lose_the_same_integrations(self):
+        # A spot crossing is a property of the star, so it contaminates
+        # NRS2 even where NRS2's weaker detection clears threshold over a
+        # narrower run. Masking each detector by its own run would leave
+        # contaminated integrations in the redder half and put the two
+        # depths on different data.
+        t, r1, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        _, r2, _ = synthetic_residuals(bump_amp=400e-6, bump_i0=500, seed=2)
+        a = detect_lightcurve_anomalies(t, r1, oot_mask=oot, detector="NRS1")
+        b = detect_lightcurve_anomalies(t, r2, oot_mask=oot, detector="NRS2")
+        merged = match_detector_anomalies({"NRS1": a, "NRS2": b})
+        k1 = anomaly_keep_mask(t.size, merged, detector="NRS1")
+        k2 = anomaly_keep_mask(t.size, merged, detector="NRS2")
+        assert not k1.all()
+        assert np.array_equal(k1, k2)
+
+    def test_report_roundtrips_through_json(self, tmp_path):
+        report = tmp_path / "anomaly_report.json"
+        report.write_text(json.dumps({
+            "contam_version": PATCHWORK_CONTAM_VERSION,
+            "mask_indices": {"NRS1": [10, 11, 12], "NRS2": []},
+        }))
+        payload, keep = load_anomaly_mask(report, "NRS1", 100)
+        assert payload["contam_version"] == PATCHWORK_CONTAM_VERSION
+        assert (~keep).sum() == 3 and not keep[10:13].any()
+        _, keep2 = load_anomaly_mask(report, "NRS2", 100)
+        assert keep2.all()
+
+    def test_out_of_range_indices_are_ignored(self, tmp_path):
+        report = tmp_path / "r.json"
+        report.write_text(json.dumps({"mask_indices": {"NRS1": [5, 999]}}))
+        _, keep = load_anomaly_mask(report, "NRS1", 100)
+        assert (~keep).sum() == 1 and not keep[5]
+
+
+class TestSpanOverlapMatching:
+    """Regression: matching on t_peak missed 2/3 of injected coincident
+    crossings. A broad (boxcar) crossing detrends into a suppressed core
+    with negative wings of comparable height, so the |detrended| peak is
+    noise-driven and wanders tens of minutes between detectors — far
+    beyond the 5-minute tolerance. Matching must use the flagged spans."""
+
+    @staticmethod
+    def _boxcar_pair(seed):
+        n = 2000
+        t = 2460000.0 + np.arange(n) * 20 / 86400.0
+        oot = np.ones(n, bool)
+        oot[800:1200] = False
+        rng = np.random.default_rng(seed)
+        reports = {}
+        for det, amp in (("NRS1", 400e-6), ("NRS2", 300e-6)):
+            r = rng.normal(0, 100e-6, n)
+            r[950:1010] += amp
+            reports[det] = detect_lightcurve_anomalies(
+                t, r, oot_mask=oot, detector=det)
+        return reports
+
+    def test_broad_boxcar_crossing_confirmed_despite_peak_jitter(self):
+        # Seeds 0, 2, 4, 5, 7 all failed peak-time matching (peaks landed
+        # 5-14 min apart on opposite lobes). Span overlap must catch them.
+        for seed in (0, 2, 4, 5, 7):
+            merged = match_detector_anomalies(self._boxcar_pair(seed))
+            confirmed = [m for m in merged
+                         if m["kind"] == "spot_crossing" and m["confirmed"]]
+            assert confirmed, f"coincident crossing not confirmed (seed {seed})"
+            assert confirmed[0]["span_overlap_min"] > 0
+
+    def test_anomalies_carry_their_span_times(self):
+        rep = self._boxcar_pair(0)["NRS1"]
+        a = rep["anomalies"][0]
+        assert a["t_start"] < a["t_peak"] < a["t_end"]
+
+    def test_peak_only_dicts_still_match_at_the_tolerance(self):
+        # Backward compatibility: anomaly dicts from an old report have
+        # no t_start/t_end; matching falls back to peak separation.
+        reports = self._boxcar_pair(3)
+        for rep in reports.values():
+            for a in rep["anomalies"]:
+                a.pop("t_start"), a.pop("t_end")
+                a["t_peak"] = 2460000.5   # force coincident peaks
+        merged = match_detector_anomalies(reports)
+        assert any(len(m["detectors"]) == 2 for m in merged)
+
+
+class TestRemapAnomalyReport:
+    """Regression: pass-1 white fits are tilt-transition-masked, so the
+    scanned residual arrays are compressed and the scan's indices count
+    the compressed series. Applied to the full lightcurve unmapped, the
+    mask lands early by the number of dropped integrations."""
+
+    def test_mask_aligns_with_original_coordinates(self):
+        n = 2000
+        t = 2460000.0 + np.arange(n) * 20 / 86400.0
+        oot = np.ones(n, bool)
+        oot[800:1200] = False
+        # Two tilt events before the crossing: 14 integrations dropped.
+        tilt_keep = tilt_transition_keep_mask(
+            n, [{"index": 300}, {"index": 600}])
+        rng = np.random.default_rng(1)
+        reports = {}
+        for det, amp in (("NRS1", 500e-6), ("NRS2", 400e-6)):
+            r = rng.normal(0, 100e-6, n)
+            r[950:1010] += amp
+            rep = detect_lightcurve_anomalies(
+                t[tilt_keep], r[tilt_keep], oot_mask=oot[tilt_keep],
+                detector=det)
+            reports[det] = remap_anomaly_report(
+                rep, np.flatnonzero(tilt_keep), n)
+        assert all(rep["n_integrations"] == n for rep in reports.values())
+        merged = match_detector_anomalies(reports)
+        spots = [m for m in merged
+                 if m["kind"] == "spot_crossing" and m["confirmed"]]
+        assert spots
+        keep = anomaly_keep_mask(n, spots, detector="NRS1")
+        # Every contaminated integration must be gone from the FULL series.
+        assert not keep[950:1010].any()
+
+    def test_identity_remap_changes_nothing(self):
+        t, r, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        before = [(a["index_start"], a["index_end"]) for a in rep["anomalies"]]
+        rep = remap_anomaly_report(rep, np.arange(t.size), t.size)
+        after = [(a["index_start"], a["index_end"]) for a in rep["anomalies"]]
+        assert before == after and rep["n_integrations"] == t.size
+
+
+class TestStage65SpectrumUnits:
+    def test_read_spectrum_csv_keys_are_ppm(self, tmp_path):
+        # Regression: Stage 6.5 read s["depth"] (KeyError) and multiplied
+        # by 1e6 (unit error). The reader returns ppm under _ppm keys.
+        rows = [{"wave": 3.0 + 0.03 * i, "wave_err": 0.015,
+                 "depth": 1800e-6, "depth_err": 30e-6, "rms_ppm": 300.0}
+                for i in range(10)]
+        p = tmp_path / "combined_nrs1_transmission_spectrum.csv"
+        write_spectrum_csv(p, rows)
+        s = read_spectrum_csv(p)
+        assert "depth_ppm" in s and "depth_err_ppm" in s
+        assert "depth" not in s
+        assert np.allclose(s["depth_ppm"], 1800.0, atol=0.01)
+        assert np.allclose(s["depth_err_ppm"], 30.0, atol=0.01)
+
+
+class TestMatchTiltEventsTimeless:
+    def test_two_timeless_events_do_not_crash_the_sort(self):
+        # Regression: sorting keyed on (time is None, time) compared
+        # None < None and raised TypeError with two timeless events.
+        reports = {
+            "NRS1": {"events": [
+                {"index": 100, "amplitude_ppm": 200.0, "n_sources": 2},
+                {"index": 900, "amplitude_ppm": -150.0, "n_sources": 2},
+            ]},
+        }
+        merged = match_tilt_events(reports)
+        assert len(merged) == 2
+        assert all(m["single_detector"] for m in merged)
+
+
+# -------------------- Stage 6.5: unocculted heterogeneities ---------------
+
+
+class TestContaminationFactor:
+    def test_no_spots_means_no_correction(self):
+        w = np.linspace(2.9, 5.2, 40)
+        eps = contamination_factor(w, t_phot=3500, t_het=2800, f_het=0.0)
+        assert np.allclose(eps, 1.0)
+
+    def test_identical_temperatures_mean_no_correction(self):
+        w = np.linspace(2.9, 5.2, 40)
+        eps = contamination_factor(w, t_phot=3500, t_het=3500, f_het=0.3)
+        assert np.allclose(eps, 1.0)
+
+    def test_cool_spots_deepen_the_transit(self):
+        w = np.linspace(2.9, 5.2, 40)
+        eps = contamination_factor(w, t_phot=3500, t_het=2800, f_het=0.2)
+        assert np.all(eps > 1.0)
+
+    def test_hot_faculae_shallow_the_transit(self):
+        w = np.linspace(2.9, 5.2, 40)
+        eps = contamination_factor(w, t_phot=3500, t_het=4200, f_het=0.2)
+        assert np.all(eps < 1.0)
+
+    def test_spot_contrast_falls_towards_the_infrared(self):
+        # The chromatic slope is the whole signal; its SIGN is what
+        # distinguishes contamination from an atmosphere, so pin it.
+        w = np.linspace(2.9, 5.2, 40)
+        eps = contamination_factor(w, t_phot=3500, t_het=2800, f_het=0.2)
+        assert eps[0] > eps[-1]
+
+    def test_supplied_stellar_spectra_override_blackbodies(self):
+        w = np.linspace(2.9, 5.2, 10)
+        ones = np.ones_like(w)
+        eps = contamination_factor(w, t_phot=3500, t_het=2800, f_het=0.5,
+                                   stellar_spectra={"phot": ones, "het": ones})
+        assert np.allclose(eps, 1.0)
+
+    def test_planck_is_hotter_is_brighter(self):
+        w = np.array([4.0])
+        assert planck(w, 4000)[0] > planck(w, 3000)[0]
+
+    def test_extreme_covering_fraction_stays_finite(self):
+        w = np.linspace(2.9, 5.2, 20)
+        eps = contamination_factor(w, t_phot=5000, t_het=1000, f_het=0.99)
+        assert np.all(np.isfinite(eps))
+
+
+class TestContaminationBackends:
+    def test_probe_reports_every_backend(self):
+        report = contamination_backends()
+        assert set(report) == {"spotrod", "stctm", "sage"}
+        assert all("available" in v for v in report.values())
+
+    def test_external_command_marks_a_backend_available(self, monkeypatch):
+        monkeypatch.setenv("ASTER_STCTM_CMD", "/usr/bin/true")
+        report = contamination_backends()
+        assert report["stctm"]["available"] is True
+        assert report["stctm"]["external_command"] == "/usr/bin/true"
+
+
+# -------------------- depth check --------------------
+
+
+class TestDepthCheck:
+    def test_prefers_a_published_same_band_depth(self):
+        ref = published_depth_reference("TOI-1231 b")
+        assert ref is not None and ref["depth_ppm"] == pytest.approx(5571.0)
+        check = evaluate_depth_check(5596.0, 6.0, {"rp_rs": 0.07464},
+                                     planet_name="TOI-1231 b")
+        assert check["band"] == "same-band"
+        assert check["expected_ppm"] == pytest.approx(5571.0)
+        assert check["status"] == "ok"
+
+    def test_alias_resolves_to_the_published_entry(self):
+        assert published_depth_reference("TOI-732 c")["planet_name"] == "LTT 3780 c"
+
+    def test_unknown_planet_falls_back_to_the_archive(self):
+        check = evaluate_depth_check(1000.0, 30.0, {"rp_rs": 0.0316},
+                                     planet_name="Nowhere b")
+        assert check["band"] == "cross-band"
+        assert check["status"] == "ok"
+
+    def test_cross_band_offset_is_indicative_not_suspect(self):
+        # The referee's point: a healthy G395H depth sits 10-15% from the
+        # optical TESS value, and the old check called that "suspect".
+        # TOI-1468 c: TESS 2767 ppm vs Patchwork 3055 ppm (+10.4%).
+        rp_rs = float(np.sqrt(2767e-6))
+        check = evaluate_depth_check(3055.0, 9.0, {"rp_rs": rp_rs},
+                                     planet_name="TOI-1468 c")
+        assert check["band"] == "cross-band"
+        assert check["suspect"] is False
+        assert check["difference_frac"] == pytest.approx(0.104, abs=0.01)
+
+    def test_same_band_disagreement_is_suspect(self):
+        check = evaluate_depth_check(4500.0, 20.0, {"rp_rs": 0.07464},
+                                     planet_name="TOI-1231 b")
+        assert check["status"] == "suspect" and check["suspect"] is True
+
+    def test_prior_returning_fit_is_suspect_in_any_band(self):
+        # The documented failure: ~1800 ppm with errors larger than the
+        # signal, whatever the target.
+        check = evaluate_depth_check(1800.0, 1500.0, {"rp_rs": 0.0316},
+                                     planet_name="Nowhere b")
+        assert check["suspect"] is True and check["returned_prior"] is True
+
+    def test_gross_cross_band_disagreement_is_still_reported(self):
+        rp_rs = float(np.sqrt(1000e-6))
+        check = evaluate_depth_check(5000.0, 20.0, {"rp_rs": rp_rs})
+        assert check["status"] == "indicative"
+        assert check["difference_frac"] > CROSS_BAND_TOL_FRAC
+
+    def test_no_reference_at_all_is_unavailable(self):
+        check = evaluate_depth_check(3000.0, 20.0, {})
+        assert check["status"] == "unavailable" and check["suspect"] is False
+
+    def test_old_key_is_preserved_for_readers(self):
+        check = evaluate_depth_check(1000.0, 30.0, {"rp_rs": 0.0316})
+        assert check["expected_ppm_from_archive"] == check["expected_ppm"]
+
+
+# -------------------- tilt events (v1.3 multivariate search) --------------
+
+
+def synthetic_tilt_visit(n=2000, step_i=1000, step_amp=800e-6,
+                         fwhm_step=0.05, y_step=0.02, pca_step=5.0,
+                         transit=(700, 1300), depth=5000e-6,
+                         noise=150e-6, seed=0):
+    """A visit with a transit and a mirror tilt event, plus the trace
+    diagnostics a real reduction would supply. The tilt is placed INSIDE
+    the transit by default — the TOI-270 c configuration."""
+    rng = np.random.default_rng(seed)
+    time = 2460500.0 + np.arange(n) * (9.0 / 86400)      # ~5 h at 9 s
+    oot = np.ones(n, dtype=bool)
+    if transit:
+        oot[transit[0]:transit[1]] = False
+
+    flux = np.ones(n) - depth * (~oot) + rng.normal(0, noise, n)
+    diagnostics = {k: rng.normal(0, 0.01, n) for k in ("fwhm", "y", "x")}
+    pca = rng.normal(0, 1.0, (n, 6))
+    if step_i is not None:
+        flux[step_i:] += step_amp
+        diagnostics["fwhm"][step_i:] += fwhm_step
+        diagnostics["y"][step_i:] += y_step
+        pca[step_i:, 0] += pca_step
+    return {"time": time, "flux": flux, "oot": oot,
+            "diagnostics": diagnostics, "pca": pca, "t0_obs": time[n // 2]}
+
+
+class TestStepStatistic:
+    def test_flat_series_has_no_significant_step(self):
+        z = step_statistic(np.random.default_rng(0).normal(0, 1, 1000))
+        assert np.nanmax(np.abs(z)) < 6.0
+
+    def test_step_is_localised_and_significant(self):
+        s = np.random.default_rng(0).normal(0, 0.01, 1000)
+        s[500:] += 0.2
+        z = step_statistic(s)
+        assert np.abs(z[500]) > 6.0
+        assert int(np.nanargmax(np.abs(z))) == pytest.approx(500, abs=3)
+
+    def test_a_smooth_ramp_is_not_a_step(self):
+        s = np.linspace(0, 1, 1000) + np.random.default_rng(0).normal(0, 0.01, 1000)
+        assert np.nanmax(np.abs(step_statistic(s))) < 6.0
+
+
+class TestFindTiltEvents:
+    def test_finds_a_tilt_that_happens_during_transit(self):
+        # The failure this exists for: the flux-only search has to mask
+        # the transit to avoid flagging ingress, so an in-transit tilt is
+        # structurally invisible. TOI-270 c cost us a spectrum this way.
+        v = synthetic_tilt_visit(step_i=1000)
+        assert detect_tilt_events(v["flux"], exclude_mask=v["oot"]) == [], \
+            "precondition: the legacy flux-only search cannot see this"
+
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        assert len(r["events"]) == 1
+        e = r["events"][0]
+        assert abs(e["index"] - 1000) <= 3
+        assert e["in_transit"] is True
+        assert e["amplitude_ppm"] == pytest.approx(800, rel=0.2)
+
+    def test_reports_which_diagnostics_triggered(self):
+        v = synthetic_tilt_visit(step_i=400, transit=(700, 1300))
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        sources = r["events"][0]["sources"]
+        # FWHM is the most direct signature of a tilt (Albert 2026)
+        assert "trace_fwhm" in sources
+        assert "pca_0" in sources
+        assert r["events"][0]["n_sources"] >= 2
+
+    def test_a_transit_alone_is_not_a_tilt(self):
+        v = synthetic_tilt_visit(step_i=None)
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        assert r["events"] == []
+
+    def test_one_series_stepping_alone_is_rejected(self):
+        # A glitch in a single diagnostic is not the observatory moving.
+        v = synthetic_tilt_visit(step_i=None)
+        v["diagnostics"]["y"][1000:] += 0.10
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        assert r["events"] == []
+
+    def test_smooth_drifts_are_not_tilts(self):
+        v = synthetic_tilt_visit(step_i=None)
+        n = v["flux"].size
+        v["diagnostics"]["fwhm"] += np.linspace(0, 0.08, n)
+        v["diagnostics"]["y"] += np.linspace(0, 0.05, n)
+        r = find_tilt_events(v["flux"] + np.linspace(0, 1e-3, n),
+                             diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        assert r["events"] == []
+
+    def test_stable_across_noise_seeds(self):
+        for seed in (0, 1, 7):
+            v = synthetic_tilt_visit(step_i=1000, seed=seed)
+            r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                                 pca_components=v["pca"], oot_mask=v["oot"],
+                                 time=v["time"], t0_obs=v["t0_obs"])
+            assert len(r["events"]) == 1, f"seed {seed}"
+            assert abs(r["events"][0]["index"] - 1000) <= 5
+
+    def test_rate_guard_fires_on_implausibly_many_events(self):
+        # ~1 tilt event per day (Albert 2026), so a 5 h visit expects
+        # ~0.2. Six is the search misbehaving, not the telescope.
+        v = synthetic_tilt_visit(step_i=None)
+        for i in (200, 500, 800, 1100, 1400, 1700):
+            v["diagnostics"]["fwhm"][i:] += 0.05
+            v["diagnostics"]["y"][i:] += 0.04
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        assert len(r["events"]) > 2
+        assert r["rate_warning"] and "rare" in r["rate_warning"]
+
+    def test_quiet_visit_raises_no_rate_warning(self):
+        v = synthetic_tilt_visit(step_i=1000)
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        assert r["rate_warning"] is None
+
+    def test_without_diagnostics_it_says_so(self):
+        v = synthetic_tilt_visit(step_i=1000)
+        r = find_tilt_events(v["flux"], oot_mask=v["oot"], time=v["time"],
+                             t0_obs=v["t0_obs"])
+        assert r["diagnostics_available"] is False
+        assert r["sources_searched"] == ["flux"]
+
+
+class TestTiltCrossDetector:
+    def _reports(self, offset_ints=0):
+        a = synthetic_tilt_visit(step_i=1000, seed=1)
+        b = synthetic_tilt_visit(step_i=1000 + offset_ints, seed=2)
+        b["time"] = a["time"]
+        return {
+            "NRS1": find_tilt_events(a["flux"], diagnostics=a["diagnostics"],
+                                     pca_components=a["pca"], oot_mask=a["oot"],
+                                     time=a["time"], t0_obs=a["t0_obs"],
+                                     detector="NRS1"),
+            "NRS2": find_tilt_events(b["flux"], diagnostics=b["diagnostics"],
+                                     pca_components=b["pca"], oot_mask=b["oot"],
+                                     time=b["time"], t0_obs=b["t0_obs"],
+                                     detector="NRS2"),
+        }
+
+    def test_coincident_event_is_confirmed(self):
+        merged = match_tilt_events(self._reports())
+        assert len(merged) == 1
+        assert merged[0]["confirmed"] is True
+        assert set(merged[0]["detectors"]) == {"NRS1", "NRS2"}
+
+    def test_opposite_sign_steps_still_confirm(self):
+        # A tilt reshapes the PSF, so the flux step can differ in size
+        # AND sign between detectors (arXiv:2405.06737). Chromaticity
+        # must never be used to reject a tilt.
+        a = synthetic_tilt_visit(step_i=1000, step_amp=+800e-6, seed=1)
+        b = synthetic_tilt_visit(step_i=1000, step_amp=-600e-6, seed=2)
+        b["time"] = a["time"]
+        reports = {
+            d: find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                                pca_components=v["pca"], oot_mask=v["oot"],
+                                time=v["time"], t0_obs=v["t0_obs"], detector=d)
+            for d, v in (("NRS1", a), ("NRS2", b))
+        }
+        merged = match_tilt_events(reports)
+        assert merged[0]["confirmed"] is True
+        amps = merged[0]["amplitude_ppm"]
+        assert amps["NRS1"] > 0 > amps["NRS2"]
+
+    def test_single_detector_event_is_not_confirmed(self):
+        reports = self._reports()
+        reports["NRS2"]["events"] = []
+        merged = match_tilt_events(reports)
+        assert all(not m["confirmed"] for m in merged)
+        assert merged[0]["single_detector"] is True
+
+
+class TestTiltTransitionMask:
+    def test_masks_only_the_transition(self):
+        keep = tilt_transition_keep_mask(2000, [{"index": 1000}])
+        assert (~keep).sum() == 2 * TILT_TRANSITION_MASK + 1
+        assert not keep[1000]
+        assert keep[:1000 - TILT_TRANSITION_MASK].all()
+        assert keep[1000 + TILT_TRANSITION_MASK + 1:].all()
+
+    def test_preserves_the_post_event_data(self):
+        # The whole point of the Heaviside: the post-event half of the
+        # visit is corrected, not discarded, and the lightcurve is never
+        # split. Anything else throws away the orbit constraint.
+        keep = tilt_transition_keep_mask(2000, [{"index": 1000}])
+        assert keep.sum() > 2000 - 10
+        assert keep[1500:].all()
+
+    def test_no_events_keeps_everything(self):
+        assert tilt_transition_keep_mask(500, []).all()
+
+    def test_accepts_a_cross_matched_event(self):
+        merged = [{"detectors": {"NRS1": {"index": 300}}}]
+        keep = tilt_transition_keep_mask(1000, merged)
+        assert not keep[300]
+
+    def test_step_regressor_matches_the_detected_event(self):
+        v = synthetic_tilt_visit(step_i=1000)
+        r = find_tilt_events(v["flux"], diagnostics=v["diagnostics"],
+                             pca_components=v["pca"], oot_mask=v["oot"],
+                             time=v["time"], t0_obs=v["t0_obs"])
+        M = step_regressors(v["flux"].size, r["events"])
+        assert M.shape == (v["flux"].size, 1)
+        idx = r["events"][0]["index"]
+        assert M[:idx].sum() == 0 and M[idx:].all()

@@ -62,6 +62,70 @@ New guards / diagnostics:
   escape hatch) is stamped `1.2-nopca` and must not be mixed with
   survey fits.
 
+Stellar contamination — fit v1.3 (referee feedback 2026-08-03):
+- **Stage 5.5 occulted-spot scan — SURVEY DEFAULT.** The `fit` step is
+  now two passes per visit: white pass 1 (unmasked, written to
+  `fits/<visit>/<det>/pass1`) → cross-detector anomaly scan → masked
+  white refit + spectroscopic channels. Confirmed spot/facula crossings
+  are **masked**; the referee endorsed masking over modelling for a
+  wholesale survey. A fit whose scan did not run is stamped `-noscan`
+  and is not uniform with the rest.
+- Only events seen in BOTH detectors at the same time are masked.
+  Persistent (step-like) events are tilt events — corrected with a step
+  regressor, never masked. Single-detector excursions are reported and
+  never masked (masking one detector alone would corrupt the NRS1–NRS2
+  offset). The NRS2/NRS1 amplitude ratio is recorded: a real spot's
+  contrast falls to the infrared, so an achromatic bump is suspect.
+- Per-visit outputs: `fits/<visit>/anomalies/anomaly_report.json` (the
+  mask, as explicit integration indices) and `anomaly_scan.pdf/.svg`.
+  `spot_handling` in `white_fit_summary.json` records what was masked;
+  `patchwork_summary.json` records the pass-1 vs pass-2 depth and beta
+  so you can see whether masking helped.
+- **Depth check reworked.** It used to compare every depth against the
+  archive TESS value and call a 10% offset `suspect` — which fired on
+  healthy targets survey-wide. It now prefers a published **same-band**
+  (JWST G395H) depth where one exists (`PUBLISHED_G395H_DEPTHS` in
+  `juliet.py`; LTT 3780 c and TOI-1231 b are seeded) and only then falls
+  back to the optical archive value, with a wider tolerance and
+  `status: indicative` instead of `suspect`.
+- **Stage 6.5 unocculted-spot check** — new `contamination` step, runs
+  on the combined spectrum in seconds. Fits a flat spectrum × ε(λ).
+  Expect non-detections at G395H: the blackbody spot contrast at 3–5 µm
+  moves a depth ~20 ppm, below the channel errors. Quote ε(λ) and the
+  f_het upper limit, never f_het alone (it is degenerate with T_het).
+- `spotrod` / `stctm` / `sage` are optional cross-check backends only.
+  `VerifyContaminationBackends` reports what is importable; nothing in
+  the survey path needs them.
+
+Tilt events — rewritten (also fit v1.3, Stage 4 → 1.2):
+- **Detection now searches the PSF diagnostics** (trace FWHM, trace x/y,
+  PCA components), requiring a coincident step in ≥2 of them. A tilt
+  moves a mirror segment, so it changes the PSF *shape* before the flux
+  — Loic Albert: "the most direct effect ... is a change in its FWHM, so
+  PCA are good to catch that"; KELT-7 b confirmed theirs as a jump in
+  the guide star *width*. These series carry no transit, so the search
+  covers the whole visit. The old flux-only search had to mask the
+  transit and so could never see an in-transit tilt — that is exactly
+  what happened to TOI-270 c.
+- **This makes `reduction_dir` load-bearing.** No Stage 2 calints → no
+  diagnostics → flux-only fallback → an in-transit tilt is invisible.
+  The fit is stamped `-nopca` in that case; read that stamp as "blind to
+  the TOI-270 c failure", not just "worse detrending".
+- **Correction is a fitted Heaviside step, not a mask or a split.** One
+  step regressor per event, free amplitude, break time fixed from the
+  white fit and reused per channel — what Eureka!, ExoTiC-JEDI and
+  Tiberius all did for KELT-7 b. Amplitude stays free per channel and
+  free in SIGN: the flux change is pixel-dependent and can go either way
+  (arXiv:2405.06737). Never reject a tilt for being chromatic.
+- Only 3 integrations are dropped at each transition (the integration
+  straddling the tilt is a blend of two PSF states). ~0.35% of a visit,
+  against splitting the lightcurve, which would cost the orbit constraint.
+- Rate guard: tilt events are rare (~1/day → ~0.2 per visit). Several
+  detections in one visit raises `tilt_handling.rate_warning` instead of
+  quietly fitting a step per false positive.
+- Tool renamed `DetectTiltEvents` (`DetectNirspecTiltEvents` still works).
+  Pass `reduction_dir` to it or its answer is the weak one.
+
 ## 1. One-time setup on Fir (before anything)
 
 ```bash
@@ -158,8 +222,11 @@ After REDUCE:
 
 After FIT:
 - [ ] transit coverage ~100% (log line, seconds into the fit)
-- [ ] white depth within tens of ppm of the expected value printed in
-      the submission plan; `depth_check.suspect: false`
+- [ ] `depth_check.status` is `ok` or `indicative` — **not** `suspect`.
+      `indicative` just means the only reference was the optical archive
+      value; check `depth_check.band` before reacting to a % offset
+- [ ] `fit_version` is exactly `1.3` — a `-noscan` or `-nopca` suffix
+      means this fit is NOT uniform with the survey
 - [ ] `median_depth_err_ppm` << depth (tens of ppm, not ~1500)
 - [ ] white rms hundreds of ppm; `rednoise.beta_median` ~ 1 (record it;
       > ~1.2 = flag for error inflation, per COMPASS)
@@ -167,6 +234,47 @@ After FIT:
       fallback means the node was offline — fine, but note it)
 - [ ] ~29 (NRS1) + ~24 (NRS2) channels at R=100;
       `nrs1_nrs2_offset_ppm` small; `nrs1_nrs2_t0_offset_s` recorded
+
+Tilt events (`tilt_handling` in `white_fit_summary.json`):
+- [ ] `searched_diagnostics: true`. If false the search saw flux only
+      and an in-transit tilt could not have been found — check why the
+      Stage 2 calints were missing before accepting the spectrum
+- [ ] `rate_warning` empty. Tilt events are rare; more than ~1 in a visit
+      means the search is firing on a ramp or a noisy diagnostic
+- [ ] for each event, `sources` lists ≥2 series and normally includes
+      `trace_fwhm` — that is the signature of a real tilt. An event
+      carried only by `flux` + one PCA component deserves a look
+- [ ] `n_transition_masked` is ~3 per event, no more. The post-event
+      data must NOT be masked — it is corrected by the step
+- [ ] events with `in_transit: true` are the expensive ones. Confirm the
+      depth is sane afterwards, and that the event also appears in the
+      other detector (a tilt is a telescope event, so it must)
+
+After the Stage 5.5 scan (same fit job — check before trusting the
+spectrum):
+- [ ] open `fits/<visit>/anomalies/anomaly_scan.pdf`. Every shaded span
+      that was masked should be a bump the eye agrees with in BOTH panels
+- [ ] `spot_handling.frac_masked`. A crossing plus its wings and padding
+      runs ~10% of a visit, so 10-15% is normal for one event. Above
+      that, look at the figure before accepting: a large fraction is not
+      a correction, it means the event is instrumental or the visit is
+      bad. The fit refuses outright below 50 kept integrations
+- [ ] NRS1 and NRS2 masked the SAME count — the mask is the union across
+      detectors by design, so a mismatch means one detector's report is
+      stale
+- [ ] no event with `achromatic: true` or `single_detector: true` was
+      masked (they should appear in the report but not in `mask_indices`)
+- [ ] compare `white_depth_ppm` with `white_depth_ppm_pass1` and the two
+      betas in `patchwork_summary.json`. Masking should reduce beta; if
+      it moved the depth a lot and did not improve beta, look at the
+      figure before accepting it
+
+After the CONTAMINATION step (Stage 6.5):
+- [ ] `delta_bic` — report contamination only above ~10. A non-detection
+      is the expected outcome and is a *limit*, not a clean bill of
+      health for the star
+- [ ] quote ε(λ) / the corrected spectrum and `f_het_95pct_upper`, never
+      `f_het` alone (degenerate with `T_het` over one G395H octave)
 
 Then archive to `/project/def-ncowan/wasi/patchwork_reductions/<SLUG>/`
 with the rsync in session summary 0.9 (NEVER flatten the tree).

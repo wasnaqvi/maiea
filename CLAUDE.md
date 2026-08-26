@@ -86,8 +86,9 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 **Data Reduction** (`aster_toolkit/data_reduction/`) — the Patchwork pipeline:
 - `discover.py` - `DiscoverPatchworkVisits`: index a raw tree, identify planets, write manifests
 - `exotedrf.py` - `ReduceNirspecG395hTso`, `InspectNirspecG395hUncalData`, `VerifyPatchworkEnvironment`, `MakeUncalTestSubset` (Stages 1-3)
-- `lightcurves.py` - `DetectNirspecTiltEvents` (Stage 4; pure numpy/astropy)
+- `lightcurves.py` - `DetectTiltEvents` (Stage 4; pure numpy/astropy. `DetectNirspecTiltEvents` is a back-compat alias)
 - `juliet.py` - `FitNirspecG395hWhiteLight`, `FitNirspecG395hTransmissionSpectrum`, `CombineNirspecG395hVisits` (Stages 5-6)
+- `contamination.py` - `DetectLightCurveAnomalies` (Stage 5.5), `ModelStellarContamination` (Stage 6.5), `VerifyContaminationBackends`
 - `survey.py` - `RunPatchworkTarget`, `GeneratePatchworkFirJob` (end-to-end driver)
 - `optimize.py` - `OptimizeNirspecG395hReduction`, `SummarizeG395hOptimization`, `GenerateFirOptimizerJobs`
 
@@ -201,7 +202,9 @@ Uniform reduction of JWST NIRSpec/G395H BOTS time-series (raw uncals →
 transmission spectrum) for the Patchwork sub-Neptune survey. Chain:
 
 ```
-uncals → inspect → exoTEDRF Stages 1-3 → Stage 4 lightcurves → juliet fits → visit combination
+uncals → inspect → exoTEDRF Stages 1-3 → Stage 4 lightcurves
+      → juliet white fit → Stage 5.5 occulted-spot scan → masked refit + channels
+      → visit combination → Stage 6.5 unocculted-spot check
 ```
 
 ### Module map
@@ -220,13 +223,19 @@ uncals → inspect → exoTEDRF Stages 1-3 → Stage 4 lightcurves → juliet fi
   per-visit baseline window.
 - **`lightcurves.py`** — Stage 4, pure numpy/astropy (runs in the main
   ASTER env): MJD→BJD on load, out-of-transit normalization, constant-R
-  binning, trace diagnostics, tilt-event detection, PCA regressors,
-  red-noise beta, and the transit-in-window guard.
+  binning, trace diagnostics, PCA regressors, red-noise beta, the
+  transit-in-window guard, and tilt-event detection from the PSF
+  diagnostics (see [Tilt events](#tilt-events--detect-in-the-psf-correct-with-a-heaviside)).
 - **`juliet.py`** — Stages 5-6: white-light then per-channel fits with
   the orbit frozen to the white posterior; ExoTiC-LD priors; visit
-  combination; NRS1-NRS2 offset.
+  combination; NRS1-NRS2 offset; the same-band depth check.
+- **`contamination.py`** — Stages 5.5 and 6.5, the two stellar
+  contamination problems (pure numpy; `emcee` for the retrieval). See
+  [Stellar contamination](#stellar-contamination--stages-55-and-65).
 - **`survey.py`** — manifest-driven driver (`inspect → reduce → fit →
-  combine`), restartable by step, plus the Fir sbatch generator.
+  combine → contamination`), restartable by step, plus the Fir sbatch
+  generator. `fit` is compound: white pass 1 → Stage 5.5 scan → masked
+  white refit → channels.
 - **`optimize.py`** — wraps the exoTEDRF coordinate-descent optimizer as
   a frozen, replayable rule generator (SHA-256 `omega_hash` per run).
 
@@ -306,19 +315,131 @@ and never mix old and new products in one analysis.
 | constant | value | module |
 |---|---|---|
 | `PATCHWORK_CONFIG_VERSION` | 1.1 | `exotedrf.py` |
-| `PATCHWORK_STAGE4_VERSION` | 1.1 | `lightcurves.py` |
-| `PATCHWORK_FIT_VERSION` | 1.2 | `juliet.py` |
+| `PATCHWORK_STAGE4_VERSION` | 1.2 | `lightcurves.py` |
+| `PATCHWORK_FIT_VERSION` | 1.3 | `juliet.py` |
+| `PATCHWORK_CONTAM_VERSION` | 1.0 | `contamination.py` |
 | `PATCHWORK_OPTIMIZER_VERSION` | 1.0 | `optimize.py` |
 | `DEFAULT_RESOLUTION` | 100 | `lightcurves.py` |
 | `CRDS_CONTEXT` | `jwst_1322.pmap` | `exotedrf.py` |
 
-Fit v1.2 includes COMPASS-style relative-pixel-flux PCA regressors
-(Ahrer et al. 2025, arXiv:2511.18196); a fit that could not build them is
-stamped `1.2-nopca` and is **not** uniform with the rest.
+Fit v1.2 added COMPASS-style relative-pixel-flux PCA regressors (Ahrer et
+al. 2025, arXiv:2511.18196); a fit that could not build them is stamped
+`-nopca`. Fit **v1.3** adds two things, both from the 2026-08-03 referee
+feedback: the Stage 5.5 occulted-spot scan (confirmed crossings masked,
+lightcurve refit) and the rewritten tilt handling below. A fit where the
+spot scan did not run is stamped `-noscan`. The stamps compose, so
+`1.3-nopca-noscan` is possible and is **not** a survey fit. "Scan ran and
+found nothing" and "scan never ran" are different states — do not treat
+an unstamped and a `-noscan` fit as equivalent.
+
+`-nopca` now carries a second meaning worth knowing: no PCA components
+means no Stage 2 calints, which means no trace diagnostics, which means
+the tilt search fell back to the out-of-transit flux and could not have
+found an in-transit tilt. Treat `-nopca` as "this fit is blind to the
+TOI-270 c failure mode", not merely as slightly worse detrending.
+
+### Tilt events — detect in the PSF, correct with a Heaviside
+
+A tilt event is a primary-mirror segment moving. Rare (~1 per day, so
+~0.2 per visit — Loic Albert, 2026-08-26), and expensive when missed:
+TOI-270 c's landed **inside** transit and left the depth unusable.
+
+**Detection searches the trace diagnostics, not the flux.** A tilt
+changes the PSF *shape* first and the aperture flux only in consequence.
+Albert: *"the most direct effect that a tilt event has on the PSF is a
+change in its FWHM, so PCA are good to catch that."* The KELT-7 b team
+confirmed theirs as "a definite jump in the guide star **width**"
+(arXiv:2509.12479); SOSSISSE catches tilts through its spatial-derivative
+term for the same reason. `find_tilt_events` therefore step-searches
+`trace_fwhm`, `trace_y`, `trace_x` and every PCA component, and requires
+a coincident trigger in **≥2** of them — one series stepping alone is a
+glitch in that series. Those series contain no transit, so the search
+runs over the whole visit. The white flux is searched too but only out of
+transit, since it is the one series the transit lives in.
+
+This is the fix for the old `detect_tilt_events`, which searched the flux
+alone and so had to mask the transit to stop ingress registering as a
+step — making an in-transit tilt structurally undetectable. That function
+is still there for single-series use, and its tests pin the old
+behaviour, but it is not the survey path.
+
+**Correction is a fitted Heaviside, not a mask or a split.** One step
+regressor per event, amplitude free, break time fixed from the white fit
+and reused per channel — the recipe all three KELT-7 b pipelines
+(Eureka!, ExoTiC-JEDI, Tiberius) converged on: *"we also fixed the step
+function's break point ... when fitting the wavelength-binned light
+curves."* The amplitude must stay free **per channel and free in sign**:
+the flux change is pixel-dependent and *"can be positive or negative and
+varies between pixels"* (arXiv:2405.06737). Never reject a tilt for being
+chromatic — unlike a spot crossing, chromaticity is expected.
+
+Only `TILT_TRANSITION_MASK = 3` integrations are dropped at each
+transition, because the integration straddling the tilt is a blend of two
+PSF states that no Heaviside describes (same choice as the WASP-39 b
+G395H analysis). Everything else is preserved: splitting the lightcurve
+at the event would cost the joint constraint on the orbit, which is the
+information the step is there to protect.
+
+Cross-detector coincidence confirms an event (a segment tilt is a
+telescope-level event, so it lands at the same instant in NRS1 and NRS2),
+and the rate guard flags a visit with implausibly many detections rather
+than fitting a step per false positive.
+
 `extract_width` is fixed at 16 — never `'optimize'`, which silently
 breaks per-target uniformity. The `overrides` argument to
 `write_dms_config` / `run_reduction` exists for debugging single targets
 only; production survey reductions must not use it.
+
+### Stellar contamination — Stages 5.5 and 6.5
+
+Two different problems, two different places in the chain. Added after
+referee feedback on Patchwork 1 (2026-08-03).
+
+**Stage 5.5 — occulted spots (`contamination.py`, inside the `fit` step).**
+The planet crosses a spot; the lightcurve shows a positive bump *inside*
+transit, which distorts the shape, inflates β, and biases the depth.
+Visible only against a clean transit model, so the `fit` step is two
+passes: white fit pass 1 (unmasked) → scan → masked white refit → the
+spectroscopic channels, with the **same mask** on both. Detection is a
+centred running mean over the residuals, long-window detrended, flagged
+at ≥5 consecutive integrations beyond 3σ of the out-of-transit MAD.
+
+Classification rules, and why each exists:
+- **Both detectors, transient, in transit** → real crossing. Masked.
+- **NRS2/NRS1 peak-amplitude ratio** is reported: a spot's contrast falls
+  towards the infrared, so a ratio ≥ 0.9 is achromatic and argues
+  instrumental despite the coincidence.
+- **Persistent (level does not return)** → a tilt event, not stellar.
+  Corrected with a step regressor, **never masked**.
+- **One detector only** → detector systematics. Reported, never masked:
+  masking it would drop integrations from one half of the spectrum only
+  and corrupt the NRS1-NRS2 offset.
+
+Masking (not modelling) is the survey default, on the referee's
+recommendation — *"for a wholesale analysis like yours, masking
+starspots seems a reasonable compromise between expediency and
+accuracy."* `fit_spot_crossing_spotrod` is the per-target escape hatch
+and its results are **not** uniform with the survey.
+
+**Stage 6.5 — unocculted spots (the `contamination` step).** Spots
+outside the transit chord never appear in the lightcurve but multiply
+every depth by ε(λ) (Rackham+2018 transit light source effect). Fitted
+as a flat intrinsic spectrum × ε(λ) — the null hypothesis, so the result
+bounds how much structure the star alone could produce. Report
+`delta_bic > 10` as a detection, otherwise quote the `f_het` upper limit.
+
+Two limits, both load-bearing:
+- `f_het` and `T_het` are **degenerate** over one G395H octave. Quote
+  ε(λ) and the corrected spectrum, not `f_het` alone.
+- Blackbody spot contrast at 3-5 µm is weak: a plausible M-dwarf spot
+  moves the depth ~20 ppm across the band, below Patchwork's channel
+  errors. Non-detection means *G395H cannot constrain this*, not that
+  the star is quiet. Breaking either needs a bluer baseline (the ten
+  targets with NIRISS SOSS overlap).
+
+`spotrod`, `stctm` and `sage` are **optional** cross-check backends,
+probed by `VerifyContaminationBackends` and never imported at module
+scope. Nothing in the survey path requires them.
 
 ### VERIFY PHYSICS, NOT EXIT CODES
 
@@ -335,10 +456,26 @@ produced plausible-looking spectra:
    *Guarded*: the fit step refuses when posteriors exist; clear with
    `force_refit=True` (CLI `--force-refit`, sbatch `FORCE_REFIT=1`).
 
-Every white-light fit now also records `depth_check` (measured depth vs
-archive (Rp/Rs)², with a `suspect` flag) and `rednoise.beta_median`
-(Pont+2006; > ~1.2 means that target's depth errors need inflating).
-Check these, not the exit status.
+Every white-light fit also records `rednoise.beta_median` (Pont+2006;
+> ~1.2 means that target's depth errors need inflating) and
+`depth_check`. Check these, not the exit status.
+
+`depth_check` compares against the best available reference and says
+which it used:
+- **`band: same-band`** — a published JWST/G395H depth from
+  `PUBLISHED_G395H_DEPTHS` in `juliet.py`. Tight tolerance (10%); a
+  disagreement is `status: suspect` and worth stopping for. Add entries
+  as the literature grows — each needs a citation.
+- **`band: cross-band`** — the archive optical (Rp/Rs)², i.e. TESS
+  discovery photometry for these targets. Different bandpass: limb
+  darkening differs and unocculted spots move the two bands by different
+  amounts. Verified-healthy Patchwork 1 fits ran +0.3% to +14% from
+  TESS, so this can only be `status: indicative` and **never**
+  `suspect`. The old check flagged healthy targets survey-wide on
+  exactly this.
+
+An error bar larger than half the expected depth is `suspect` in either
+band — that is the prior-returning fit, and it is bandpass-independent.
 
 ### Compute discipline
 
@@ -380,12 +517,19 @@ Check these, not the exit status.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/scripts/test_data_reduction.py -q
 ```
 
-58 tests, no network and no exoTEDRF/juliet environment required. They
+111 tests, no network and no exoTEDRF/juliet environment required. They
 cover the transit-in-window and force-refit guards, MJD→BJD conversion,
 constant-R binning, tilt detection (including that a real transit is not
-flagged), planet resolution, staging deduplication, and the
-frozen-config assertions. `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` avoids an
-unrelated `pkg_resources` breakage in the local pytest plugins.
+flagged), planet resolution, staging deduplication, the frozen-config
+assertions, and — for the contamination stages — injected spot and
+facula crossings recovered across noise seeds, an **in-transit** step
+still found (the TOI-270 c case, where a naive noise scale measures the
+step height and the event hides itself), detrend lobes merged into one
+event, two separated crossings kept separate, tilt steps and
+single-detector excursions never masked, the chromatic amplitude ratio,
+ε(λ) limits, and the same-band/cross-band depth-check logic.
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` avoids an unrelated `pkg_resources`
+breakage in the local pytest plugins.
 
 ## Common Workflows
 
@@ -424,10 +568,20 @@ Full detail in `scripts/patchwork/CAMPAIGN.md`. The sequence:
    `segments_complete: true`, identical `exotedrf.path` and
    `crds_context` across targets.
 6. **Fit** — only after step 5 passes; `FORCE_REFIT=1` on any rerun.
-7. **Verify the science** — depth vs archive expectation,
-   `depth_check.suspect`, `rednoise.beta_median`, `ld_source`,
-   `fit_version`, channel counts, NRS1-NRS2 offset.
-8. **Archive** to durable storage (scratch is purged). Never flatten the
+   This one step runs white pass 1, the Stage 5.5 spot scan, the masked
+   white refit, and the channels.
+7. **Verify the science** — `depth_check.status` (`suspect` stops you;
+   `indicative` is a cross-band note, not a problem),
+   `rednoise.beta_median`, `ld_source`, `fit_version` (must not carry
+   `-noscan` or `-nopca`), `tilt_handling` (events found, which
+   diagnostics saw them, `rate_warning` empty),
+   `spot_handling.n_masked`, channel counts,
+   NRS1-NRS2 offset. Read `fits/<visit>/anomalies/anomaly_scan.pdf`:
+   every masked span should be a bump the eye agrees with, and any
+   `achromatic` or `single_detector` event should NOT have been masked.
+8. **Contamination** — `STEPS=contamination` on the combined spectrum
+   (seconds, no refit). Expect non-detections; see the Stage 6.5 limits.
+9. **Archive** to durable storage (scratch is purged). Never flatten the
    directory tree: Stage 3 filenames repeat across visits, so the visit
    is encoded only in the directory name.
 

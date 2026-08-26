@@ -13,9 +13,12 @@ target-agnostic form:
 3. Extract per-integration trace diagnostics (cross-dispersion position
    y, dispersion drift x, trace FWHM) from the Stage 2 calints cubes —
    the decorrelation regressors for the juliet fits.
-4. Detect **tilt events** (sudden mirror-segment tilts, seen in NIRSpec
-   TSOs as step discontinuities in flux / trace position) and build the
-   corresponding step regressors.
+4. Detect **tilt events** (sudden mirror-segment tilts) and build the
+   corresponding Heaviside step regressors. The search runs over the
+   trace diagnostics — FWHM, position, PCA components — because a tilt
+   changes the PSF before it changes the flux, and those series carry no
+   transit signal, so an event *during* transit is as visible as one
+   outside it. See ``find_tilt_events``.
 
 Everything here is plain numpy/astropy — no jwst/exotedrf import — so it
 runs in the main ASTER environment.
@@ -46,7 +49,11 @@ except ModuleNotFoundError:
 
 # 1.1: final bin edge clipped to the wavelength cut (the last channel's
 # centre used to be reported outside the detector range).
-PATCHWORK_STAGE4_VERSION = "1.1"
+# 1.2: tilt events are searched in the trace diagnostics (FWHM, position,
+# PCA) rather than the out-of-transit flux alone, so an event during
+# transit is detectable. Different events found => different step
+# regressors => different fits, so this is a survey-definition change.
+PATCHWORK_STAGE4_VERSION = "1.2"
 
 N_REFPIX_COLS = 5             # detector reference columns trimmed each edge
 # Survey-frozen binning (decision Wasi 2026-07-30): one resolution for
@@ -67,6 +74,24 @@ G395H_WAVE_RANGES = {"NRS1": (2.87, 3.72), "NRS2": (3.82, 5.18)}
 TILT_WINDOW = 15              # integrations each side of candidate step
 TILT_THRESHOLD = 6.0          # robust sigma of window-median differences
 TILT_MIN_SEPARATION = 30      # integrations between distinct events
+# A mirror tilt event must show in at least this many independent series
+# before it is believed. One series stepping is a glitch in that series;
+# the PSF changing shape shows up in several at once.
+TILT_MIN_SOURCES = 2
+# Integrations dropped at the step itself. The tilt completes in under
+# 1.4 s (Schlawin et al. 2023, PASP 135 018001) but the integration that
+# straddles it is a blend of both PSF states, which no Heaviside
+# describes. Rigby et al. / the WASP-39 b G395H analysis (arXiv:2405.06737)
+# "exclude three integrations around the tilt event" and step-correct the
+# rest; three is enough at any NIRSpec BOTS cadence and costs ~0.1% of a
+# visit, against splitting the lightcurve which costs the orbit constraint.
+TILT_TRANSITION_MASK = 3
+# Loic Albert (2026-08-26): tilt events are rare, "no more than ~1 per day".
+# A 5 h visit therefore expects ~0.2. Finding several in one visit means
+# the detection is firing on something else, so flag it rather than
+# silently fitting a step per false positive.
+TILT_EXPECTED_PER_DAY = 1.0
+TILT_MATCH_TOL_MIN = 5.0      # cross-detector coincidence window
 
 
 # -------------------- loading --------------------
@@ -458,49 +483,322 @@ def detect_tilt_events(
     min_separation: int = TILT_MIN_SEPARATION,
     exclude_mask: np.ndarray | None = None,
 ) -> list[dict[str, float]]:
-    """Detect step discontinuities (mirror tilt events) in a lightcurve.
+    """Detect step discontinuities in a single series (legacy, flux-only).
 
     At each interior integration i, compare the median of ``window``
     points after i to the median of ``window`` points before; a step
     exceeding ``threshold`` robust sigma (MAD of the difference series)
     is an event. ``exclude_mask`` is a KEEP mask (True = use this point;
-    False = ignore it, e.g. in-transit points) — pass the out-of-transit
-    mask so ingress/egress is never flagged as a step.
+    False = ignore it, e.g. in-transit points).
+
+    **Prefer ``find_tilt_events``.** This function can only search one
+    series, so on the flux it must mask the transit to stop ingress and
+    egress registering as steps — and an event *inside* transit is then
+    structurally undetectable. That is the TOI-270 c failure. It remains
+    here because it is still the right tool for a single diagnostic
+    series, and ``find_tilt_events`` uses the same statistic.
 
     Returns a list of ``{"index", "amplitude"}`` (amplitude in relative
-    flux, positive = brightening), strongest first, merged so events are
+    flux, positive = brightening), ordered by index, merged so events are
     at least ``min_separation`` apart.
     """
+    z = step_statistic(flux, window=window, exclude_mask=exclude_mask)
+    if not np.any(np.isfinite(z)):
+        return []
+
     f = np.asarray(flux, dtype=float).copy()
     if exclude_mask is not None:
         f[~np.asarray(exclude_mask, dtype=bool)] = np.nan
 
-    n = f.size
+    candidates = np.flatnonzero(np.abs(z) > threshold)
+    events: list[dict[str, float]] = []
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        for idx in candidates[np.argsort(-np.abs(z[candidates]))]:
+            if any(abs(int(idx) - e["index"]) < min_separation for e in events):
+                continue
+            i = int(idx)
+            amplitude = float(np.nanmedian(f[i: i + window])
+                              - np.nanmedian(f[i - window: i]))
+            events.append({"index": i, "amplitude": amplitude})
+    return sorted(events, key=lambda e: e["index"])
+
+
+def step_statistic(series: np.ndarray, *, window: int = TILT_WINDOW,
+                   exclude_mask: np.ndarray | None = None) -> np.ndarray:
+    """Robust step-detection statistic for one per-integration series.
+
+    At each interior point, the median of ``window`` samples after it
+    minus the median of ``window`` before; that difference series is
+    then divided by its own MAD. A step of any size produces one large
+    excursion, and because a single step contributes only ~``window``
+    points out of thousands, it barely moves the MAD that normalizes it.
+
+    Returns a z-array (NaN where the windows do not fit). ``exclude_mask``
+    is a KEEP mask: False entries are ignored, which is how the transit
+    is kept out of a search run on the *flux*.
+    """
+    s = np.asarray(series, dtype=float).copy()
+    if exclude_mask is not None:
+        s[~np.asarray(exclude_mask, dtype=bool)] = np.nan
+
+    n = s.size
     diff = np.full(n, np.nan)
     import warnings
 
     with warnings.catch_warnings():
-        # Windows fully inside the excluded (in-transit) span are all-NaN
-        # by construction; their diff stays NaN and is ignored.
+        # Windows fully inside an excluded span are all-NaN by
+        # construction; their diff stays NaN and is ignored.
         warnings.simplefilter("ignore", category=RuntimeWarning)
         for i in range(window, n - window):
-            pre = np.nanmedian(f[i - window: i])
-            post = np.nanmedian(f[i: i + window])
-            diff[i] = post - pre
+            diff[i] = np.nanmedian(s[i: i + window]) - np.nanmedian(s[i - window: i])
 
     med = np.nanmedian(diff)
     mad = np.nanmedian(np.abs(diff - med))
     sigma = 1.4826 * mad
     if not np.isfinite(sigma) or sigma == 0:
-        return []
+        return np.full(n, np.nan)
+    return (diff - med) / sigma
 
-    candidates = np.where(np.abs(diff - med) > threshold * sigma)[0]
-    events: list[dict[str, float]] = []
-    for idx in candidates[np.argsort(-np.abs(diff[candidates] - med))]:
-        if any(abs(idx - e["index"]) < min_separation for e in events):
+
+def find_tilt_events(
+    flux: np.ndarray,
+    *,
+    diagnostics: dict[str, np.ndarray] | None = None,
+    pca_components: np.ndarray | None = None,
+    oot_mask: np.ndarray | None = None,
+    time: np.ndarray | None = None,
+    t0_obs: float | None = None,
+    window: int = TILT_WINDOW,
+    threshold: float = TILT_THRESHOLD,
+    min_separation: int = TILT_MIN_SEPARATION,
+    min_sources: int = TILT_MIN_SOURCES,
+    detector: str = "",
+) -> dict[str, Any]:
+    """Detect mirror-segment tilt events from the trace diagnostics.
+
+    A tilt event is a primary-mirror segment moving, so what it changes
+    first is the **point spread function**, and only consequently the
+    flux in the extraction aperture. Loic Albert (2026-08-26): *"The most
+    direct effect that a tilt event has on the PSF is a change in its
+    FWHM, so PCA are good to catch that."* The KELT-7 b analysis
+    (arXiv:2509.12479) confirmed its event through the guide star,
+    finding "a definite jump in the guide star **width**", and SOSSISSE
+    detects tilts through the spatial-derivative term precisely because a
+    tilt changes the trace's *shape* while barely moving its position.
+
+    This is the reason to search the diagnostics rather than the flux.
+    Searching the flux alone forces a choice between two failures: leave
+    the transit in and every ingress is a step, or mask the transit — as
+    Patchwork did until now — and an event *during* transit becomes
+    structurally invisible. It is the second that cost us TOI-270 c.
+    The FWHM, trace position and PCA series contain no transit at all, so
+    they can be searched over the whole visit, in-transit included.
+
+    Series searched: ``fwhm``, ``y``, ``x`` from ``diagnostics``, each
+    column of ``pca_components``, and the white ``flux`` — the last
+    restricted to ``oot_mask`` where one is given, since it is the only
+    series the transit lives in. An event must trigger in at least
+    ``min_sources`` of them: one series stepping on its own is a glitch
+    in that series, while a PSF genuinely changing shape moves several
+    together.
+
+    Returns ``{"events": [...], "sources": [...], "rate_warning": ...}``.
+    Each event carries ``index``, ``amplitude`` (flux step, relative —
+    positive means brighter after), ``n_sources``, ``z`` per triggering
+    series, and, when ``time`` is given, ``time``/``hours_from_mid``.
+    """
+    flux = np.asarray(flux, dtype=float)
+    n = flux.size
+
+    panel: dict[str, np.ndarray] = {}
+    if diagnostics:
+        for key in ("fwhm", "y", "x"):
+            v = diagnostics.get(key)
+            if v is not None and np.asarray(v).size == n:
+                panel[f"trace_{key}"] = np.asarray(v, dtype=float)
+    if pca_components is not None:
+        pca = np.asarray(pca_components, dtype=float)
+        if pca.ndim == 2 and pca.shape[0] == n:
+            for j in range(pca.shape[1]):
+                panel[f"pca_{j}"] = pca[:, j]
+
+    # The flux is searched too, but only outside transit: it is the one
+    # series where ingress and egress are themselves steps.
+    z_by_source = {name: step_statistic(v, window=window)
+                   for name, v in panel.items()}
+    z_by_source["flux"] = step_statistic(flux, window=window,
+                                         exclude_mask=oot_mask)
+
+    triggers = {name: np.abs(z) > threshold
+                for name, z in z_by_source.items()}
+    stacked = np.vstack([np.where(np.isfinite(z_by_source[name]), t, False)
+                         for name, t in triggers.items()])
+    n_trig = stacked.sum(axis=0)
+
+    # Total significance, used only to pick the representative index
+    # inside a group of adjacent candidate points.
+    total_z = np.nansum(
+        np.vstack([np.abs(np.nan_to_num(z, nan=0.0))
+                   for z in z_by_source.values()]), axis=0)
+
+    candidates = np.flatnonzero(n_trig >= int(min_sources))
+    events: list[dict[str, Any]] = []
+    for idx in candidates[np.argsort(-total_z[candidates])]:
+        if any(abs(int(idx) - e["index"]) < min_separation for e in events):
             continue
-        events.append({"index": int(idx), "amplitude": float(diff[idx] - med)})
-    return sorted(events, key=lambda e: e["index"])
+        i = int(idx)
+        pre = flux[max(0, i - window): i]
+        post = flux[i: i + window]
+        amplitude = (float(np.nanmedian(post) - np.nanmedian(pre))
+                     if pre.size and post.size else float("nan"))
+        sources = sorted(name for name, t in triggers.items()
+                         if t[i] and np.isfinite(z_by_source[name][i]))
+        event: dict[str, Any] = {
+            "index": i,
+            "amplitude": amplitude,
+            "amplitude_ppm": amplitude * 1e6,
+            "n_sources": len(sources),
+            "sources": sources,
+            "z": {name: float(z_by_source[name][i]) for name in sources},
+            "detector": detector.upper(),
+        }
+        if time is not None:
+            event["time"] = float(np.asarray(time, dtype=float)[i])
+            if t0_obs is not None:
+                event["hours_from_mid"] = float((event["time"] - t0_obs) * 24)
+            if oot_mask is not None:
+                event["in_transit"] = bool(~np.asarray(oot_mask, dtype=bool)[i])
+        events.append(event)
+
+    events.sort(key=lambda e: e["index"])
+
+    # Rate sanity check (see TILT_EXPECTED_PER_DAY).
+    rate_warning = None
+    if time is not None and len(events):
+        t_arr = np.asarray(time, dtype=float)
+        span_days = float(np.nanmax(t_arr) - np.nanmin(t_arr))
+        expected = TILT_EXPECTED_PER_DAY * span_days
+        if len(events) > max(2, 5 * expected):
+            rate_warning = (
+                f"{len(events)} tilt events in a {span_days * 24:.1f} h visit, "
+                f"against ~{expected:.2f} expected at the observed rate of "
+                f"~{TILT_EXPECTED_PER_DAY:.0f}/day. Tilt events are rare; this "
+                "many means the search is firing on something else (a "
+                "systematic ramp, a noisy diagnostic). Inspect before fitting "
+                "a step per detection."
+            )
+
+    return {
+        "detector": detector.upper(),
+        "events": events,
+        "sources_searched": sorted(z_by_source),
+        "diagnostics_available": bool(panel),
+        "threshold": float(threshold),
+        "min_sources": int(min_sources),
+        "window": int(window),
+        "rate_warning": rate_warning,
+    }
+
+
+def match_tilt_events(reports: dict[str, dict[str, Any]], *,
+                      tol_min: float = TILT_MATCH_TOL_MIN) -> list[dict[str, Any]]:
+    """Cross-confirm tilt events between detectors.
+
+    A segment tilt is a *telescope* event: the same mirror moves for
+    every detector at the same instant. NRS1 and NRS2 read through
+    independent chains, so a step in only one of them is detector
+    electronics, not the observatory. Coincidence is therefore a cheap,
+    strong discriminator — the same argument as for spot crossings in
+    ``contamination.py``, but with the opposite chromatic expectation:
+    a tilt changes the PSF, so its flux step can differ in size *and
+    sign* between detectors and even between pixels (arXiv:2405.06737:
+    "the change in count can be positive or negative and varies between
+    pixels"). Do NOT reject a tilt for being chromatic.
+
+    Returns one entry per matched or unmatched event, earliest first.
+    """
+    dets = [d for d in ("NRS1", "NRS2") if d in reports]
+    dets += sorted(d for d in reports if d not in ("NRS1", "NRS2"))
+    tol_days = tol_min / (24 * 60)
+    merged: list[dict[str, Any]] = []
+    used: set[tuple[str, int]] = set()
+
+    if len(dets) >= 2:
+        a_det, b_det = dets[0], dets[1]
+        for i, a in enumerate(reports[a_det].get("events", [])):
+            if "time" not in a:
+                continue
+            best, best_dt = None, None
+            for j, b in enumerate(reports[b_det].get("events", [])):
+                if (b_det, j) in used or "time" not in b:
+                    continue
+                dt = abs(a["time"] - b["time"])
+                if dt <= tol_days and (best_dt is None or dt < best_dt):
+                    best, best_dt = j, dt
+            if best is None:
+                continue
+            b = reports[b_det]["events"][best]
+            used.add((a_det, i))
+            used.add((b_det, best))
+            merged.append({
+                "confirmed": True,
+                "detectors": {a_det: a, b_det: b},
+                "time": 0.5 * (a["time"] + b["time"]),
+                "delta_t_min": float(best_dt * 24 * 60),
+                "hours_from_mid": a.get("hours_from_mid"),
+                "in_transit": bool(a.get("in_transit")
+                                   or b.get("in_transit")),
+                "amplitude_ppm": {a_det: a["amplitude_ppm"],
+                                  b_det: b["amplitude_ppm"]},
+                "n_sources": max(a["n_sources"], b["n_sources"]),
+            })
+
+    for det in dets:
+        for i, a in enumerate(reports[det].get("events", [])):
+            if (det, i) in used:
+                continue
+            merged.append({
+                "confirmed": False,
+                "detectors": {det: a},
+                "time": a.get("time"),
+                "delta_t_min": None,
+                "hours_from_mid": a.get("hours_from_mid"),
+                "in_transit": bool(a.get("in_transit")),
+                "amplitude_ppm": {det: a["amplitude_ppm"]},
+                "n_sources": a["n_sources"],
+                "single_detector": True,
+            })
+
+    # None times sort last; the 0.0 placeholder keeps two timeless
+    # events comparable (None < None raises in Python 3).
+    merged.sort(key=lambda m: (m["time"] is None,
+                               m["time"] if m["time"] is not None else 0.0))
+    return merged
+
+
+def tilt_transition_keep_mask(n: int, events: list[dict[str, Any]], *,
+                              pad: int = TILT_TRANSITION_MASK) -> np.ndarray:
+    """KEEP mask (True = use) excluding the integrations at each step.
+
+    A Heaviside cannot describe the integration that straddles the tilt:
+    for part of that exposure the PSF was in one state and for the rest
+    in another, so its flux lies somewhere between the two levels and
+    would drag the fitted step amplitude. Dropping ``pad`` integrations
+    at the transition is what the WASP-39 b G395H analysis does, and it
+    costs ~0.1% of a visit — as against splitting the lightcurve in two,
+    which throws away the joint constraint on the orbit.
+    """
+    keep = np.ones(int(n), dtype=bool)
+    for e in events:
+        idx = int(e["index"] if "index" in e
+                  else next(iter(e["detectors"].values()))["index"])
+        lo = max(0, idx - int(pad))
+        hi = min(int(n) - 1, idx + int(pad))
+        keep[lo: hi + 1] = False
+    return keep
 
 
 def step_regressors(n: int, events: list[dict[str, float]]) -> np.ndarray:
@@ -562,28 +860,51 @@ def build_regressor_matrix(
 # -------------------- orchestral tool --------------------
 
 
-class DetectNirspecTiltEvents(BaseTool):
+class DetectTiltEvents(BaseTool):
     """
-    Scan a reduced NIRSpec/G395H visit for mirror tilt events — sudden
-    step discontinuities in the white lightcurve caused by primary-mirror
-    segment tilts. Undetected tilt events bias the transit depth; the
-    juliet fitting tools correct them with a fitted step term.
+    Scan a reduced NIRSpec/G395H visit for mirror-segment tilt events.
 
-    Input is an exoTEDRF ``*_spectra_fullres.fits`` product. In-transit
-    points are excluded from the step search using the planet ephemeris
-    (period, t0, duration), so real ingress/egress is never flagged.
+    A tilt event is a primary-mirror segment shifting, which changes the
+    PSF and steps the flux in the extraction aperture. Undetected, it
+    biases the transit depth; the KELT-7 b event sat a third of the way
+    through transit and every pipeline that reduced it had to model it
+    (arXiv:2509.12479).
 
-    Reports each event's integration index, time, and amplitude in ppm.
-    The same detection runs automatically inside
-    ``FitNirspecG395hWhiteLight`` — use this tool to inspect a visit
-    before fitting, or to diagnose a suspicious lightcurve.
+    **Detection searches the trace diagnostics, not just the flux.** A
+    tilt changes the PSF *width* first — Loic Albert: "the most direct
+    effect that a tilt event has on the PSF is a change in its FWHM, so
+    PCA are good to catch that"; the KELT-7 b team confirmed theirs as "a
+    definite jump in the guide star width". So this tool steps-searches
+    the trace FWHM, the trace x/y position and the PCA components, and
+    requires an event to appear in at least two of them. Those series
+    carry no transit signal, so an event *during* transit is as visible
+    as one outside it — the flux-only search this replaces had to mask
+    the transit to avoid flagging ingress, which made an in-transit tilt
+    structurally undetectable. The white flux is searched too, but only
+    out of transit.
+
+    Pass ``reduction_dir`` — without the Stage 2 calints there are no
+    diagnostics, the search falls back to flux-only, and the tool says so.
+
+    **Correction is a fitted Heaviside step, not a mask.** The juliet fit
+    tools add one step regressor per event with a free amplitude, fixed
+    in time, and re-fit it per wavelength channel (the flux change is
+    pixel-dependent and can be positive or negative, arXiv:2405.06737).
+    Only ~3 integrations at the transition are dropped, because the
+    integration straddling the tilt is a blend of both PSF states. Nothing
+    else is discarded and the lightcurve is never split.
+
+    Tilt events are rare — roughly one per day, so ~0.2 per visit. Several
+    in one visit means the search is firing on something else, and the
+    tool warns rather than fitting a step per false positive.
 
     Example
     -------
-        DetectNirspecTiltEvents(
-            spectra_path="reductions/GJ_9827_d/o010/nrs1/.../..._box_spectra_fullres.fits",
+        DetectTiltEvents(
+            spectra_path="reductions/TOI_270_c/o016/nrs1/.../..._box_spectra_fullres.fits",
+            reduction_dir="reductions/TOI_270_c/o016/nrs1",
             detector="NRS1",
-            period=6.20146980, t0_ref=2457740.96115, duration_hr=1.28,
+            period=11.38014, t0_ref=2458444.4677, duration_hr=2.17,
         )
     """
 
@@ -596,6 +917,12 @@ class DetectNirspecTiltEvents(BaseTool):
     period: float = RuntimeField(description="Orbital period in days.")
     t0_ref: float = RuntimeField(description="Reference mid-transit epoch, BJD_TDB.")
     duration_hr: float = RuntimeField(description="Transit duration in hours.")
+    reduction_dir: str | None = RuntimeField(
+        default=None,
+        description="Reduction dir with Stage 2 calints. Strongly "
+                    "recommended: without it there are no PSF diagnostics "
+                    "and an in-transit tilt cannot be found.",
+    )
     base_directory: str = StateField()
 
     def _run(self) -> str:
@@ -607,23 +934,68 @@ class DetectNirspecTiltEvents(BaseTool):
             spectra, detector=self.detector, t0_ref=self.t0_ref,
             period=self.period, duration_hr=self.duration_hr,
         )
-        events = detect_tilt_events(lc["wl_flux"], exclude_mask=lc["oot_mask"])
+
+        diagnostics = pca = None
+        if self.reduction_dir:
+            red = self.reduction_dir
+            if not os.path.isabs(red):
+                red = os.path.join(self.base_directory, red)
+            calints = find_stage2_calints(red, self.detector)
+            if calints:
+                diagnostics = trace_diagnostics(calints)
+                if any(np.asarray(v).size != lc["time"].size
+                       for v in diagnostics.values()):
+                    diagnostics = None
+                else:
+                    try:
+                        pca = pca_regressors(calints)
+                        if pca.shape[0] != lc["time"].size:
+                            pca = None
+                    except Exception:
+                        pca = None
+
+        report = find_tilt_events(
+            lc["wl_flux"], diagnostics=diagnostics, pca_components=pca,
+            oot_mask=lc["oot_mask"], time=lc["time"], t0_obs=lc["t0_obs"],
+            detector=self.detector,
+        )
+        events = report["events"]
+
         lines = [
             f"Tilt-event scan ({self.detector}): {len(events)} event(s); "
             f"OOT scatter {lc['oot_scatter_ppm']:.0f} ppm.",
+            f"  searched: {', '.join(report['sources_searched'])}",
         ]
-        for e in events:
-            t = lc["time"][e["index"]]
+        if not report["diagnostics_available"]:
             lines.append(
-                f"  index {e['index']} (BJD {t:.5f}, "
-                f"{(t - lc['t0_obs']) * 24:+.2f} h from mid-transit): "
-                f"step {e['amplitude'] * 1e6:+.0f} ppm"
+                "  WARNING: no trace diagnostics (pass reduction_dir). The "
+                "search fell back to the out-of-transit flux only, so a tilt "
+                "DURING transit would not be found — the TOI-270 c failure."
+            )
+        for e in events:
+            lines.append(
+                f"  index {e['index']} (BJD {e['time']:.5f}, "
+                f"{e.get('hours_from_mid', float('nan')):+.2f} h from "
+                f"mid-transit"
+                + (", IN TRANSIT" if e.get("in_transit") else "")
+                + f"): step {e['amplitude_ppm']:+.0f} ppm, "
+                f"{e['n_sources']} source(s): "
+                + ", ".join(f"{s} ({e['z'][s]:+.1f} sigma)" for s in e["sources"])
             )
         if not events:
             lines.append("  No step discontinuities above threshold.")
         else:
             lines.append(
-                "The juliet fit tools will include one step regressor per "
-                "event (tilt_correction=True, the default)."
+                f"The juliet fit tools will fit one Heaviside step per event "
+                f"and drop {TILT_TRANSITION_MASK} integration(s) either side "
+                "of each transition (tilt_correction=True, the default). "
+                "Nothing else is masked."
             )
+        if report["rate_warning"]:
+            lines.append(f"  WARNING: {report['rate_warning']}")
         return "\n".join(lines)
+
+
+# Pre-v1.3 name; the tool now searches the PSF diagnostics rather than
+# the out-of-transit flux alone.
+DetectNirspecTiltEvents = DetectTiltEvents

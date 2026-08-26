@@ -6,8 +6,11 @@ Ties the whole Patchwork chain together for one target:
       -> segment inventory check           (exotedrf.inspect_uncal_directory)
       -> exoTEDRF Stages 1-3 per visit     (exotedrf.run_reduction)
       -> Stage 4 lightcurves + tilt scan   (lightcurves.py)
-      -> juliet white + spectroscopic fits (juliet.py, frozen v1.1)
+      -> juliet white fit, pass 1          (juliet.py, frozen v1.3)
+      -> Stage 5.5 occulted-spot scan      (contamination.py)
+      -> masked white refit + channels     (juliet.py)
       -> visit combination + metrics       (juliet.py Stage 6)
+      -> Stage 6.5 unocculted-spot check   (contamination.py)
 
 driven by a small per-target JSON manifest:
 
@@ -73,9 +76,26 @@ from .juliet import (
     write_spectrum_csv,
     _plot_combined,
 )
+from .contamination import (
+    PATCHWORK_CONTAM_VERSION,
+    anomaly_keep_mask,
+    detect_lightcurve_anomalies,
+    match_detector_anomalies,
+    plot_anomaly_diagnostic,
+    remap_anomaly_report,
+    retrieve_contamination,
+    summarize_anomalies,
+    write_contamination_report,
+)
 
 DETECTORS = ("NRS1", "NRS2")
-ALL_STEPS = ("inspect", "reduce", "fit", "combine")
+# "fit" is a compound step: white pass 1 -> Stage 5.5 anomaly scan ->
+# masked white refit -> spectroscopic channels. The scan cannot be a
+# separate top-level step because it sits *between* two fits of the same
+# visit and both must see the same integrations. "contamination" (Stage
+# 6.5) is separate: it runs on the combined spectrum, needs no
+# refitting, and is cheap enough to iterate on.
+ALL_STEPS = ("inspect", "reduce", "fit", "combine", "contamination")
 
 
 def _slug(name: str) -> str:
@@ -178,7 +198,7 @@ def run_patchwork_target(
     cached_priors = manifest.get("priors")
 
     stellar = manifest.get("stellar")
-    if stellar is None and ("reduce" in steps or "fit" in steps):
+    if stellar is None and {"reduce", "fit", "contamination"} & set(steps):
         try:
             priors = fetch_transit_priors(planet)
         except Exception:
@@ -281,6 +301,14 @@ def run_patchwork_target(
             )
 
         for vname in visit_dirs:
+            # -- pass 1: unmasked white fits, one per detector ----------
+            # The Stage 5.5 spot scan needs a clean transit model to
+            # subtract, and it needs BOTH detectors before it can confirm
+            # anything (a bump in one detector alone is instrumental).
+            # So every detector is fitted once unmasked, then scanned
+            # together, then refitted with the mask.
+            preps: dict[str, dict[str, Any]] = {}
+            pass1: dict[str, dict[str, Any]] = {}
             for det in detectors:
                 det_dir = root / "reductions" / vname / det.lower()
                 products = [
@@ -290,16 +318,115 @@ def run_patchwork_target(
                 if not products:
                     log(f"[{slug}] {vname} {det}: no Stage 3 spectra — skipping fit.")
                     continue
-                fit_dir = root / "fits" / vname / det.lower()
-                log(f"[{slug}] fitting {vname} {det} white light...")
                 if len(products) > 1:
                     log(f"[{slug}] {vname} {det}: {len(products)} Stage 3 "
                         f"products found; using {products[0]}")
+                log(f"[{slug}] fitting {vname} {det} white light (pass 1)...")
                 prep = prepare_visit_fit_inputs(
                     products[0], planet,
                     instrument=det, reduction_dir=str(det_dir),
                     fallback_priors=cached_priors,
                 )
+                preps[det] = prep
+                pass1[det] = fit_white_lightcurve(
+                    prep["lc"], prep["priors"],
+                    root / "fits" / vname / det.lower() / "pass1",
+                    instrument=det, program=program, visit=vname,
+                    regressors=prep["regressors"],
+                    regressor_names=prep["regressor_names"],
+                    ld=prep["ld"],
+                    keep_mask=prep["tilt_keep_mask"],
+                    tilt_report=prep["tilt_report"],
+                    n_tilt_masked=prep["n_tilt_masked"],
+                )
+                tr = prep["tilt_report"] or {}
+                if tr.get("events"):
+                    log(f"[{slug}] {vname} {det}: {len(tr['events'])} tilt "
+                        "event(s) — fitted as Heaviside steps: "
+                        + "; ".join(
+                            f"index {e['index']} "
+                            f"({e['amplitude_ppm']:+.0f} ppm"
+                            + (", IN TRANSIT" if e.get("in_transit") else "")
+                            + f", {'+'.join(e['sources'])})"
+                            for e in tr["events"]))
+                if tr.get("rate_warning"):
+                    log(f"[{slug}] {vname} {det}: WARNING {tr['rate_warning']}")
+            if not preps:
+                continue
+
+            # -- Stage 5.5: scan pass-1 residuals, cross-confirm --------
+            anomaly_dir = root / "fits" / vname / "anomalies"
+            anomaly_dir.mkdir(parents=True, exist_ok=True)
+            reports, series = {}, {}
+            for det, prep in preps.items():
+                npz = np.load(Path(pass1[det]["output_dir"])
+                              / "white_lightcurve_residuals.npz")
+                series[det] = {"time": npz["time"], "residual": npz["residual"]}
+                reports[det] = detect_lightcurve_anomalies(
+                    npz["time"], npz["residual"], oot_mask=npz["oot_mask"],
+                    detector=det,
+                )
+                # Pass 1 was fitted with the tilt transition mask, so the
+                # npz arrays are compressed and the scan's indices count
+                # the compressed series. Map them back to original
+                # integration numbers before building any mask.
+                reports[det] = remap_anomaly_report(
+                    reports[det], npz["index"], prep["lc"]["time"].size)
+            merged = match_detector_anomalies(reports)
+            # The spot mask is combined with the tilt transition mask, so
+            # pass 2 sees both corrections at once and the spectroscopic
+            # channels can be checked against a single total.
+            masks = {det: (anomaly_keep_mask(preps[det]["lc"]["time"].size,
+                                             merged, detector=det)
+                           & preps[det]["tilt_keep_mask"])
+                     for det in preps}
+            scan_payload = {
+                "contam_version": PATCHWORK_CONTAM_VERSION,
+                "planet_name": planet,
+                "visit": vname,
+                "detectors": reports,
+                "events": [
+                    {k: v for k, v in m.items() if k != "detectors"}
+                    | {"detectors": {d: {"index_start": e["index_start"],
+                                         "index_end": e["index_end"],
+                                         "amplitude_ppm": e["amplitude_ppm"],
+                                         "peak_sigma": e["peak_sigma"]}
+                                     for d, e in m["detectors"].items()}}
+                    for m in merged
+                ],
+                "masked_integrations": {d: int((~m).sum()) for d, m in masks.items()},
+                "mask_indices": {d: np.flatnonzero(~m).tolist()
+                                 for d, m in masks.items()},
+            }
+            with (anomaly_dir / "anomaly_report.json").open("w") as fh:
+                json.dump(scan_payload, fh, indent=2)
+            try:
+                plot_anomaly_diagnostic(
+                    reports, series, merged, anomaly_dir,
+                    title=figure_title(planet, program=program, visit=vname,
+                                       suffix="Stage 5.5 anomaly scan"))
+            except Exception as exc:  # a figure must never fail a fit
+                log(f"[{slug}] {vname}: anomaly figure failed ({exc}).")
+            if merged:
+                log(f"[{slug}] {vname}: Stage 5.5 scan —\n"
+                    + summarize_anomalies(merged))
+            else:
+                log(f"[{slug}] {vname}: Stage 5.5 scan — no anomalies.")
+            summary["visits"].setdefault(vname, {})["anomaly_scan"] = {
+                "contam_version": PATCHWORK_CONTAM_VERSION,
+                "n_events": len(merged),
+                "n_confirmed": sum(1 for m in merged if m["confirmed"]),
+                "masked_integrations": scan_payload["masked_integrations"],
+                "report": str(anomaly_dir / "anomaly_report.json"),
+            }
+
+            # -- pass 2: masked white refit + spectroscopic channels ----
+            for det, prep in preps.items():
+                fit_dir = root / "fits" / vname / det.lower()
+                keep = masks[det]
+                n_masked = int((~keep).sum())
+                log(f"[{slug}] fitting {vname} {det} white light "
+                    f"(pass 2, {n_masked} integration(s) masked)...")
                 white = fit_white_lightcurve(
                     prep["lc"], prep["priors"], fit_dir,
                     instrument=det,
@@ -307,6 +434,11 @@ def run_patchwork_target(
                     regressors=prep["regressors"],
                     regressor_names=prep["regressor_names"],
                     ld=prep["ld"],
+                    keep_mask=keep,
+                    anomaly_scan=scan_payload,
+                    tilt_report=prep["tilt_report"],
+                    n_spot_masked=int(n_masked - prep["n_tilt_masked"]),
+                    n_tilt_masked=prep["n_tilt_masked"],
                 )
                 log(f"[{slug}] fitting {vname} {det} spectroscopic channels...")
                 spec = fit_transmission_spectrum(
@@ -315,25 +447,49 @@ def run_patchwork_target(
                     program=program, visit=vname,
                     regressors=prep["regressors"],
                     stellar=stellar,
+                    keep_mask=keep,
                 )
                 summary["visits"].setdefault(vname, {}).setdefault("fits", {})[det] = {
                     "white_depth_ppm": white["depth_ppm"],
+                    "white_depth_ppm_pass1": pass1[det]["depth_ppm"],
                     "white_rms_ppm": white["residual_rms_ppm"],
+                    "fit_version": white["fit_version"],
                     "tilt_events": len(prep["tilt_events"]),
+                    "tilt_handling": white.get("tilt_handling"),
+                    "spot_handling": white.get("spot_handling"),
                     "ld_source": white["ld_source"],
                     "priors_source": prep["priors_source"],
                     "rednoise": white.get("rednoise"),
+                    "rednoise_pass1": pass1[det].get("rednoise"),
                     "depth_check": white.get("depth_check"),
                     "n_channels": spec["n_bins"],
                     "median_depth_err_ppm": spec["median_depth_err_ppm"],
                     "median_channel_rms_ppm": spec["median_rms_ppm"],
                     "spectrum_csv": spec["spectrum_csv"],
                 }
-                if white.get("depth_check", {}) and white["depth_check"].get("suspect"):
+                dc = white.get("depth_check") or {}
+                if dc.get("status") == "suspect":
                     log(f"[{slug}] {vname} {det}: SUSPECT white-light depth "
-                        f"({white['depth_check']['measured_ppm']:.0f} ppm vs "
-                        f"archive {white['depth_check']['expected_ppm_from_archive']:.0f} "
-                        "ppm) — verify before using.")
+                        f"({dc['measured_ppm']:.0f} ppm vs {dc['band']} "
+                        f"reference {dc['expected_ppm']:.0f} ppm, "
+                        f"{dc['difference_sigma']:.1f} sigma) — verify before using.")
+                elif dc.get("status") == "indicative":
+                    log(f"[{slug}] {vname} {det}: depth "
+                        f"{dc['difference_frac'] * 100:+.1f}% from the optical "
+                        "archive value (different band — indicative only).")
+                # Masking is only worth its integrations if it actually
+                # improves the noise. Record the comparison so a target
+                # where it did not can be spotted without a rerun.
+                if n_masked:
+                    b1 = (pass1[det].get("rednoise") or {}).get("beta_median")
+                    b2 = (white.get("rednoise") or {}).get("beta_median")
+                    d1 = pass1[det]["depth_ppm"]["median"]
+                    d2 = white["depth_ppm"]["median"]
+                    log(f"[{slug}] {vname} {det}: masking moved the depth "
+                        f"{d2 - d1:+.0f} ppm and beta {b1:.2f} -> {b2:.2f}."
+                        if b1 and b2 else
+                        f"[{slug}] {vname} {det}: masking moved the depth "
+                        f"{d2 - d1:+.0f} ppm.")
 
     # -- combine ------------------------------------------------------
     if "combine" in steps:
@@ -397,6 +553,69 @@ def run_patchwork_target(
                              suffix=f"{n_vis} visit"
                                     f"{'s' if n_vis != 1 else ''} combined, "
                                     f"R = {DEFAULT_RESOLUTION}"))
+
+    # -- contamination (Stage 6.5) ------------------------------------
+    # Unocculted spots and faculae never appear in the lightcurve, so
+    # Stage 5.5 cannot see them; they multiply the whole spectrum by
+    # epsilon(lambda). Runs on the combined spectrum, costs seconds, and
+    # never modifies the measured spectrum — it writes a corrected copy
+    # alongside it.
+    if "contamination" in steps:
+        contam_dir = root / "contamination"
+        csvs = sorted(glob.glob(str(
+            root / "combined" / "combined_*_transmission_spectrum.csv")))
+        t_phot = (stellar or {}).get("st_teff") if stellar else None
+        if not csvs:
+            log(f"[{slug}] contamination: no combined spectrum — run the "
+                "combine step first.")
+        elif not t_phot:
+            log(f"[{slug}] contamination: no stellar effective temperature "
+                "available — skipping. Add 'stellar' to the manifest.")
+        else:
+            from .juliet import read_spectrum_csv
+
+            waves, depths, errs = [], [], []
+            for c in csvs:
+                s = read_spectrum_csv(c)
+                waves.append(np.asarray(s["wave"], dtype=float))
+                # read_spectrum_csv already returns ppm (depth_ppm columns).
+                depths.append(np.asarray(s["depth_ppm"], dtype=float))
+                errs.append(np.asarray(s["depth_err_ppm"], dtype=float))
+            wave = np.concatenate(waves)
+            order = np.argsort(wave)
+            try:
+                result = retrieve_contamination(
+                    wave[order],
+                    np.concatenate(depths)[order],
+                    np.concatenate(errs)[order],
+                    t_phot=float(t_phot),
+                )
+                written = write_contamination_report(result, contam_dir)
+                p = result["posterior"]
+                summary["contamination"] = {
+                    "contam_version": PATCHWORK_CONTAM_VERSION,
+                    "stellar_model": result["stellar_model"],
+                    "f_het": p["f_het"],
+                    "f_het_95pct_upper": result["f_het_95pct_upper"],
+                    "T_het": p["T_het"],
+                    "delta_bic": result["delta_bic"],
+                    "detected": result["contamination_detected"],
+                    "corrected_csv": written["corrected_csv"],
+                }
+                log(f"[{slug}] Stage 6.5: f_het = {p['f_het']['median']:.3f} "
+                    f"(<{result['f_het_95pct_upper']:.3f} at 95%), "
+                    f"T_het = {p['T_het']['median']:.0f} K, "
+                    f"delta_BIC = {result['delta_bic']:+.1f} — "
+                    + ("contamination favoured; confirm with stctm on a "
+                       "PHOENIX grid before publishing."
+                       if result["contamination_detected"]
+                       else "no correction needed."))
+            except Exception as exc:
+                # Stage 6.5 is diagnostic. A failure here must not cost
+                # the reduction and fits that produced the spectrum.
+                log(f"[{slug}] contamination: FAILED ({type(exc).__name__}: "
+                    f"{exc}). The measured spectrum is unaffected.")
+                summary["contamination"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     summary_path = root / "patchwork_summary.json"
     with summary_path.open("w") as fh:
@@ -481,7 +700,7 @@ def write_fir_slurm_script(
     crds_path: str = "~/scratch/crds_cache",
     crds_context: str = CRDS_CONTEXT,
     exotic_ld_data: str = "~/scratch/exotic_ld_data",
-    steps: str = "inspect,reduce,fit,combine",
+    steps: str = "inspect,reduce,fit,combine,contamination",
 ) -> Path:
     """Write the sbatch file that runs one target's Patchwork chain on
     Fir. Paths default to the Fir layout (scratch for the big caches);
@@ -518,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", required=True,
                         help="Root directory for all per-target outputs.")
     parser.add_argument("--steps", default=",".join(ALL_STEPS),
-                        help="Comma-separated subset of: inspect,reduce,fit,combine.")
+                        help="Comma-separated subset of: inspect,reduce,fit,combine,contamination.")
     parser.add_argument("--detectors", default="NRS1,NRS2")
     parser.add_argument("--force-refit", action="store_true",
                         help="Delete previous posteriors before fitting. "
@@ -576,15 +795,15 @@ class RunPatchworkTarget(BaseTool):
         RunPatchworkTarget(
             manifest_path="patchwork/GJ_9827_d.json",
             output_root="patchwork/results",
-            steps="inspect,reduce,fit,combine",
+            steps="inspect,reduce,fit,combine,contamination",
         )
     """
 
     manifest_path: str = RuntimeField(description="Path to the target manifest JSON.")
     output_root: str = RuntimeField(description="Root directory for outputs.")
     steps: str = RuntimeField(
-        default="inspect,reduce,fit,combine",
-        description="Comma-separated subset of inspect,reduce,fit,combine.",
+        default="inspect,reduce,fit,combine,contamination",
+        description="Comma-separated subset of inspect,reduce,fit,combine,contamination.",
     )
     force_refit: bool = RuntimeField(
         default=False,
@@ -677,7 +896,7 @@ class GeneratePatchworkFirJob(BaseTool):
                     "different python version than aster_env.",
     )
     steps: str = RuntimeField(
-        default="inspect,reduce,fit,combine",
+        default="inspect,reduce,fit,combine,contamination",
         description="Steps the job should run.",
     )
     base_directory: str = StateField()
