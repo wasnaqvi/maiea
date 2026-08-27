@@ -68,7 +68,13 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "L_98_59_d":  ("2:00:00", "15:00:00", "48G", "24G", 2, "below demographic"),
     "GJ_357_b":   ("3:00:00", "15:00:00", "48G", "24G", 2,
                    "below demographic; folder label says d, headers say b — APT check"),
-    "TOI_776_b":  ("2:00:00", "15:00:00", "48G", "24G", 2, ""),
+    # TWO visits since the o006 NRS2 uncal was repaired (2026-08-27): it
+    # had been truncated on disk since August 1, so o006 produced nothing
+    # and the target fit as single-visit. Two visits is ~112 nested
+    # sampling runs against ~56, and the wave-2 15 h allocation timed out
+    # at exactly that point. Sized with the other two-visit targets.
+    "TOI_776_b":  ("4:00:00", "30:00:00", "48G", "24G", 3,
+                   "2 visits since the o006 truncated-uncal repair"),
     "TOI_836_01": ("4:00:00", "15:00:00", "48G", "24G", 2,
                    "keep the .01 designation — 'TOI-836 c' is not in pscomppars"),
     "GJ_9827_d":  ("3:00:00", "30:00:00", "48G", "24G", 3,
@@ -89,9 +95,13 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     # OOM would land AFTER up to 24 h of Stages 1-2. The extrapolation is
     # 8x beyond the measured range and may flatten if exoTEDRF chunks by
     # segment, but headroom is far cheaper than a lost day.
-    "TOI_561_b":  ("24:00:00", "15:00:00", "128G", "32G", 4,
-                   "21228 integrations in one visit; TIMED OUT at 12 h on the "
-                   "first attempt; mem extrapolated from Wave 1 MaxRSS"),
+    # Fit sizing raised 2026-08-27. 32G OOM'd after 50 min: pca_regressors
+    # materialises an (nints, npix) array before selecting bright pixels,
+    # which at 21228 integrations peaks near 33 GB. The fit walltime was
+    # also still 15 h, the same as targets with 8x fewer integrations.
+    "TOI_561_b":  ("24:00:00", "2-12:00:00", "128G", "128G", 4,
+                   "21228 integrations in one visit; reduce TIMED OUT at 12 h "
+                   "and the fit OOM'd at 32G — both raised"),
     # GO 4126 observed TOI-125 b AND c, one transit each (proposal
     # abstract, ADS 2023jwst.prop.4126F). Manifest overrides:
     #   --override jw04126101001="TOI-125 b" --override jw04126201001="TOI-125 c"
