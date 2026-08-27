@@ -47,6 +47,8 @@ from typing import Any
 
 import numpy as np
 
+from .lightcurves import refine_step_shape
+
 try:
     from orchestral.tools.base.tool import BaseTool
     from orchestral.tools.base.field_utils import RuntimeField, StateField
@@ -64,7 +66,7 @@ except ModuleNotFoundError:
 # Frozen survey-wide contamination settings. Bump the version if any
 # change: the Stage 5.5 mask changes which integrations enter the fit,
 # so it is part of the survey definition exactly like the Stage 4 binning.
-PATCHWORK_CONTAM_VERSION = "1.0"
+PATCHWORK_CONTAM_VERSION = "1.1"
 
 # --- Stage 5.5 anomaly detection ---------------------------------------
 # The running-mean window is the timescale a spot crossing occupies. A
@@ -103,6 +105,37 @@ ANOMALY_MATCH_TOL_MIN = 5.0
 # should show a *smaller* bump than NRS1 (2.9-3.7 um). A ratio at or
 # above this is achromatic and points at the instrument, not the star.
 ACHROMATIC_RATIO = 0.9
+# A step is refused only when its flagged span MEANINGFULLY straddles a
+# transit contact, where a Heaviside is degenerate with the transit
+# shape. Bounds, not (0, 1): a span 99% inside transit is an in-transit
+# step -- the TOI-270 c case this machinery exists for, and its largest
+# event (68.8 sigma) has in_transit_frac 0.99. A strict (0, 1) test
+# threw exactly that away.
+CONTACT_STRADDLE = (0.10, 0.90)
+# A mirror-segment tilt completes in under 1.4 s (Schlawin et al. 2023,
+# PASP 135 018001) -- instantaneous at any NIRSpec BOTS cadence. So a
+# genuine tilt's 25-75% transition is set by the smoothing alone, a few
+# integrations. Anything taking MINUTES is a ramp, a mis-fit transit
+# contact, or a trend, and fitting a Heaviside to it is wrong: the step
+# absorbs signal it does not describe.
+#
+# TOI-270 c o016 is why this exists. Its three "confirmed steps" ran
+# 68.8, 15.0 and 10.3 sigma and looked decisive, but measured 4.5-6.3
+# min across the 25-75% transition, and the middle one spanned 514
+# integrations (92 min, in_transit_frac 0.99) -- the whole transit. They
+# are the fitted model missing ingress, the floor and egress, not
+# telescope events. The NRS1 baseline shifts 451 ppm across the visit
+# while NRS2 shifts 55 ppm, which a telescope-level event cannot do.
+# Widths beyond this are not instrument steps. TOI-270 c's real events
+# fit at 8 integrations (1.4 min); anything much slower is a ramp or an
+# unmodelled trend, which a step regressor would happily absorb along
+# with whatever signal shares its timescale.
+STEP_MAX_RAMP_INTS = 25
+# Backstop only -- SHARPNESS above is the real discriminator. A large
+# step legitimately produces wide lobes (a clean 2800 ppm injection
+# spans ~19% of the series), so this must not be tight enough to reject
+# those; it exists to catch a "step" that is really a whole-visit trend.
+TILT_MAX_SPAN_FRAC = 0.30
 
 _KIND_SPOT = "spot_crossing"
 _KIND_FACULA = "facula_crossing"
@@ -159,6 +192,62 @@ def _consecutive_runs(flagged: np.ndarray) -> list[tuple[int, int]]:
 
 
 # -------------------- Stage 5.5 detection --------------------
+
+
+def _transition_width(residual: np.ndarray, i0: int, i1: int,
+                      jump: float, smooth: int = 5) -> int | None:
+    """Integrations spanned by the 25-75% part of a level change.
+
+    ``None`` when no monotone crossing can be located, which is itself
+    disqualifying: a step whose transition cannot be found is not a step.
+    """
+    if not jump:
+        return None
+    sm = running_mean(residual, smooth)
+    c = (int(i0) + int(i1)) // 2
+    half = max(60, int(i1) - int(i0))
+    lo_i, hi_i = max(0, c - half), min(residual.size, c + half)
+    pre = np.nanmedian(residual[max(0, int(i0) - 60): max(1, int(i0))])
+    if not np.isfinite(pre):
+        return None
+    lo, hi = pre + 0.25 * jump, pre + 0.75 * jump
+    band = sm[lo_i:hi_i]
+    inside = ((band > min(lo, hi)) & (band < max(lo, hi)) & np.isfinite(band))
+    n = int(inside.sum())
+    return n if n else None
+
+
+def _slow_trend(smoothed: np.ndarray, oot: np.ndarray,
+                window: int) -> np.ndarray:
+    """Slow instrumental trend, measured OUT OF TRANSIT and interpolated.
+
+    A running mean over the whole series subtracts part of any feature
+    broader than the window from itself, so a long spot crossing erases
+    its own detection. Measuring the trend only where the transit is
+    absent, then interpolating linearly across the transit, removes
+    drift while leaving in-transit structure untouched.
+
+    A step is still localized: within the out-of-transit stretches the
+    trend is exactly the old running mean, so a level change still
+    appears as the antisymmetric pair the search keys on. An in-transit
+    step survives better than before, since a straight interpolation
+    cannot follow it.
+
+    Falls back to the whole-series trend when the out-of-transit
+    baseline is too sparse to define one (fewer than a window's worth,
+    or under a fifth of the visit) -- there, interpolating would invent
+    a trend rather than measure it.
+    """
+    oot = np.asarray(oot, dtype=bool)
+    n = smoothed.size
+    if oot.sum() < max(window, 0.2 * n):
+        return running_mean(smoothed, window)
+    trend = running_mean(np.where(oot, smoothed, np.nan), window)
+    idx = np.arange(n, dtype=float)
+    good = np.isfinite(trend)
+    if good.sum() < 2:
+        return running_mean(smoothed, window)
+    return np.interp(idx, idx[good], trend[good])
 
 
 def detect_lightcurve_anomalies(
@@ -246,11 +335,19 @@ def detect_lightcurve_anomalies(
     # the reason for working with the smoothed series rather than
     # dividing white noise by sqrt(window).
     #
-    # The cost is deliberate: an excursion LONGER than ~6 windows is
-    # suppressed along with the trend. At the survey defaults that is
-    # ~30 minutes of a NIRSpec TSO; a stellar feature broader than that
-    # is not a spot crossing but a change in the transit itself.
-    trend = running_mean(smoothed, 6 * window)
+    # v1.1: the trend is built from OUT-OF-TRANSIT points only and
+    # interpolated across the transit (see _slow_trend). The old version
+    # ran the trend over the whole series, which meant any in-transit
+    # feature broader than ~6 windows (~30 min at survey defaults)
+    # partly subtracted ITSELF -- precisely the broad spot crossings the
+    # stage exists to find. Measured on the 2026-08-27 survey products,
+    # recovery of the in-transit peak roughly doubled: TOI-1231 b NRS1
+    # 4.1 -> 9.4 sigma, GJ 3090 b o014 2.9/2.7 -> 5.0/5.2, GJ 9827 d
+    # o010 3.3/2.9 -> 5.1/4.2, LTT 3780 c 3.2/2.1 -> 4.8/3.0. Four
+    # targets whose crossings are obvious by eye went from undetectable
+    # to confirmed in both detectors. Slow drift is still removed,
+    # because out of transit the trend is unchanged.
+    trend = _slow_trend(smoothed, oot_sel, 6 * window)
     detrended = smoothed - trend
     baseline = 0.0
     # Detrending also removes ~1/6 of the variance (var(s - <s>_6w) =
@@ -343,10 +440,20 @@ def detect_lightcurve_anomalies(
         else:
             kind = _KIND_UNCONFIRMED
 
+        # How long the level change actually takes (25-75% crossing of a
+        # lightly-smoothed series). For a true step this is set by the
+        # smoothing; for a ramp or a mis-fit transit contact it is not.
+        trans_ints = _transition_width(r, i0, i1, shift if persistent else 0.0)
+        cadence_min = (float(np.nanmedian(np.diff(t))) * 24 * 60
+                       if t.size > 1 else float("nan"))
         anomalies.append({
             "detector": detector.upper(),
             "index_start": int(i0),
             "index_end": int(i1),
+            "transition_ints": trans_ints,
+            "transition_min": (trans_ints * cadence_min
+                               if trans_ints is not None else None),
+            "span_frac": float((i1 - i0 + 1) / max(1, n)),
             "n_integrations": int(i1 - i0 + 1),
             "sign": int(np.sign(amp)) or 1,
             "amplitude_ppm": amp * 1e6,
@@ -599,6 +706,172 @@ def anomaly_keep_mask(
     return keep
 
 
+def step_events_for_regressors(
+    merged: list[dict[str, Any]],
+    detector: str,
+    *,
+    residual: np.ndarray | None = None,
+) -> list[dict[str, Any]]:
+    """Confirmed persistent (step) events, as tilt-style event dicts.
+
+    Stage 5.5 refuses to MASK a step, because a step is meant to be
+    corrected with a fitted Heaviside instead — but those regressors are
+    built in Stage 4 by ``find_tilt_events``, which searches the trace
+    diagnostics and can miss an event that is unmistakable in the flux.
+    When that happens the step is handed to a stage that has already
+    run, nothing corrects it, and the discontinuity goes into the fit.
+
+    That is exactly what happened to TOI-270 c o016 (2026-08-27): the
+    scan confirmed three steps in BOTH detectors at 27.3, 15.2 and 7.9
+    sigma -- one of them 2803 ppm -- while the Stage 4 search reported
+    none, because only ``trace_fwhm`` on NRS1 cleared 6 sigma and
+    ``TILT_MIN_SOURCES`` is 2. The fit came out with beta ~6.1 and a
+    depth 96% above expectation.
+
+    This closes the loop: the events the scan confirmed are converted
+    into step regressors for the pass-2 refit, so a step found by
+    EITHER stage is corrected. The index is the centre of the flagged
+    span -- the detrended feature of a step is antisymmetric about the
+    transition, so its two lobes straddle the break time.
+    """
+    events: list[dict[str, Any]] = []
+    for m in merged:
+        if m.get("kind") != _KIND_STEP or not m.get("confirmed", False):
+            continue
+        entry = (m.get("detectors") or {}).get(detector.upper())
+        if entry is None:
+            continue
+        # REFUSE a step that straddles a transit contact. Over ingress or
+        # egress a Heaviside is degenerate with the transit shape itself,
+        # so fitting one there absorbs part of the contact and biases the
+        # depth -- the opposite of the correction's purpose. Seen on
+        # TOI-270 c o016: of its three confirmed steps, one spans egress
+        # (in_transit_frac 0.54) and a free step there swallowed the
+        # egress. A step wholly inside transit (frac 1.0) or wholly
+        # outside (0.0) is fine and is exactly the in-transit tilt case
+        # this machinery exists for.
+        frac = m.get("in_transit_frac")
+        if frac is not None and CONTACT_STRADDLE[0] < float(frac) < CONTACT_STRADDLE[1]:
+            continue
+        if float(entry.get("span_frac") or 0.0) > TILT_MAX_SPAN_FRAC:
+            continue
+        events.append({
+            "index": int(round(0.5 * (int(entry["index_start"])
+                                      + int(entry["index_end"])))),
+            "width_ints": 0.0,
+            "span": (int(entry["index_start"]), int(entry["index_end"])),
+            "amplitude": float(m["amplitude_ppm"]) / 1e6,
+            "amplitude_ppm": float(m["amplitude_ppm"]),
+            "peak_sigma": float(m["peak_sigma"]),
+            "source": "stage5.5-scan",
+        })
+    events.sort(key=lambda e: e["index"])
+
+    # Fit each break time and transition width to the residuals. The
+    # flagged span's centre is only a starting guess -- it comes from a
+    # detrended statistic whose lobes need not straddle the transition
+    # symmetrically. On TOI-270 c o016 it sat 23 integrations late, and
+    # a hard edge there recovered +2275 ppm where the fitted ramp
+    # recovers +2784 ppm: the step stopped 22% short of the flux level
+    # the data actually reaches after the event. Refining the shape took
+    # the corrected residual from 337 to 230 ppm rms, and both detectors
+    # chose the same break and width independently.
+    if residual is not None and events:
+        for i, e in enumerate(events):
+            fit = refine_step_shape(
+                residual, e["index"], bounds=e["span"],
+                others=[o for j, o in enumerate(events) if j != i])
+            if not np.isfinite(fit.get("rms", np.nan)):
+                continue
+            if fit["width_ints"] > STEP_MAX_RAMP_INTS:
+                # Too slow to be an instrument step: a change taking many
+                # minutes is a ramp or an unmodelled trend, and giving it
+                # a step regressor would let it absorb real signal.
+                e["rejected"] = "transition too slow"
+                continue
+            e.update({"index": fit["index"], "width_ints": fit["width_ints"],
+                      "amplitude": fit["amplitude"],
+                      "amplitude_ppm": fit["amplitude_ppm"],
+                      "fitted_shape": True})
+        events = [e for e in events if not e.get("rejected")]
+    return sorted(events, key=lambda e: e["index"])
+
+
+def spot_crossing_regressors(
+    time: np.ndarray,
+    merged: list[dict[str, Any]],
+    detector: str,
+    *,
+    pad: int = ANOMALY_MASK_PAD,
+    kinds: tuple[str, ...] = (_KIND_SPOT, _KIND_FACULA),
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Gaussian regressor columns for confirmed occulted crossings.
+
+    MODEL the crossing instead of masking it, following Radica et al.
+    2026 (LHS 1140 b, four NIRISS/SOSS visits), who "model the spot
+    crossing as a Gaussian with a freely fit amplitude, width, and
+    position" in the white light curve and then, per channel, "fix the
+    spot position and width to the best-fitting white light curve
+    values and put a Gaussian prior on the amplitude ... to allow for
+    wavelength evolution".
+
+    Patchwork gets that structure for free. The centre and width come
+    from the Stage 5.5 detection, which already localizes the crossing,
+    so each event contributes ONE fixed-shape column whose amplitude is
+    an ordinary linear-regressor coefficient -- free in the white fit
+    and free again in every channel. Position and width are shared; the
+    amplitude evolves with wavelength, which is the whole point: a
+    spot's contrast falls towards the infrared, and masking throws that
+    chromatic information away along with the integrations.
+
+    Two advantages over the mask this replaces. Nothing is discarded --
+    a crossing spanning 100 integrations cost 100 integrations before,
+    from both detectors. And the fitted amplitude is reported, so the
+    crossing becomes a measurement rather than a hole.
+
+    The width is taken from the flagged span PLUS ``pad`` either side,
+    because the running mean pulls a crossing's edges inwards by about
+    half a window -- the same reason the mask was padded.
+
+    Returns ``(columns, metadata)``; an empty ``(n, 0)`` matrix when
+    there is nothing to model.
+    """
+    t = np.asarray(time, dtype=float)
+    cols: list[np.ndarray] = []
+    meta: list[dict[str, Any]] = []
+    for m in merged:
+        if m.get("kind") not in kinds or not m.get("confirmed", False):
+            continue
+        entries = (m.get("detectors") or {})
+        if detector.upper() not in entries:
+            continue
+        # Union span across detectors, exactly as the mask used: the
+        # crossing is a property of the star, so both detectors see the
+        # same event even where one clears threshold over fewer points.
+        i0 = max(0, min(int(e["index_start"]) for e in entries.values()) - int(pad))
+        i1 = min(t.size - 1,
+                 max(int(e["index_end"]) for e in entries.values()) + int(pad))
+        if i1 <= i0:
+            continue
+        centre = 0.5 * (t[i0] + t[i1])
+        sigma = max((t[i1] - t[i0]) / 2.355, 1e-9)
+        cols.append(np.exp(-0.5 * ((t - centre) / sigma) ** 2))
+        meta.append({
+            "kind": m["kind"],
+            "t_centre": float(centre),
+            "sigma_days": float(sigma),
+            "fwhm_min": float((t[i1] - t[i0]) * 24 * 60),
+            "index_start": int(i0),
+            "index_end": int(i1),
+            "detected_amplitude_ppm": float(m["amplitude_ppm"]),
+            "peak_sigma": float(m["peak_sigma"]),
+            "method": "gaussian-regressor",
+        })
+    if not cols:
+        return np.empty((t.size, 0)), []
+    return np.column_stack(cols), meta
+
+
 def summarize_anomalies(merged: list[dict[str, Any]]) -> str:
     """Human-readable one-block summary of a cross-matched anomaly list."""
     if not merged:
@@ -661,7 +934,10 @@ def plot_anomaly_diagnostic(
                     color=DATA_COLOR, label="residual")
             window = int(reports.get(det, {}).get("window") or ANOMALY_WINDOW)
             smoothed = running_mean(s["residual"], window)
-            detrended = smoothed - running_mean(smoothed, 6 * window)
+            oot = s.get("oot_mask")
+            oot = (np.ones(smoothed.size, bool) if oot is None
+                   else np.asarray(oot, dtype=bool))
+            detrended = smoothed - _slow_trend(smoothed, oot, 6 * window)
             ax.plot(t_hr, detrended * 1e6, "-", lw=1.6, color=MODEL_COLOR,
                     label=f"detrended running mean ({window} ints)")
             sig = reports.get(det, {}).get("sigma_smoothed_ppm")
@@ -970,6 +1246,7 @@ def retrieve_contamination(
     n_walkers: int = 32,
     seed: int = 0,
     fit_faculae: bool = False,
+    offset_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Fit an unocculted-heterogeneity model to a transmission spectrum.
 
@@ -1034,6 +1311,22 @@ def retrieve_contamination(
     if fit_faculae:
         labels += ["f_fac", "T_fac"]
         p0 += [0.02, 1.1 * t_phot]
+    # An inter-detector offset, free and marginalized over. epsilon(lambda)
+    # is monotone in wavelength, so it can absorb a STEP between the NRS1
+    # and NRS2 halves of a combined spectrum and report it as stellar
+    # contamination. That is what produced Patchwork's two "detections"
+    # on 2026-08-27: GJ 357 b at delta_BIC +74.7 and TOI-836.01 at +31.0,
+    # both with f_het railed against the prior wall (0.489 and 0.471
+    # against a 0.5 bound) and implying ~48% spot coverage. Decisively,
+    # TOI-836 b and TOI-836.01 orbit the SAME star and disagreed
+    # (+31.0 vs -1.3) -- impossible for a real stellar property. Giving
+    # the offset its own parameter lets the fit explain the step without
+    # inventing a starspot.
+    if offset_mask is not None:
+        offset_mask = np.asarray(offset_mask, dtype=bool)[good]
+        labels += ["offset_ppm"]
+        p0 += [0.0]
+    off_i = labels.index("offset_ppm") if offset_mask is not None else None
 
     def _unpack(theta):
         d0, f_het, t_het, tp = theta[:4]
@@ -1042,10 +1335,13 @@ def retrieve_contamination(
 
     def _model(theta):
         d0, f_het, t_het, tp, f_fac, t_fac = _unpack(theta)
-        return d0 * contamination_factor(
+        m = d0 * contamination_factor(
             w, t_phot=tp, t_het=t_het, f_het=f_het,
             t_fac=t_fac, f_fac=f_fac,
         )
+        if off_i is not None:
+            m = m + theta[off_i] * offset_mask
+        return m
 
     def _log_prob(theta):
         d0, f_het, t_het, tp, f_fac, t_fac = _unpack(theta)
@@ -1059,6 +1355,8 @@ def retrieve_contamination(
                                 and tp <= t_fac <= 1.5 * tp):
             return -np.inf
         if f_het + f_fac > f_het_max:
+            return -np.inf
+        if off_i is not None and abs(theta[off_i]) > 1000.0:
             return -np.inf
         lp = -0.5 * ((tp - t_phot) / max(t_phot_err, 1.0)) ** 2
         resid = d - _model(theta)
@@ -1090,6 +1388,30 @@ def retrieve_contamination(
     chi2_flat = float(np.sum(((d - flat) / e) ** 2))
     bic_flat = chi2_flat + np.log(n)
 
+    # A LINEAR baseline is the honest null. epsilon(lambda) is a smooth
+    # monotone curve, so beating a flat line proves only that the
+    # spectrum has a slope -- which a detector offset, a residual ramp
+    # or an ordinary atmospheric gradient all produce. Contamination
+    # earns a detection only by beating a straight line in wavelength
+    # too, because what distinguishes it is CURVATURE (the Planck
+    # surface-brightness ratio), not tilt. On 2026-08-27 every Patchwork
+    # "detection" beat flat handsomely; this is the test that asks
+    # whether any of them says anything a slope could not.
+    lin_cols = [np.ones(n), w - w.mean()]
+    if offset_mask is not None:
+        # Give the null the SAME freedom to absorb the inter-detector
+        # step. Otherwise the contamination model is rewarded for
+        # explaining a jump the offset parameter already covers, and a
+        # pure detector offset scores as a stellar detection.
+        lin_cols.append(offset_mask.astype(float))
+    design = np.vstack(lin_cols).T
+    wgt = 1.0 / e**2
+    coef = np.linalg.solve(design.T @ (design * wgt[:, None]),
+                           design.T @ (d * wgt))
+    lin = design @ coef
+    chi2_linear = float(np.sum(((d - lin) / e) ** 2))
+    bic_linear = chi2_linear + design.shape[1] * np.log(n)
+
     eps = contamination_factor(
         w, t_phot=med[3], t_het=med[2], f_het=med[1],
         t_fac=(med[5] if fit_faculae else None),
@@ -1099,6 +1421,14 @@ def retrieve_contamination(
     # detect contamination, which is the expected outcome for most
     # targets and is still a useful published limit.
     f_het_95 = float(np.percentile(chain[:, 1], 95))
+    # RAILED: the posterior is pressed against its own prior wall, so the
+    # median is an artefact of where the bound was put, not a
+    # measurement. Report it rather than quoting a number that would
+    # move if the bound moved.
+    railed_f = bool(f_het_95 > 0.95 * f_het_max)
+    t_het_lo, t_het_hi = 0.5 * med[3], 1.2 * med[3]
+    railed_t = bool(med[2] < t_het_lo + 0.05 * (t_het_hi - t_het_lo)
+                    or med[2] > t_het_hi - 0.05 * (t_het_hi - t_het_lo))
 
     return {
         "backend": "patchwork-blackbody",
@@ -1112,7 +1442,22 @@ def retrieve_contamination(
         "bic": bic,
         "bic_flat": bic_flat,
         "delta_bic": float(bic_flat - bic),
-        "contamination_detected": bool(bic_flat - bic > 10.0),
+        # A railed fit cannot be a detection whatever delta_BIC says: the
+        # model is escaping its prior, not fitting the star.
+        "chi2_linear": chi2_linear,
+        "bic_linear": bic_linear,
+        "delta_bic_linear": float(bic_linear - bic),
+        # Every condition must hold: better than flat, better than a
+        # plain slope, and not escaping its own prior.
+        "contamination_detected": bool(bic_flat - bic > 10.0
+                                       and bic_linear - bic > 10.0
+                                       and not railed_f and not railed_t),
+        "f_het_railed": railed_f,
+        "T_het_railed": railed_t,
+        "railed": bool(railed_f or railed_t),
+        "f_het_max": float(f_het_max),
+        "offset_fitted": off_i is not None,
+        "offset_ppm": (float(med[off_i]) if off_i is not None else None),
         "wave_um": w,
         "epsilon": eps,
         "model_ppm": model,

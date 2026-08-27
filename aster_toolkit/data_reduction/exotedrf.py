@@ -432,6 +432,40 @@ def write_dms_config(
     return path
 
 
+def _declared_data_bytes(path: str) -> int:
+    """Total bytes every HDU's header says its data block occupies.
+
+    Read from the headers alone (NAXISn and BITPIX), so it costs no data
+    I/O and works on a file too short to open as a datamodel. Returns 0
+    when the headers cannot be parsed at all -- absence of evidence, so
+    the caller must not treat that as a truncation.
+    """
+    from astropy.io import fits
+
+    total = 0
+    try:
+        with fits.open(path, memmap=False, lazy_load_hdus=True) as hdul:
+            for hdu in hdul:
+                # Accumulate INSIDE the loop and swallow per-HDU errors:
+                # on a badly truncated file the later HDUs cannot be
+                # parsed at all, and the headers already read are still
+                # enough to show the file is short.
+                try:
+                    h = hdu.header
+                    naxis = int(h.get("NAXIS", 0) or 0)
+                    if naxis < 1:
+                        continue
+                    n = 1
+                    for i in range(1, naxis + 1):
+                        n *= int(h.get(f"NAXIS{i}", 0) or 0)
+                    total += n * abs(int(h.get("BITPIX", 0) or 0)) // 8
+                except Exception:
+                    break
+    except Exception:
+        return total
+    return total
+
+
 def inspect_uncal_directory(input_dir: str | os.PathLike[str]) -> dict[str, Any]:
     """Report segment completeness per detector for a directory of uncal files.
 
@@ -460,6 +494,7 @@ def inspect_uncal_directory(input_dir: str | os.PathLike[str]) -> dict[str, Any]
                 "target": None,
                 "date_obs": None,
                 "files": [],
+                "truncated_files": [],
             },
         )
         entry["segments_found"].append(int(h.get("EXSEGNUM", 0)))
@@ -472,11 +507,30 @@ def inspect_uncal_directory(input_dir: str | os.PathLike[str]) -> dict[str, Any]
         entry["date_obs"] = h.get("DATE-OBS")
         entry["files"].append(os.path.basename(f))
 
+        # A TRUNCATED segment has a perfectly good header and only part
+        # of its data, so the segment-number test above sees a complete
+        # set. exoTEDRF then dies inside DQInitStep with an unrelated
+        # UnboundLocalError (TOI-776 b o006 NRS2, 176 of 1006 MB: failed
+        # identically in two campaigns a month apart before anyone
+        # looked at the file size). Compare the file length against the
+        # size the header itself declares -- no data read needed.
+        expected_bytes = _declared_data_bytes(f)
+        actual_bytes = os.path.getsize(f)
+        if expected_bytes and actual_bytes < expected_bytes:
+            entry["truncated_files"].append({
+                "file": os.path.basename(f),
+                "actual_mb": round(actual_bytes / 1e6, 1),
+                "expected_mb": round(expected_bytes / 1e6, 1),
+            })
+
     for det, entry in report["detectors"].items():
         found = sorted(entry["segments_found"])
         expected = entry["segments_expected"] or 0
         entry["missing_segments"] = [s for s in range(1, expected + 1) if s not in found]
-        entry["complete"] = expected > 0 and not entry["missing_segments"]
+        # Truncated counts as incomplete: reducing it is the same silent
+        # data loss as a missing segment, only harder to diagnose.
+        entry["complete"] = (expected > 0 and not entry["missing_segments"]
+                             and not entry["truncated_files"])
     return report
 
 

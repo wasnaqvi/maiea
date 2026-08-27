@@ -115,7 +115,7 @@ def _import_juliet():
 # facula crossings are masked and the lightcurve is refit. A fit where
 # the scan did not run is stamped "1.3-noscan". The stamps compose:
 # "1.3-nopca-noscan" is possible and is not a survey fit.
-PATCHWORK_FIT_VERSION = "1.3"
+PATCHWORK_FIT_VERSION = "1.4"
 SAMPLER = "dynesty"
 N_LIVE_WHITE = 500
 N_LIVE_SPEC = 300
@@ -1342,16 +1342,34 @@ def prepare_visit_fit_inputs(
     wave_min: float | None = None,
     wave_max: float | None = None,
     fallback_priors: dict[str, Any] | None = None,
+    priors_override: dict[str, Any] | None = None,
     pca_detrending: bool = True,
     anomaly_report: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Shared Stage 4 -> Stage 5 preparation: archive priors, lightcurves,
     trace diagnostics, tilt events, regressor matrix, white-band LD.
 
-    Priors come from the NASA Exoplanet Archive at fit time (so they
-    cannot go stale); when the query fails (offline compute node) the
-    manifest-cached ``fallback_priors`` written by discover.py are used
-    instead, and ``priors_source`` records which one actually ran.
+    Priors come from the NASA Exoplanet Archive at fit time; when the
+    query fails (offline compute node) the manifest-cached
+    ``fallback_priors`` written by discover.py are used instead, and
+    ``priors_source`` records which one actually ran.
+
+    ``priors_override`` wins over BOTH. The archive is current, not
+    correct: an ephemeris whose reference epoch is years old drifts by
+    hours over hundreds of epochs, and for some targets the archive
+    prediction misses a transit that is plainly present in the data
+    (TOI-125 b visit o101, 2026-08-26: archive predicts mid-transit
+    24.7 h after a window whose white lightcurve shows a full 870 ppm
+    transit at its centre). The transit-in-window guard then correctly
+    refuses to fit. The supported fix is to supply the measured value
+    here — NOT to relax the guard, which is what stands between a stale
+    ephemeris and a "spectrum" that is only the Rp/Rs prior.
+
+    Keys map onto the ``fetch_transit_priors`` output (``t0``,
+    ``period``, ``duration_hr``, ``a_rs``, ``rp_rs``, ``b``, ``st_teff``
+    ...). Every overridden key is recorded in ``priors_override_used``
+    and stamped into ``priors_source``, so a target fitted on a
+    non-archive ephemeris can never be mistaken for a default one.
 
     The COMPASS-style relative-pixel-flux PCA regressors (Ahrer et al.
     2025) are part of the frozen v1.2 fit and on by default; a fit
@@ -1374,6 +1392,14 @@ def prepare_visit_fit_inputs(
         priors = dict(fallback_priors)
         priors.setdefault("planet_name", planet_name)
         priors_source = "manifest-cache"
+
+    # Applied last, so it beats the archive as well as the cache.
+    override_used = sorted(k for k, v in (priors_override or {}).items()
+                           if v is not None)
+    if override_used:
+        priors = dict(priors)
+        priors.update({k: priors_override[k] for k in override_used})
+        priors_source = f"{priors_source}+override({','.join(override_used)})"
     spectra = load_stage3_spectra(spectra_path)
     lc = build_lightcurves(
         spectra,
@@ -1452,7 +1478,8 @@ def prepare_visit_fit_inputs(
         n_spot_masked = int((~spot_keep).sum())
         keep_mask = keep_mask & spot_keep
 
-    return {"priors": priors, "priors_source": priors_source, "lc": lc,
+    return {"priors": priors, "priors_source": priors_source,
+            "priors_override_used": override_used, "lc": lc,
             "regressors": regressors, "regressor_names": regressor_names,
             "tilt_events": tilt_events, "tilt_report": tilt_report,
             "tilt_keep_mask": tilt_keep,

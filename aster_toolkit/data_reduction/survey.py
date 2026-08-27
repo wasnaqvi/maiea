@@ -63,7 +63,12 @@ from .exotedrf import (
     inspect_uncal_directory,
     run_reduction,
 )
-from .lightcurves import DEFAULT_RESOLUTION
+from .lightcurves import (
+    DEFAULT_RESOLUTION,
+    ramp_regressors,
+    step_regressors,
+    tilt_transition_keep_mask,
+)
 from .juliet import (
     PATCHWORK_FIT_VERSION,
     figure_title,
@@ -84,6 +89,8 @@ from .contamination import (
     plot_anomaly_diagnostic,
     remap_anomaly_report,
     retrieve_contamination,
+    spot_crossing_regressors,
+    step_events_for_regressors,
     summarize_anomalies,
     write_contamination_report,
 )
@@ -326,6 +333,11 @@ def run_patchwork_target(
                     products[0], planet,
                     instrument=det, reduction_dir=str(det_dir),
                     fallback_priors=cached_priors,
+                    # Manifest-level ephemeris correction. Only for a
+                    # target whose archive ephemeris demonstrably misses
+                    # a transit that IS in the data; every use is stamped
+                    # into priors_source. See prepare_visit_fit_inputs.
+                    priors_override=manifest.get("priors_override"),
                 )
                 preps[det] = prep
                 pass1[det] = fit_white_lightcurve(
@@ -361,7 +373,8 @@ def run_patchwork_target(
             for det, prep in preps.items():
                 npz = np.load(Path(pass1[det]["output_dir"])
                               / "white_lightcurve_residuals.npz")
-                series[det] = {"time": npz["time"], "residual": npz["residual"]}
+                series[det] = {"time": npz["time"], "residual": npz["residual"],
+                               "oot_mask": npz["oot_mask"]}
                 reports[det] = detect_lightcurve_anomalies(
                     npz["time"], npz["residual"], oot_mask=npz["oot_mask"],
                     detector=det,
@@ -376,10 +389,13 @@ def run_patchwork_target(
             # The spot mask is combined with the tilt transition mask, so
             # pass 2 sees both corrections at once and the spectroscopic
             # channels can be checked against a single total.
-            masks = {det: (anomaly_keep_mask(preps[det]["lc"]["time"].size,
-                                             merged, detector=det)
-                           & preps[det]["tilt_keep_mask"])
-                     for det in preps}
+            # v1.4: confirmed crossings are MODELLED with a Gaussian
+            # (Radica et al. 2026) rather than masked, so no integrations
+            # are dropped for them and the amplitude is free per channel.
+            # anomaly_keep_mask is called with an empty kinds tuple so it
+            # masks nothing while remaining the single place that decides
+            # what a mask would have covered.
+            masks = {det: preps[det]["tilt_keep_mask"] for det in preps}
             scan_payload = {
                 "contam_version": PATCHWORK_CONTAM_VERSION,
                 "planet_name": planet,
@@ -424,6 +440,47 @@ def run_patchwork_target(
             for det, prep in preps.items():
                 fit_dir = root / "fits" / vname / det.lower()
                 keep = masks[det]
+                # A step confirmed by the Stage 5.5 scan but missed by
+                # the Stage 4 trace search would otherwise be corrected
+                # by NOBODY: the scan declines to mask steps because a
+                # Heaviside is the right correction, and the Heaviside
+                # regressors were already built. Add them here, so a
+                # step found by EITHER stage reaches the fit.
+                # Pass the residuals so each break time and transition
+                # width is FITTED, not taken from the flagged span's
+                # centre (see step_events_for_regressors).
+                scan_steps = step_events_for_regressors(
+                    merged, det, residual=series.get(det, {}).get("residual"))
+                regressors = prep["regressors"]
+                regressor_names = list(prep["regressor_names"])
+                spot_cols, spot_meta = spot_crossing_regressors(
+                    prep["lc"]["time"], merged, det)
+                if spot_cols.shape[1]:
+                    regressors = np.column_stack([regressors, spot_cols])
+                    regressor_names += [f"spot_gauss_{j}"
+                                        for j in range(spot_cols.shape[1])]
+                    log(f"[{slug}] {vname} {det}: {spot_cols.shape[1]} occulted "
+                        "crossing(s) MODELLED as Gaussian(s) (not masked): "
+                        + "; ".join(f"{m['kind']} {m['detected_amplitude_ppm']:+.0f} ppm "
+                                    f"FWHM {m['fwhm_min']:.0f} min"
+                                    for m in spot_meta))
+                if scan_steps:
+                    n_int = prep["lc"]["time"].size
+                    extra = ramp_regressors(n_int, scan_steps)
+                    regressors = np.column_stack([regressors, extra])
+                    regressor_names += [f"scan_step_{j}"
+                                        for j in range(extra.shape[1])]
+                    # Drop the blended integrations at each transition,
+                    # same rule as a Stage 4 tilt.
+                    keep = keep & tilt_transition_keep_mask(n_int, scan_steps)
+                    log(f"[{slug}] {vname} {det}: {len(scan_steps)} step(s) "
+                        "from the Stage 5.5 scan added as Heaviside "
+                        "regressor(s): "
+                        + "; ".join(f"index {e['index']} "
+                                    f"({e['amplitude_ppm']:+.0f} ppm, "
+                                    f"{e['peak_sigma']:.1f} sigma, "
+                                    f"width {e.get('width_ints', 0):.0f} ints)"
+                                    for e in scan_steps))
                 n_masked = int((~keep).sum())
                 log(f"[{slug}] fitting {vname} {det} white light "
                     f"(pass 2, {n_masked} integration(s) masked)...")
@@ -431,8 +488,8 @@ def run_patchwork_target(
                     prep["lc"], prep["priors"], fit_dir,
                     instrument=det,
                     program=program, visit=vname,
-                    regressors=prep["regressors"],
-                    regressor_names=prep["regressor_names"],
+                    regressors=regressors,
+                    regressor_names=regressor_names,
                     ld=prep["ld"],
                     keep_mask=keep,
                     anomaly_scan=scan_payload,
@@ -445,7 +502,7 @@ def run_patchwork_target(
                     prep["lc"], white, fit_dir / "spectro",
                     instrument=det,
                     program=program, visit=vname,
-                    regressors=prep["regressors"],
+                    regressors=regressors,
                     stellar=stellar,
                     keep_mask=keep,
                 )
@@ -455,10 +512,13 @@ def run_patchwork_target(
                     "white_rms_ppm": white["residual_rms_ppm"],
                     "fit_version": white["fit_version"],
                     "tilt_events": len(prep["tilt_events"]),
+                    "scan_steps_corrected": scan_steps,
+                    "spot_crossings_modelled": spot_meta,
                     "tilt_handling": white.get("tilt_handling"),
                     "spot_handling": white.get("spot_handling"),
                     "ld_source": white["ld_source"],
                     "priors_source": prep["priors_source"],
+                    "priors_override_used": prep.get("priors_override_used"),
                     "rednoise": white.get("rednoise"),
                     "rednoise_pass1": pass1[det].get("rednoise"),
                     "depth_check": white.get("depth_check"),

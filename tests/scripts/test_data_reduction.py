@@ -27,6 +27,7 @@ from aster_toolkit.data_reduction.lightcurves import (  # noqa: E402
     TILT_TRANSITION_MASK,
     detect_tilt_events,
     find_tilt_events,
+    estimate_transit_midpoint,
     load_stage3_spectra,
     match_tilt_events,
     step_statistic,
@@ -36,6 +37,8 @@ from aster_toolkit.data_reduction.lightcurves import (  # noqa: E402
     pca_regressors,
     propagate_t0,
     rednoise_beta,
+    ramp_regressors,
+    refine_step_shape,
     step_regressors,
 )
 from aster_toolkit.data_reduction.juliet import (  # noqa: E402
@@ -57,6 +60,9 @@ from aster_toolkit.data_reduction.contamination import (  # noqa: E402
     detect_lightcurve_anomalies,
     match_detector_anomalies,
     planck,
+    retrieve_contamination,
+    spot_crossing_regressors,
+    step_events_for_regressors,
     remap_anomaly_report,
     running_mean,
 )
@@ -179,6 +185,35 @@ class TestBinning:
         err = np.full_like(flux, 0.01)
         b = bin_at_resolution(wave, flux, err, resolution=50)
         assert np.isfinite(b["flux"]).all()
+
+
+class TestEdgeBinRejection:
+    def test_a_half_empty_edge_bin_is_dropped(self):
+        # Regression: three of the four >4 sigma outliers in the
+        # 2026-08-27 combined spectra were first/last channels clipped
+        # by the wavelength cut (GJ 3090 b NRS2 4.038 um, -7.0 sigma).
+        rng = np.random.default_rng(0)
+        wave = np.linspace(3.0, 3.5, 400)
+        flux = np.ones((50, wave.size)) + rng.normal(0, 1e-3, (50, wave.size))
+        err = np.full_like(flux, 1e-3)
+        full = bin_at_resolution(wave, flux, err, resolution=100)
+        # Now clip the array so the first bin keeps only a couple of columns.
+        keep = wave > wave[0] + 0.98 * (wave[1] - wave[0]) * 3
+        clipped = bin_at_resolution(wave[keep], flux[:, keep], err[:, keep],
+                                    resolution=100)
+        assert clipped["wave"].size <= full["wave"].size
+        # Whatever survives must be a properly filled bin, so no channel
+        # centre may sit outside the data that fed it.
+        assert clipped["wave"].min() >= wave[keep].min()
+
+    def test_normal_bins_are_unaffected(self):
+        rng = np.random.default_rng(1)
+        wave = np.linspace(2.9, 3.7, 800)
+        flux = np.ones((40, wave.size)) + rng.normal(0, 1e-3, (40, wave.size))
+        err = np.full_like(flux, 1e-3)
+        out = bin_at_resolution(wave, flux, err, resolution=100)
+        assert out["wave"].size > 15
+        assert np.all(np.isfinite(out["flux"]))
 
 
 class TestBuildLightcurves:
@@ -670,6 +705,46 @@ class TestInspectUncal:
         assert report["detectors"]["NRS1"]["complete"]
         assert not report["detectors"]["NRS2"]["complete"]
         assert report["detectors"]["NRS2"]["missing_segments"] == [2]
+
+    def _write_uncal_with_data(self, path, det, segnum, segtot):
+        from astropy.io import fits
+
+        h = fits.PrimaryHDU()
+        h.header["DETECTOR"] = det
+        h.header["EXSEGNUM"] = segnum
+        h.header["EXSEGTOT"] = segtot
+        h.header["NINTS"] = 100
+        h.header["SUBARRAY"] = "SUB2048"
+        sci = fits.ImageHDU(np.zeros((4, 7, 8, 64), dtype=np.float32), name="SCI")
+        fits.HDUList([h, sci]).writeto(path)
+
+    def test_a_truncated_segment_is_not_complete(self, tmp_path):
+        # Regression (TOI-776 b o006 NRS2): a partially downloaded uncal
+        # keeps a valid header and only part of its data, so the segment
+        # -number test sees a full set and exoTEDRF then dies inside
+        # DQInitStep with an unrelated UnboundLocalError. It failed that
+        # way in two campaigns a month apart. Truncation must be caught
+        # here, where the message is actionable.
+        a = tmp_path / "a_nrs2_uncal.fits"
+        b = tmp_path / "b_nrs2_uncal.fits"
+        self._write_uncal_with_data(a, "NRS2", 1, 2)
+        self._write_uncal_with_data(b, "NRS2", 2, 2)
+        assert inspect_uncal_directory(tmp_path)["detectors"]["NRS2"]["complete"]
+
+        with open(b, "r+b") as fh:          # keep headers, drop most data
+            fh.truncate(os.path.getsize(b) // 3)
+        entry = inspect_uncal_directory(tmp_path)["detectors"]["NRS2"]
+        assert entry["complete"] is False
+        # The old segment test alone would have passed this file.
+        assert entry["missing_segments"] == []
+        assert [t["file"] for t in entry["truncated_files"]] == [b.name]
+
+    def test_headerless_files_are_not_called_truncated(self, tmp_path):
+        # A header-only uncal declares no data, so absence of a data
+        # block must never read as truncation.
+        self._write_uncal(tmp_path / "a_nrs1_uncal.fits", "NRS1", 1, 1)
+        entry = inspect_uncal_directory(tmp_path)["detectors"]["NRS1"]
+        assert entry["truncated_files"] == [] and entry["complete"]
 
 
 # -------------------- optimize --------------------
@@ -1244,6 +1319,290 @@ class TestStage65SpectrumUnits:
         assert np.allclose(s["depth_err_ppm"], 30.0, atol=0.01)
 
 
+class TestEstimateTransitMidpoint:
+    @staticmethod
+    def _visit(t0_frac=0.5, dur_hr=2.5, depth=900e-6, span_hr=7.7, n=1500, seed=0):
+        rng = np.random.default_rng(seed)
+        t = 2460583.2 + np.linspace(0, span_hr / 24, n)
+        centre = t[0] + t0_frac * (t[-1] - t[0])
+        flux = np.ones(n) + rng.normal(0, 120e-6, n)
+        flux[np.abs(t - centre) < 0.5 * dur_hr / 24] -= depth
+        return t, flux, centre
+
+    def test_recovers_an_injected_midpoint(self):
+        t, f, centre = self._visit()
+        r = estimate_transit_midpoint(t, f)
+        assert r["found"]
+        # within a couple of minutes of truth
+        assert abs(r["t0"] - centre) * 24 * 60 < 3
+        assert 700 < r["depth_ppm"] < 1100
+        assert 2.2 < r["duration_hr"] < 2.8
+        assert r["partial"] is False
+
+    def test_flags_a_partial_transit(self):
+        # Ingress only: the transit starts late and runs off the end,
+        # which is TOI-125 c o201. Depth is then degenerate with the
+        # baseline, so the caller must not build an override from it.
+        t, f, _ = self._visit(t0_frac=1.0, dur_hr=2.5)
+        r = estimate_transit_midpoint(t, f)
+        assert r["found"] and r["partial"] is True
+
+    def test_no_dip_is_reported_not_invented(self):
+        rng = np.random.default_rng(3)
+        t = 2460583.2 + np.linspace(0, 7.7 / 24, 1500)
+        r = estimate_transit_midpoint(t, np.ones(1500) + rng.normal(0, 120e-6, 1500))
+        # Pure noise: either no detection, or a spurious run that is
+        # tiny and shallow — never a confident deep event.
+        assert (not r["found"]) or r["depth_ppm"] < 400
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            estimate_transit_midpoint(np.arange(10.0), np.arange(9.0))
+
+
+class TestPriorsOverride:
+    def test_override_beats_archive_and_is_recorded(self, monkeypatch):
+        # The archive is current, not correct. An override must win over
+        # it and must be visible in priors_source, so a target fitted on
+        # a hand-supplied ephemeris can never look like a default one.
+        import aster_toolkit.data_reduction.juliet as J
+
+        captured = {}
+        monkeypatch.setattr(J, "fetch_transit_priors",
+                            lambda name: {"t0": 2458355.35529, "period": 4.65382,
+                                          "duration_hr": 2.96, "planet_name": name})
+
+        def fake_build(spectra, **kw):
+            captured.update(kw)
+            raise RuntimeError("stop after priors")
+
+        monkeypatch.setattr(J, "build_lightcurves", fake_build)
+        monkeypatch.setattr(J, "load_stage3_spectra", lambda p: {})
+        with pytest.raises(RuntimeError, match="stop after priors"):
+            J.prepare_visit_fit_inputs(
+                "x.fits", "TOI-125 b", instrument="NRS1",
+                priors_override={"t0": 2460583.50540, "period": None},
+            )
+        assert captured["t0_ref"] == 2460583.50540
+        assert captured["period"] == 4.65382   # None override is ignored
+
+
+class TestOotAnchoredDetrend:
+    """The old whole-series trend subtracted part of any broad in-transit
+    feature from itself. Measured on the 2026-08-27 products, recovery of
+    the in-transit peak roughly doubled once the trend was built from
+    out-of-transit points only (TOI-1231 b NRS1 4.1 -> 9.4 sigma)."""
+
+    @staticmethod
+    def _broad_crossing(width=260, amp=300e-6, n=2000, seed=11):
+        # A crossing WIDER than the old 6x-window detrend (90 ints).
+        rng = np.random.default_rng(seed)
+        t = 2460000.0 + np.arange(n) * 20 / 86400.0
+        oot = np.ones(n, bool); oot[700:1300] = False
+        r = rng.normal(0, 80e-6, n)
+        centre = 1000
+        r += amp * np.exp(-0.5 * ((np.arange(n) - centre) / (width / 2.355)) ** 2)
+        return t, r, oot
+
+    def test_a_broad_crossing_survives_the_detrend(self):
+        t, r, oot = self._broad_crossing()
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert rep["anomalies"], "broad in-transit crossing not detected"
+        top = rep["anomalies"][0]
+        assert top["in_transit_frac"] > 0.9
+        # Recovered peak must be a decent fraction of the injected 300 ppm,
+        # not the ~half the whole-series trend used to leave.
+        assert abs(top["peak_amplitude_ppm"]) > 180
+
+    def test_slow_drift_is_still_removed(self):
+        t, r, oot = self._broad_crossing(amp=0.0)
+        r = r + 400e-6 * np.linspace(-1, 1, r.size)     # linear drift
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert not rep["anomalies"], "drift alone must not raise an anomaly"
+
+    def test_falls_back_when_out_of_transit_is_too_sparse(self):
+        # Almost no baseline: interpolating would invent a trend, so the
+        # whole-series running mean is used instead.
+        t, r, _ = self._broad_crossing()
+        oot = np.zeros(t.size, bool); oot[:40] = True
+        rep = detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")
+        assert isinstance(rep["anomalies"], list)      # no crash, no NaNs
+
+
+class TestSpotCrossingRegressors:
+    """Radica et al. 2026: model the crossing as a Gaussian with position
+    and width frozen from the white fit and a free per-channel amplitude,
+    rather than masking the integrations away."""
+
+    @staticmethod
+    def _confirmed_crossing():
+        t, r1, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        _, r2, _ = synthetic_residuals(bump_amp=400e-6, bump_i0=500, seed=2)
+        merged = match_detector_anomalies({
+            "NRS1": detect_lightcurve_anomalies(t, r1, oot_mask=oot, detector="NRS1"),
+            "NRS2": detect_lightcurve_anomalies(t, r2, oot_mask=oot, detector="NRS2")})
+        return t, merged
+
+    def test_builds_one_gaussian_per_confirmed_crossing(self):
+        t, merged = self._confirmed_crossing()
+        cols, meta = spot_crossing_regressors(t, merged, "NRS1")
+        n_cross = sum(1 for m in merged
+                      if m["confirmed"] and m["kind"].endswith("crossing"))
+        assert cols.shape == (t.size, n_cross) and len(meta) == n_cross
+        if n_cross:
+            col = cols[:, 0]
+            assert 0.99 < col.max() <= 1.0      # normalized shape
+            assert col.min() >= 0.0
+            peak = int(np.argmax(col))
+            assert abs(peak - 520) < 60          # centred on the injection
+
+    def test_both_detectors_get_the_same_shape(self):
+        # Position and width are shared; only the amplitude may differ,
+        # and that is the fitted coefficient, not the column.
+        t, merged = self._confirmed_crossing()
+        a, _ = spot_crossing_regressors(t, merged, "NRS1")
+        b, _ = spot_crossing_regressors(t, merged, "NRS2")
+        assert a.shape == b.shape
+        if a.shape[1]:
+            assert np.allclose(a, b)
+
+    def test_steps_are_not_modelled_as_gaussians(self):
+        t, r, oot = synthetic_residuals(step_amp=800e-6, step_i=500)
+        merged = match_detector_anomalies({
+            "NRS1": detect_lightcurve_anomalies(t, r, oot_mask=oot, detector="NRS1")})
+        cols, meta = spot_crossing_regressors(t, merged, "NRS1")
+        assert cols.shape[1] == 0 and meta == []
+
+    def test_nothing_to_model_gives_an_empty_matrix(self):
+        t = 2460000.0 + np.arange(500) * 20 / 86400.0
+        cols, meta = spot_crossing_regressors(t, [], "NRS1")
+        assert cols.shape == (500, 0) and meta == []
+
+
+class TestRampStepFitting:
+    """TOI-270 c o016 (2026-08-27). A hard Heaviside at the flagged
+    span's centre recovered +2275 ppm where the true post-event level
+    needs +2893: the correction stopped 22% short of the data. The break
+    must be FITTED (the span centre sat 23-240 integrations off) and the
+    transition given its measured width."""
+
+    @staticmethod
+    def _stepped(n=1500, break_at=900, width=8.0, amp=2500e-6, seed=5):
+        from math import erf
+        rng = np.random.default_rng(seed)
+        x = np.arange(n, dtype=float)
+        shape = 0.5 * (1 + np.vectorize(erf)((x - break_at) / (np.sqrt(2) * width)))
+        return rng.normal(0, 120e-6, n) + amp * shape
+
+    def test_ramp_recovers_break_width_and_amplitude(self):
+        r = self._stepped()
+        fit = refine_step_shape(r, 700, bounds=(700, 1100))
+        assert abs(fit["index"] - 900) <= 8
+        assert 4.0 <= fit["width_ints"] <= 14.0
+        assert abs(fit["amplitude_ppm"] - 2500) < 250
+
+    def test_the_model_reaches_the_post_event_level(self):
+        # The specific failure: a step that does not rise as far as the
+        # data after the event.
+        r = self._stepped()
+        fit = refine_step_shape(r, 700, bounds=(700, 1100))
+        cols = ramp_regressors(r.size, [fit])
+        design = np.column_stack([np.ones(r.size), cols])
+        coef, *_ = np.linalg.lstsq(design, r, rcond=None)
+        model = design @ coef
+        tail = slice(r.size - 200, None)
+        assert abs(np.mean(model[tail]) - np.mean(r[tail])) * 1e6 < 40
+
+    def test_a_hard_step_is_still_available(self):
+        # width 0 must give the exact Heaviside, so a genuinely
+        # instantaneous event is unchanged.
+        cols = ramp_regressors(100, [{"index": 50, "width_ints": 0.0}])
+        assert cols[49, 0] == 0.0 and cols[50, 0] == 1.0
+
+    def test_searching_the_span_beats_a_window_round_its_centre(self):
+        # The span brackets the transition; its centre need not be near it.
+        r = self._stepped(break_at=1100)
+        near = refine_step_shape(r, 700, search=45)
+        span = refine_step_shape(r, 700, bounds=(700, 1300))
+        assert span["rms"] < near["rms"]
+        assert abs(span["index"] - 1100) <= 10
+
+    def test_no_events_gives_an_empty_matrix(self):
+        assert ramp_regressors(300, []).shape == (300, 0)
+
+
+class TestScanStepsBecomeRegressors:
+    """Regression (TOI-270 c o016, 2026-08-27). The scan confirmed three
+    steps in both detectors -- 27.3, 15.2 and 7.9 sigma, one of them
+    2803 ppm -- while the Stage 4 trace search found none, because only
+    trace_fwhm on NRS1 cleared 6 sigma and TILT_MIN_SOURCES is 2. Stage
+    5.5 then declined to mask them (correct: a step wants a Heaviside,
+    not a mask) and handed them to a stage that had already run. Nothing
+    corrected a 2803 ppm discontinuity; the fit returned beta ~6.1 and a
+    depth 96% high. A step confirmed by EITHER stage must reach the fit."""
+
+    @staticmethod
+    def _stepped_pair(step_i=900, amp=2800e-6, n=2000):
+        t = 2460000.0 + np.arange(n) * 20 / 86400.0
+        oot = np.ones(n, bool); oot[800:1200] = False
+        reports = {}
+        for det, seed in (("NRS1", 4), ("NRS2", 5)):
+            rng = np.random.default_rng(seed)
+            r = rng.normal(0, 100e-6, n) + amp * (np.arange(n) >= step_i)
+            reports[det] = detect_lightcurve_anomalies(t, r, oot_mask=oot,
+                                                       detector=det)
+        return match_detector_anomalies(reports)
+
+    def test_a_confirmed_step_becomes_a_regressor(self):
+        merged = self._stepped_pair()
+        steps = [m for m in merged if m["kind"] == "step" and m["confirmed"]]
+        assert steps, "injected step not confirmed across detectors"
+        evs = step_events_for_regressors(merged, "NRS1")
+        assert len(evs) == len(steps)
+        # Break time recovered near the true transition.
+        assert abs(evs[0]["index"] - 900) < 100
+        assert evs[0]["source"] == "stage5.5-scan"
+
+    def test_the_regressor_is_a_heaviside_at_the_break(self):
+        evs = step_events_for_regressors(self._stepped_pair(), "NRS1")
+        cols = step_regressors(2000, evs)
+        assert cols.shape == (2000, len(evs))
+        i = evs[0]["index"]
+        assert cols[i - 1, 0] == 0.0 and cols[i, 0] == 1.0
+
+    def test_a_step_is_still_never_masked(self):
+        # The correction is the regressor; the integrations stay in.
+        merged = self._stepped_pair()
+        keep = anomaly_keep_mask(2000, merged, detector="NRS1")
+        assert keep.all()
+
+    def test_a_step_straddling_a_contact_is_refused(self):
+        # TOI-270 c o016: a confirmed step spanning egress
+        # (in_transit_frac 0.54). A Heaviside there is degenerate with
+        # the transit shape and eats the contact, so it must be refused
+        # -- while steps wholly in or wholly out of transit are kept.
+        base = self._stepped_pair()
+        step = next(m for m in base if m["kind"] == "step" and m["confirmed"])
+        # 0.99 must be KEPT: that is TOI-270 c's largest step (68.8 sigma),
+        # essentially wholly in transit, not straddling a contact.
+        for frac, expected in ((0.0, 1), (1.0, 1), (0.99, 1), (0.03, 1),
+                               (0.54, 0), (0.2, 0)):
+            step["in_transit_frac"] = frac
+            got = len(step_events_for_regressors([step], "NRS1"))
+            assert got == expected, f"in_transit_frac={frac} gave {got}"
+
+    def test_spot_crossings_are_not_turned_into_step_regressors(self):
+        # Only persistent events. A transient bump must still be masked,
+        # not fitted with a Heaviside.
+        t, r1, oot = synthetic_residuals(bump_amp=600e-6, bump_i0=500)
+        _, r2, _ = synthetic_residuals(bump_amp=400e-6, bump_i0=500, seed=2)
+        merged = match_detector_anomalies({
+            "NRS1": detect_lightcurve_anomalies(t, r1, oot_mask=oot, detector="NRS1"),
+            "NRS2": detect_lightcurve_anomalies(t, r2, oot_mask=oot, detector="NRS2")})
+        assert any(m["kind"] == "spot_crossing" for m in merged)
+        assert step_events_for_regressors(merged, "NRS1") == []
+
+
 class TestMatchTiltEventsTimeless:
     def test_two_timeless_events_do_not_crash_the_sort(self):
         # Regression: sorting keyed on (time is None, time) compared
@@ -1305,6 +1664,51 @@ class TestContaminationFactor:
         w = np.linspace(2.9, 5.2, 20)
         eps = contamination_factor(w, t_phot=5000, t_het=1000, f_het=0.99)
         assert np.all(np.isfinite(eps))
+
+
+class TestStage65Robustness:
+    """The 2026-08-27 run produced two "detections" that could not be
+    real: f_het railed against its prior wall implying ~48% spot
+    coverage, and TOI-836 b vs TOI-836.01 -- two planets of the SAME
+    star -- disagreeing (delta_BIC -1.3 vs +31.0)."""
+
+    @staticmethod
+    def _spectrum(slope_ppm_per_um=0.0, offset_ppm=0.0, n=50, seed=0):
+        rng = np.random.default_rng(seed)
+        w = np.linspace(2.9, 5.2, n)
+        d = 1800.0 + slope_ppm_per_um * (w - w.mean()) + rng.normal(0, 25, n)
+        d = d + offset_ppm * (w > 3.75)          # NRS1/NRS2 step
+        return w, d, np.full(n, 25.0), (w > 3.75)
+
+    def test_a_pure_slope_is_not_contamination(self):
+        # epsilon(lambda) can mimic any slope. Only CURVATURE is evidence,
+        # so a straight-line spectrum must not be a detection however
+        # well it beats a flat line.
+        w, d, e, _ = self._spectrum(slope_ppm_per_um=60.0)
+        r = retrieve_contamination(w, d, e, t_phot=3500.0, n_steps=2500)
+        assert r["delta_bic_linear"] < 10.0
+        assert not r["contamination_detected"]
+
+    def test_a_detector_offset_is_absorbed_not_reported_as_spots(self):
+        w, d, e, is2 = self._spectrum(offset_ppm=80.0)
+        r = retrieve_contamination(w, d, e, t_phot=3500.0,
+                                   offset_mask=is2, n_steps=2500)
+        assert r["offset_fitted"]
+        assert abs(r["offset_ppm"] - 80.0) < 60.0
+        assert not r["contamination_detected"]
+
+    def test_a_railed_posterior_is_never_a_detection(self):
+        w, d, e, _ = self._spectrum(slope_ppm_per_um=400.0, seed=3)
+        r = retrieve_contamination(w, d, e, t_phot=3500.0,
+                                   f_het_max=0.05, n_steps=2500)
+        assert r["f_het_railed"] is True
+        assert not r["contamination_detected"], "railed fit reported as detection"
+
+    def test_flat_spectrum_stays_a_clean_non_detection(self):
+        w, d, e, _ = self._spectrum()
+        r = retrieve_contamination(w, d, e, t_phot=3500.0, n_steps=2500)
+        assert not r["contamination_detected"]
+        assert 0.0 < r["f_het_95pct_upper"] <= 0.5
 
 
 class TestContaminationBackends:

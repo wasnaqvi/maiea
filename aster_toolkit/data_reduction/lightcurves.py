@@ -53,7 +53,7 @@ except ModuleNotFoundError:
 # PCA) rather than the out-of-transit flux alone, so an event during
 # transit is detectable. Different events found => different step
 # regressors => different fits, so this is a survey-definition change.
-PATCHWORK_STAGE4_VERSION = "1.2"
+PATCHWORK_STAGE4_VERSION = "1.3"
 
 N_REFPIX_COLS = 5             # detector reference columns trimmed each edge
 # Survey-frozen binning (decision Wasi 2026-07-30): one resolution for
@@ -65,6 +65,11 @@ N_REFPIX_COLS = 5             # detector reference columns trimmed each edge
 # for overlays, never mix binnings within Patchwork.
 DEFAULT_RESOLUTION = 100      # constant-R spectroscopic binning
 MJD_TO_BJD_OFFSET = 2400000.5
+# A constant-R bin clipped by the detector wavelength cut contains only
+# part of the columns its neighbours do. Such a bin is dropped rather
+# than published: see bin_at_resolution.
+MIN_BIN_COLUMNS = 3
+MIN_BIN_FILL_FRAC = 0.5
 
 # Usable wavelength ranges (um) for G395H per detector. Outside these the
 # throughput is ~0 and channels are pure noise.
@@ -170,10 +175,25 @@ def bin_at_resolution(wave: np.ndarray, flux: np.ndarray, flux_err: np.ndarray,
         e[-1] = hi
         edges = np.asarray(e)
 
+    # How many detector columns each bin SHOULD contain. An edge bin
+    # clipped by the wavelength cut holds only a fraction of that, so its
+    # depth is both noisier than its error bar implies and sitting where
+    # throughput is falling -- the two together make it the single most
+    # likely channel in a spectrum to be wrong. On the 2026-08-27 survey
+    # products three of the four >4 sigma outliers were exactly this:
+    # GJ 3090 b NRS2 4.038 um at -7.0 sigma (1075 vs 1426 ppm), L 98-59 d
+    # NRS1 2.913 um, GJ 357 b NRS2 5.077 um -- every one a first or last
+    # channel. Requiring a bin to be reasonably filled drops them before
+    # they reach a retrieval.
+    counts = np.array([int((good_col & (wave >= edges[i]) & (wave < edges[i + 1])).sum())
+                       for i in range(len(edges) - 1)])
+    typical = float(np.median(counts[counts > 0])) if np.any(counts > 0) else 0.0
+    min_cols = max(MIN_BIN_COLUMNS, MIN_BIN_FILL_FRAC * typical)
+
     centers, half_widths, fbins, ebins = [], [], [], []
     for i in range(len(edges) - 1):
         m = good_col & (wave >= edges[i]) & (wave < edges[i + 1])
-        if not m.any():
+        if not m.any() or int(m.sum()) < min_cols:
             continue
         f, e = flux[:, m], flux_err[:, m]
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -306,6 +326,71 @@ def build_lightcurves(
 
 
 # -------------------- trace diagnostics (decorrelation regressors) ------
+
+
+def estimate_transit_midpoint(time: np.ndarray, flux: np.ndarray, *,
+                              smooth: int = 15) -> dict[str, Any]:
+    """Measure mid-transit straight from a white lightcurve.
+
+    For a target whose archive ephemeris misses a transit that is
+    plainly in the data, this is how the corrected ``t0`` for a
+    ``priors_override`` is obtained — measured, not guessed. It is a
+    diagnostic, NOT a fit: the number it returns seeds the juliet prior,
+    which then fits t0 properly.
+
+    Method: normalize by the median, smooth, take the out-of-transit
+    level from the 90th percentile, and find the longest run below the
+    half-depth level. The midpoint of that run is the mid-transit time —
+    the half-depth crossing is used rather than the minimum because it
+    is insensitive to limb darkening curving the floor of the transit.
+
+    ``partial`` is the flag that matters: a run touching either end of
+    the series means ingress or egress fell outside the exposure, so the
+    depth is degenerate with the baseline and the midpoint is a lower
+    bound on the truth, not a measurement. Do not build an override from
+    a partial detection.
+    """
+    t = np.asarray(time, dtype=float)
+    f = np.asarray(flux, dtype=float)
+    if t.size != f.size:
+        raise ValueError(f"time ({t.size}) and flux ({f.size}) differ in length")
+    f = f / np.nanmedian(f)
+
+    w = max(1, int(smooth))
+    if w % 2 == 0:
+        w += 1
+    good = np.isfinite(f)
+    kern = np.ones(w)
+    num = np.convolve(np.where(good, f, 0.0), kern, mode="same")
+    den = np.convolve(good.astype(float), kern, mode="same")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s = np.where(den >= w / 2.0, num / den, np.nan)
+
+    base = float(np.nanpercentile(s, 90))
+    depth = base - float(np.nanmin(s))
+    if not np.isfinite(depth) or depth <= 0:
+        return {"found": False, "note": "No dip in this lightcurve."}
+
+    below = np.isfinite(s) & (s < base - 0.5 * depth)
+    idx = np.flatnonzero(below)
+    if idx.size == 0:
+        return {"found": False, "note": "No samples below the half-depth level."}
+    runs = np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
+    run = max(runs, key=len)
+    i0, i1 = int(run[0]), int(run[-1])
+
+    return {
+        "found": True,
+        "t0": 0.5 * (t[i0] + t[i1]),
+        "depth_ppm": depth * 1e6,
+        "duration_hr": float((t[i1] - t[i0]) * 24),
+        "index_start": i0,
+        "index_end": i1,
+        "n_in_transit": int(i1 - i0 + 1),
+        # Ingress or egress outside the exposure: the baseline on that
+        # side is missing, so depth and midpoint are both unreliable.
+        "partial": bool(i0 == 0 or i1 == t.size - 1),
+    }
 
 
 def find_stage2_calints(reduction_dir: str | os.PathLike[str],
@@ -812,6 +897,105 @@ def step_regressors(n: int, events: list[dict[str, float]]) -> np.ndarray:
         c[int(e["index"]):] = 1.0
         cols.append(c)
     return np.column_stack(cols)
+
+
+def ramp_regressors(n: int, events: list[dict[str, Any]]) -> np.ndarray:
+    """(n, n_events) matrix of SMOOTHED step functions, one per event.
+
+    A hard Heaviside assumes the flux changes between two consecutive
+    integrations. Real steps settle over a short but finite time, and
+    forcing a vertical edge through a finite transition does two things
+    wrong: the blended integrations pull the fitted amplitude towards
+    the middle, so the step comes out too shallow, and the residual
+    keeps a spike at the transition.
+
+    Measured on TOI-270 c o016 (2026-08-27), where both detectors chose
+    the same optimum independently: an erf ramp of width 8 integrations
+    (1.4 min) at the fitted break beat a hard step at the flagged-span
+    centre by 337 -> 230 ppm rms, and recovered a late-step amplitude of
+    +2784 ppm against the Heaviside's +2275 -- 22% deeper, which is the
+    difference between a model that reaches the post-event flux level
+    and one that stops short of it.
+
+    ``width_ints`` of 0 (or absent) gives the hard Heaviside, so an
+    genuinely instantaneous event is unchanged.
+    """
+    if not events:
+        return np.empty((n, 0))
+    from math import erf as _erf
+
+    x = np.arange(int(n), dtype=float)
+    cols = []
+    for e in events:
+        b = float(e["index"])
+        w = float(e.get("width_ints") or 0.0)
+        if w <= 0:
+            cols.append((x >= b).astype(float))
+        else:
+            z = (x - b) / (np.sqrt(2.0) * w)
+            cols.append(0.5 * (1.0 + np.vectorize(_erf)(z)))
+    return np.column_stack(cols)
+
+
+def refine_step_shape(
+    residual: np.ndarray,
+    index_guess: int,
+    *,
+    search: int = 45,
+    bounds: tuple[int, int] | None = None,
+    widths: tuple[float, ...] = (0.0, 2.0, 4.0, 8.0, 14.0, 20.0),
+    others: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Fit a step's break time and transition width to the residuals.
+
+    The Stage 5.5 scan localizes an event to a flagged span, but the
+    span's centre is not the break: the span comes from a detrended
+    statistic whose two lobes need not be symmetric about the
+    transition. On TOI-270 c the centre sat 23 integrations late, which
+    alone cost 22% of the fitted amplitude.
+
+    Grid-searches break index and ramp width, fitting all amplitudes
+    (plus a constant) by least squares at each trial, and returns the
+    combination minimising the residual scatter. ``others`` are the
+    other events in the same series, held at their current shape so
+    each break is fitted in the presence of the rest.
+    """
+    r = np.asarray(residual, dtype=float)
+    n = r.size
+    if bounds is not None:
+        # Search the FLAGGED SPAN, which brackets the transition by
+        # construction. Searching a fixed window around the span's
+        # centre fails whenever the two detrended lobes are lopsided:
+        # on TOI-270 c the centre sat 240 integrations from the real
+        # break, far outside any sane +/- window, and the fit settled on
+        # a wrong break with a third of the true amplitude.
+        lo, hi = max(0, int(bounds[0])), min(n - 1, int(bounds[1]))
+    else:
+        lo = max(0, int(index_guess) - int(search))
+        hi = min(n - 1, int(index_guess) + int(search))
+    if hi <= lo:
+        lo, hi = max(0, int(index_guess) - 5), min(n - 1, int(index_guess) + 5)
+    fixed = [e for e in (others or [])]
+    best: dict[str, Any] | None = None
+    good = np.isfinite(r)
+    for b in range(lo, hi + 1, 2):
+        for w in widths:
+            trial = fixed + [{"index": b, "width_ints": w}]
+            design = np.column_stack([np.ones(n), ramp_regressors(n, trial)])
+            try:
+                coef, *_ = np.linalg.lstsq(design[good], r[good], rcond=None)
+            except np.linalg.LinAlgError:
+                continue
+            rms = float(np.nanstd(r - design @ coef))
+            if best is None or rms < best["rms"]:
+                best = {"index": int(b), "width_ints": float(w),
+                        "amplitude": float(coef[-1]), "rms": rms}
+    if best is None:
+        return {"index": int(index_guess), "width_ints": 0.0,
+                "amplitude": float("nan"), "rms": float("nan")}
+    best["amplitude_ppm"] = best["amplitude"] * 1e6
+    best["rms_ppm"] = best["rms"] * 1e6
+    return best
 
 
 def build_regressor_matrix(
