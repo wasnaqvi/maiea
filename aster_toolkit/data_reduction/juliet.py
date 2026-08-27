@@ -764,7 +764,14 @@ def fit_white_lightcurve(
     # finds real G395H errors run ~5-12% above the photon prediction;
     # beta_median >> 1 here means this target's depth errors need
     # inflating before population-level use.
-    summary["rednoise"] = rednoise_beta(residual, times)
+    # times[keep], NOT times: the residual is computed on the kept
+    # subset, so passing the full time axis mismatches the two arrays.
+    # Latent until 2026-08-27 -- the tilt search had been finding zero
+    # events on every target, so keep was all-True and the sizes agreed
+    # by accident. The moment a step got masked (7 integrations per
+    # event) it raised IndexError mid-fit, after the sampling was
+    # already done.
+    summary["rednoise"] = rednoise_beta(residual, times[keep])
 
     # Sanity check against the best available reference depth. Prefers a
     # published same-band (G395H) value; falls back to the archive

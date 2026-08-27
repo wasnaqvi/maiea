@@ -634,14 +634,26 @@ def run_patchwork_target(
         else:
             from .juliet import read_spectrum_csv
 
-            waves, depths, errs = [], [], []
+            waves, depths, errs, is_nrs2 = [], [], [], []
             for c in csvs:
                 s = read_spectrum_csv(c)
                 waves.append(np.asarray(s["wave"], dtype=float))
                 # read_spectrum_csv already returns ppm (depth_ppm columns).
                 depths.append(np.asarray(s["depth_ppm"], dtype=float))
                 errs.append(np.asarray(s["depth_err_ppm"], dtype=float))
+                # Which half of the combined spectrum each channel came
+                # from, so Stage 6.5 can fit the inter-detector step as
+                # its own parameter. Without it epsilon(lambda) absorbs
+                # the step and reports it as stellar contamination: on
+                # 2026-08-27 that produced GJ 357 b at delta_BIC +74.7
+                # and TOI-836.01 at +31.0, while TOI-836 b -- the SAME
+                # star -- came out at -1.3. With the offset fitted and
+                # the null raised to a straight line, all three are
+                # non-detections and the two TOI-836 planets agree.
+                is_nrs2.append(np.full(len(s["wave"]),
+                                       "nrs2" in os.path.basename(c).lower()))
             wave = np.concatenate(waves)
+            offset_mask = np.concatenate(is_nrs2) if len(csvs) > 1 else None
             order = np.argsort(wave)
             try:
                 result = retrieve_contamination(
@@ -649,6 +661,8 @@ def run_patchwork_target(
                     np.concatenate(depths)[order],
                     np.concatenate(errs)[order],
                     t_phot=float(t_phot),
+                    offset_mask=(offset_mask[order]
+                                 if offset_mask is not None else None),
                 )
                 written = write_contamination_report(result, contam_dir)
                 p = result["posterior"]
@@ -659,6 +673,9 @@ def run_patchwork_target(
                     "f_het_95pct_upper": result["f_het_95pct_upper"],
                     "T_het": p["T_het"],
                     "delta_bic": result["delta_bic"],
+                    "delta_bic_linear": result["delta_bic_linear"],
+                    "railed": result["railed"],
+                    "offset_ppm": result["offset_ppm"],
                     "detected": result["contamination_detected"],
                     "corrected_csv": written["corrected_csv"],
                 }

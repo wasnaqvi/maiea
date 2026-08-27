@@ -531,9 +531,22 @@ def rednoise_beta(residuals: np.ndarray, time: np.ndarray,
     evaluated over bins spanning ``min_minutes`` to ``max_minutes``.
     """
     r = np.asarray(residuals, dtype=float)
+    t = np.asarray(time, dtype=float)
+    if r.size != t.size:
+        # Say what is wrong instead of raising IndexError deep in a
+        # boolean index. The caller has almost certainly passed the FULL
+        # time axis alongside residuals computed on a masked subset --
+        # exactly the TOI-1231 b / TOI-270 c failure of 2026-08-27,
+        # where 7 masked integrations killed the job after the sampling
+        # had already finished.
+        raise ValueError(
+            f"rednoise_beta: residuals ({r.size}) and time ({t.size}) differ "
+            f"in length by {abs(r.size - t.size)}. Pass the time axis subset "
+            "the same way as the residuals (e.g. times[keep])."
+        )
     good = np.isfinite(r)
     r = r[good]
-    t = np.asarray(time, dtype=float)[good]
+    t = t[good]
     if r.size < 50:
         return {"beta_median": float("nan"), "beta_max": float("nan"),
                 "rms_unbinned_ppm": float("nan")}

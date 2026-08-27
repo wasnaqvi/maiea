@@ -381,6 +381,26 @@ class TestRednoiseBeta:
         assert np.isnan(out["beta_median"])
 
 
+class TestRednoiseBetaLengths:
+    def test_mismatched_lengths_raise_a_useful_error(self):
+        # Regression: fit_white_lightcurve passed the FULL time axis with
+        # residuals computed on the kept subset. Latent while the tilt
+        # search found nothing (keep all-True); the first masked step
+        # killed TOI-1231 b and TOI-270 c after sampling had completed.
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="differ in length"):
+            rednoise_beta(rng.normal(0, 1e-4, 2719),
+                          2460000.0 + np.arange(2726) * 20 / 86400.0)
+
+    def test_matched_lengths_still_work(self):
+        rng = np.random.default_rng(1)
+        n = 2000
+        out = rednoise_beta(rng.normal(0, 1e-4, n),
+                            2460000.0 + np.arange(n) * 20 / 86400.0)
+        assert np.isfinite(out["beta_median"])
+        assert 0.5 < out["beta_median"] < 2.0
+
+
 class TestPcaRegressors:
     def _write_calints(self, path, nints=200, ny=8, nx=16, seed=7):
         from astropy.io import fits
