@@ -127,11 +127,17 @@ def amplitude_in_H(s: dict[str, np.ndarray], delta_ppm: float) -> dict:
     var_err = float(np.mean(e**2))
     excess = var_obs - var_err
     amp = np.sqrt(max(excess, 0.0)) / delta_ppm
-    # 2-sigma upper limit on a real amplitude, from the error on the
-    # variance of n points.
+    # 2-sigma upper limit on a real amplitude. The limit is the measured
+    # excess PLUS the precision with which that excess can be measured,
+    # never less than the precision alone. Without that floor a target
+    # whose quoted errors exceed its actual scatter drives the excess
+    # strongly negative, the limit collapses to zero, and the mu limit
+    # below divides by it -- which is how TOI-776 b and TOI-561 b came
+    # out at "mu > 4600000" instead of "not constrained". A spectrum
+    # cannot bound an amplitude more tightly than it can measure one.
     n = w.size
     sig_var = var_obs * np.sqrt(2.0 / max(n - 1, 1))
-    amp_hi = np.sqrt(max(excess + 2 * sig_var, 0.0)) / delta_ppm
+    amp_hi = np.sqrt(max(excess, 0.0) + 2 * sig_var) / delta_ppm
     return {"wave": w, "resid_H": resid / delta_ppm, "err_H": e / delta_ppm,
             "mean_ppm": float(mean), "amp_H": float(amp),
             "amp_H_2sig": float(amp_hi), "n": int(n),
@@ -254,6 +260,27 @@ def metallicity_from_mu(mu: float) -> float:
     return float(min(x / 5e-4, 1e5))
 
 
+def mu_limit(amp_H_2sig: float) -> float | None:
+    """Lower limit on mu from an amplitude limit, or None if unconstrained.
+
+    Amplitude scales as 1/mu, so mu > mu_H2 * A_ref / A_H. That inverts
+    into nonsense at both ends and both ends occur in real data:
+
+    * A_H at or above A_ref returns mu below 2.3 -- lighter than H2/He,
+      which is unphysical. It means the spectrum scatters MORE than a
+      clear solar atmosphere would, i.e. a detection or (far more often
+      here) excess noise. Either way it is not a composition limit.
+      TOI-1231 b lands here at A_H 5.50 with beta 3.42.
+    * A_H at zero returns infinity. Reported as no constraint rather
+      than as a spectacular one.
+    """
+    a = float(amp_H_2sig)
+    if not np.isfinite(a) or a <= 0:
+        return None
+    mu = MU_H2HE * A_REF_SCALE_HEIGHTS / a
+    return mu if mu > MU_H2HE else None
+
+
 def plot_trend(data, params, out_dir: Path) -> str:
     import matplotlib
     matplotlib.use("Agg")
@@ -265,7 +292,9 @@ def plot_trend(data, params, out_dir: Path) -> str:
     for slug, s in data.items():
         p = params[slug]
         m = amplitude_in_H(s, p["delta_ppm"])
-        mu_min = MU_H2HE * A_REF_SCALE_HEIGHTS / max(m["amp_H_2sig"], 1e-6)
+        mu_min = mu_limit(m["amp_H_2sig"])
+        if mu_min is None:          # scatter exceeds a clear solar atmosphere
+            continue                 # -> no composition constraint to plot
         rows.append((pretty(slug), p, m, mu_min))
     rows.sort(key=lambda r: r[1]["teq"])
 
@@ -345,10 +374,11 @@ def main() -> int:
           f"{'A_H':>6s} {'A_H<2s':>7s} {'mu >':>7s}")
     for slug in sorted(data, key=lambda s: params[s]["teq"]):
         p, m = params[slug], amplitude_in_H(data[slug], params[slug]["delta_ppm"])
-        mu = MU_H2HE * A_REF_SCALE_HEIGHTS / max(m["amp_H_2sig"], 1e-6)
+        mu = mu_limit(m["amp_H_2sig"])
+        mu_s = f"{mu:7.1f}" if mu is not None else "      -"
         print(f"{pretty(slug):13s} {p['teq']:5.0f} {p['g']:6.1f} "
               f"{p['H_km']:6.0f} {p['delta_ppm']:7.1f} {m['amp_H']:6.2f} "
-              f"{m['amp_H_2sig']:7.2f} {mu:7.1f}")
+              f"{m['amp_H_2sig']:7.2f} {mu_s}")
     print("\n" + plot_absolute(data, params, out))
     print(plot_panels(data, params, out))
     print(plot_trend(data, params, out))
