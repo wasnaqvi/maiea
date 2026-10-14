@@ -805,6 +805,7 @@ def get_observation_products(
     raw_only: bool = False,
     extensions: list[str] | tuple[str, ...] | str | None = FITS_EXTENSIONS,
     skip_proprietary: bool = True,
+    product_dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
     session: requests.Session | None = None,
     timeout: float = 60.0,
 ) -> list[dict[str, Any]]:
@@ -822,6 +823,7 @@ def get_observation_products(
         raw_only=raw_only,
         extensions=extensions,
         skip_proprietary=skip_proprietary,
+        product_dataproduct_types=product_dataproduct_types,
     )
 
 
@@ -833,9 +835,17 @@ def filter_products(
     raw_only: bool = False,
     extensions: list[str] | tuple[str, ...] | str | None = FITS_EXTENSIONS,
     skip_proprietary: bool = True,
+    product_dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
 ) -> list[dict[str, Any]]:
     """Filter MAST products by science type, JWST subgroup, raw status, file
     extension, and proprietary-access status.
+
+    ``product_dataproduct_types`` filters on each PRODUCT's own
+    ``dataproduct_type`` (e.g. ['timeseries']). A JWST time-series
+    observation's product list also carries its target-acquisition
+    exposures, typed 'image'; exoTEDRF's ``download_observations`` drops
+    them this way, and so must we, or a TA uncal lands in the same visit
+    directory as the science segments. Products without the field pass.
 
     ``skip_proprietary=True`` (default) drops products whose ``dataRights``
     is not ``PUBLIC`` — typically ``EXCLUSIVE_ACCESS`` files that would
@@ -845,6 +855,9 @@ def filter_products(
     type_values = {value.upper() for value in _as_list(product_types) or []}
     subgroup_values = {value.upper() for value in _as_list(product_subgroups) or []}
     extension_values = tuple(value.lower() for value in (_as_list(extensions) or []))
+    dptype_values = {
+        str(v).lower() for v in (_as_list(product_dataproduct_types) or []) if str(v).strip()
+    }
 
     if raw_only and not subgroup_values:
         subgroup_values = set(RAW_PRODUCT_SUBGROUPS)
@@ -869,6 +882,10 @@ def filter_products(
             continue
 
         if skip_proprietary and data_rights and data_rights != "PUBLIC":
+            continue
+
+        product_dptype = str(product.get("dataproduct_type") or "").lower()
+        if dptype_values and product_dptype and product_dptype not in dptype_values:
             continue
 
         selected.append(product)
@@ -1050,6 +1067,154 @@ def download_mast_product(
     raise RuntimeError(f"Download retry loop exited without result: {last_exc!r}")
 
 
+# ---- exoTEDRF-style selection: grating/filter tokens and visit numbers ----
+
+_VISIT_PREFIX_RE = re.compile(r"^jw\d{11}$")
+
+
+def _filter_tokens(value: Any) -> set[str]:
+    """'F290LP;G395H' -> {'F290LP', 'G395H'} (CAOM joins elements with ';')."""
+    return {t for t in re.split(r"[;,/\s]+", str(value or "").upper()) if t}
+
+
+def _filters_match(row_value: Any, requested: list[Any] | None) -> bool:
+    """True if ANY requested value has ALL its tokens in the row's filters.
+
+    ``['G395H']`` matches 'F290LP;G395H'; ``['F290LP;G395H']`` requires
+    both; ``['G395H', 'G395M']`` matches either grating. Applied
+    client-side on purpose: MAST discrete filters are exact-match on the
+    full joined string, so a server-side 'G395H' would silently drop
+    'F290LP;G395H' rows.
+    """
+    if not requested:
+        return True
+    have = _filter_tokens(row_value)
+    return any(
+        _filter_tokens(value) and _filter_tokens(value) <= have
+        for value in requested
+    )
+
+
+def _visit_prefix(product: dict[str, Any]) -> str | None:
+    """jwPPPPPOOOVVV visit prefix of a per-exposure product filename."""
+    head = str(product.get("productFilename") or "").split("_", 1)[0].lower()
+    return head if _VISIT_PREFIX_RE.match(head) else None
+
+
+def _normalize_visits(visits: Any) -> list[Any] | None:
+    """LLM input -> list of 1-based ints and/or 'jw...' visit prefixes."""
+    values = _as_list(visits)
+    if not values:
+        return None
+    out: list[Any] = []
+    for v in values:
+        text = str(v).strip().lower()
+        if not text:
+            continue
+        if text.startswith("jw"):
+            if not _VISIT_PREFIX_RE.match(text):
+                raise ValueError(
+                    f"Visit prefix {v!r} must look like 'jw01366004001' "
+                    "(jw + 5-digit program + 3-digit observation + 3-digit visit)."
+                )
+            out.append(text)
+        else:
+            try:
+                number = int(float(text))
+            except ValueError:
+                raise ValueError(
+                    f"visits entries must be 1-based numbers or 'jw...' prefixes, got {v!r}."
+                ) from None
+            if number < 1:
+                raise ValueError("Visit numbers are 1-based.")
+            out.append(number)
+    return out or None
+
+
+def select_products_by_visit(
+    products_by_obs: list[tuple[Any, list[dict[str, Any]]]],
+    visits: Any,
+) -> tuple[list[tuple[Any, list[dict[str, Any]]]], list[str], list[str]]:
+    """Keep only products from the requested visits (exoTEDRF ``visit_nos``).
+
+    Visit numbers are 1-based positions in the SORTED list of distinct
+    ``jwPPPPPOOOVVV`` prefixes across ALL selected products. exoTEDRF's
+    ``download_observations`` numbers visits in the order MAST happens to
+    return products instead; that usually matches the sorted order but is
+    not guaranteed, so this numbering is the deterministic version of it.
+    Literal prefixes are accepted too and are unambiguous — prefer them for
+    anything that must be reproducible. Products without a per-visit
+    prefix (observation-level stage-3 files) are dropped when a visit is
+    requested. Returns (filtered products_by_obs, all prefixes, selected).
+    """
+    wanted = _normalize_visits(visits)
+    all_prefixes = sorted({
+        p for _, products in products_by_obs for p in map(_visit_prefix, products) if p
+    })
+    if wanted is None:
+        return products_by_obs, all_prefixes, all_prefixes
+    selected: list[str] = []
+    for v in wanted:
+        if isinstance(v, int):
+            if v > len(all_prefixes):
+                raise ValueError(
+                    f"You are trying to retrieve visit {v}, but only "
+                    f"{len(all_prefixes)} visit(s) exist for this selection: "
+                    f"{all_prefixes}."
+                )
+            prefix = all_prefixes[v - 1]
+        else:
+            if v not in all_prefixes:
+                raise ValueError(
+                    f"Visit {v} is not in this selection. Available: {all_prefixes}."
+                )
+            prefix = v
+        if prefix not in selected:
+            selected.append(prefix)
+    keep = set(selected)
+    filtered = [
+        (key, [p for p in products if _visit_prefix(p) in keep])
+        for key, products in products_by_obs
+    ]
+    return filtered, all_prefixes, selected
+
+
+def _download_product_sets(
+    products_by_obs: list[tuple[Any, list[dict[str, Any]]]],
+    target_dir: Path,
+    *,
+    dir_name: Any,
+    session: requests.Session | None,
+    download_timeout: float | tuple[float, float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Download (key, products) pairs; return (downloaded, skipped_proprietary).
+
+    ``dir_name(key)`` names the per-observation subdirectory; ``key`` is
+    echoed into each manifest entry by the caller-supplied ``entry`` dict.
+    """
+    downloaded: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for key, products in products_by_obs:
+        obs_dir = target_dir / _sanitize_path_component(str(dir_name(key)))
+        for product in products:
+            data_uri = product.get("dataURI")
+            if not data_uri:
+                continue
+            try:
+                local_path = download_mast_product(
+                    str(data_uri),
+                    obs_dir,
+                    filename=product.get("productFilename"),
+                    session=session,
+                    timeout=download_timeout,
+                )
+            except ProprietaryProductError as exc:
+                skipped.append({"key": key, "product": product, "reason": str(exc)})
+                continue
+            downloaded.append({"key": key, "product": product, "path": str(local_path)})
+    return downloaded, skipped
+
+
 def download_observations_products(
     obsids: list[str | int] | tuple[str | int, ...],
     output_directory: str | os.PathLike[str],
@@ -1059,6 +1224,10 @@ def download_observations_products(
     raw_only: bool = False,
     extensions: list[str] | tuple[str, ...] | str | None = FITS_EXTENSIONS,
     max_products_per_obs: int | None = None,
+    visits: Any = None,
+    obs_dir_names: dict[str, str] | None = None,
+    product_dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
+
     session: requests.Session | None = None,
     timeout: float = 120.0,
     download_timeout: float | tuple[float, float] = (30.0, 600.0),
@@ -1067,70 +1236,58 @@ def download_observations_products(
     """
     Batch-download products for a fixed list of MAST obsids.
 
-    Writes files under ``{output_directory}/{label}/{obs_id_or_obsid}/`` and a
-    ``manifest.json`` capturing every download. Used by demographics workflows
-    where obsids come from a no-position filtered search rather than a cone
-    search around one planet.
+    Writes files under ``{output_directory}/{label}/{obs_dir}/`` (``obs_dir``
+    is ``obs_dir_names[obsid]`` when given, else the obsid) and a
+    ``manifest.json`` capturing every download. ``visits`` restricts to
+    exoTEDRF-numbered visits (see ``select_products_by_visit``); products
+    are listed for every obsid first so the numbering is global.
     """
     target_dir = Path(output_directory) / _sanitize_path_component(label)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    downloaded: list[dict[str, Any]] = []
-    skipped_proprietary: list[dict[str, Any]] = []
-    for obsid in obsids:
-        if obsid is None:
-            continue
-
-        products = get_observation_products(
+    obsid_list = [str(o) for o in obsids if o is not None]
+    products_by_obs = [
+        (
             obsid,
-            product_types=product_types,
-            product_subgroups=product_subgroups,
-            raw_only=raw_only,
-            extensions=extensions,
-            session=session,
-            timeout=timeout,
+            get_observation_products(
+                obsid,
+                product_types=product_types,
+                product_subgroups=product_subgroups,
+                raw_only=raw_only,
+                extensions=extensions,
+                product_dataproduct_types=product_dataproduct_types,
+                session=session,
+                timeout=timeout,
+            ),
         )
+        for obsid in obsid_list
+    ]
+    products_by_obs, all_visits, selected_visits = select_products_by_visit(
+        products_by_obs, visits
+    )
+    if max_products_per_obs is not None:
+        products_by_obs = [(k, p[:max_products_per_obs]) for k, p in products_by_obs]
 
-        if max_products_per_obs is not None:
-            products = products[:max_products_per_obs]
-
-        obs_dir_name = _sanitize_path_component(str(obsid))
-        for product in products:
-            data_uri = product.get("dataURI")
-            if not data_uri:
-                continue
-
-            try:
-                local_path = download_mast_product(
-                    str(data_uri),
-                    target_dir / obs_dir_name,
-                    filename=product.get("productFilename"),
-                    session=session,
-                    timeout=download_timeout,
-                )
-            except ProprietaryProductError as exc:
-                skipped_proprietary.append(
-                    {
-                        "obsid": str(obsid),
-                        "product": product,
-                        "reason": str(exc),
-                    }
-                )
-                continue
-            downloaded.append(
-                {
-                    "obsid": str(obsid),
-                    "product": product,
-                    "path": str(local_path),
-                }
-            )
+    names = obs_dir_names or {}
+    downloaded, skipped = _download_product_sets(
+        products_by_obs,
+        target_dir,
+        dir_name=lambda obsid: names.get(obsid) or obsid,
+        session=session,
+        download_timeout=download_timeout,
+    )
+    for entry in downloaded + skipped:
+        entry["obsid"] = entry.pop("key")
 
     manifest = {
         "label": label,
-        "obsids": [str(o) for o in obsids if o is not None],
+        "obsids": obsid_list,
         "downloaded": downloaded,
-        "skipped_proprietary": skipped_proprietary,
+        "skipped_proprietary": skipped,
     }
+    if visits is not None:
+        manifest["visits_available"] = all_visits
+        manifest["visits_selected"] = selected_visits
 
     with (target_dir / "manifest.json").open("w") as handle:
         json.dump(manifest, handle, indent=2)
@@ -1148,12 +1305,15 @@ def download_planet_jwst_products(
     instruments: list[str] | tuple[str, ...] | str | None = None,
     dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
     calib_levels: list[int] | tuple[int, ...] | int | None = None,
+    proposal_id: str | int | None = None,
+    filters: list[str] | tuple[str, ...] | str | None = None,
     product_types: list[str] | tuple[str, ...] | str | None = SCIENCE_PRODUCT_TYPES,
     product_subgroups: list[str] | tuple[str, ...] | str | None = None,
     raw_only: bool = False,
     extensions: list[str] | tuple[str, ...] | str | None = FITS_EXTENSIONS,
     max_observations: int | None = None,
     max_products: int | None = None,
+    visits: Any = None,
     session: requests.Session | None = None,
     timeout: float = 120.0,
     download_timeout: float | tuple[float, float] = (30.0, 600.0),
@@ -1161,8 +1321,11 @@ def download_planet_jwst_products(
     """
     Search for JWST observations of one planet target and download selected products.
 
-    The returned manifest is JSON-serializable and records the observation rows,
-    product metadata, and local file paths.
+    ``proposal_id`` / ``instruments`` / ``dataproduct_types`` filter the MAST
+    query; ``filters`` (e.g. 'G395H') and ``visits`` select client-side, as
+    exoTEDRF's ``download_observations`` does. The returned manifest is
+    JSON-serializable and records the observation rows, product metadata,
+    and local file paths.
     """
     observations = search_jwst_observations(
         planet_name,
@@ -1172,71 +1335,60 @@ def download_planet_jwst_products(
         instruments=instruments,
         dataproduct_types=dataproduct_types,
         calib_levels=calib_levels,
+        proposal_id=proposal_id,
         session=session,
         timeout=timeout,
     )
+    requested_filters = _as_list(filters)
+    observations = [
+        o for o in observations if _filters_match(o.get("filters"), requested_filters)
+    ]
     if max_observations is not None:
         observations = observations[:max_observations]
 
     target_dir = Path(output_directory) / _sanitize_path_component(planet_name)
-    downloaded: list[dict[str, Any]] = []
-    skipped_proprietary: list[dict[str, Any]] = []
-
-    for observation in observations:
-        obsid = observation.get("obsid")
-        if obsid is None:
-            continue
-
-        products = get_observation_products(
-            obsid,
-            product_types=product_types,
-            product_subgroups=product_subgroups,
-            raw_only=raw_only,
-            extensions=extensions,
-            session=session,
-            timeout=timeout,
+    products_by_obs = [
+        (
+            index,
+            get_observation_products(
+                observation["obsid"],
+                product_types=product_types,
+                product_subgroups=product_subgroups,
+                raw_only=raw_only,
+                extensions=extensions,
+                product_dataproduct_types=dataproduct_types,
+                session=session,
+                timeout=timeout,
+            ),
         )
+        for index, observation in enumerate(observations)
+        if observation.get("obsid") is not None
+    ]
+    products_by_obs, all_visits, selected_visits = select_products_by_visit(
+        products_by_obs, visits
+    )
+    if max_products is not None:
+        products_by_obs = [(k, p[:max_products]) for k, p in products_by_obs]
 
-        if max_products is not None:
-            products = products[:max_products]
-
-        obs_dir_name = _sanitize_path_component(str(observation.get("obs_id") or obsid))
-        for product in products:
-            data_uri = product.get("dataURI")
-            if not data_uri:
-                continue
-
-            try:
-                local_path = download_mast_product(
-                    str(data_uri),
-                    target_dir / obs_dir_name,
-                    filename=product.get("productFilename"),
-                    session=session,
-                    timeout=download_timeout,
-                )
-            except ProprietaryProductError as exc:
-                skipped_proprietary.append(
-                    {
-                        "observation": observation,
-                        "product": product,
-                        "reason": str(exc),
-                    }
-                )
-                continue
-            downloaded.append(
-                {
-                    "observation": observation,
-                    "product": product,
-                    "path": str(local_path),
-                }
-            )
+    downloaded, skipped = _download_product_sets(
+        products_by_obs,
+        target_dir,
+        dir_name=lambda i: observations[i].get("obs_id") or observations[i]["obsid"],
+        session=session,
+        download_timeout=download_timeout,
+    )
+    for entry in downloaded + skipped:
+        entry["observation"] = observations[entry.pop("key")]
 
     manifest = {
         "planet_name": planet_name,
         "observations": observations,
         "downloaded": downloaded,
-        "skipped_proprietary": skipped_proprietary,
+        "skipped_proprietary": skipped,
     }
+    if visits is not None:
+        manifest["visits_available"] = all_visits
+        manifest["visits_selected"] = selected_visits
 
     target_dir.mkdir(parents=True, exist_ok=True)
     with (target_dir / "manifest.json").open("w") as handle:
@@ -1358,6 +1510,9 @@ def _format_download_manifest(manifest: dict[str, Any]) -> str:
             "",
             "Local paths:",
         ]
+    if "visits_selected" in manifest:
+        lines.insert(4, f"Visits selected: {manifest['visits_selected']} "
+                        f"(of {manifest.get('visits_available')})")
     for entry in downloaded:
         lines.append(f"  - {entry.get('path', '?')}")
     if not downloaded:
@@ -1533,6 +1688,13 @@ class SearchMastJwstObservations(BaseTool):
     proposals / product types ARE present in the cone — or where a given
     proposal's observations actually live — so the next query can be corrected.
 
+    Gratings / filters
+    ------------------
+    ``filters`` keeps observations whose CAOM ``filters`` value contains the
+    given tokens, e.g. ['G395H'] keeps 'F290LP;G395H' and drops PRISM or
+    G395M; ['G395H', 'G395M'] keeps either. Matched client-side (MAST's own
+    filter is exact-match on the joined string and would drop real data).
+
     Data product types
     ------------------
     Valid values for ``dataproduct_types``:
@@ -1629,6 +1791,9 @@ class SearchMastJwstObservations(BaseTool):
             "target_name_filter=True semantics."
         ),
     )
+    filters: list | str | None = OptionalRuntimeField(
+        description="Grating/filter tokens, e.g. ['G395H'] (any-of; client-side).",
+    )
     output_csv: str | None = OptionalRuntimeField(
         description=(
             "Optional CSV path (relative to the workspace) for the full rows. "
@@ -1667,6 +1832,14 @@ class SearchMastJwstObservations(BaseTool):
         dec = _as_float_or_none(self.dec, "dec")
         radius_deg = _as_float_or_none(self.radius_deg, "radius_deg")
         radius_deg = 0.02 if radius_deg is None else radius_deg
+        grating_filters = [
+            f for f in (_as_list(self.filters) or []) if _clean_str(f)
+        ] or None
+
+        def by_grating(rows):
+            return [r for r in rows if _filters_match(r.get("filters"), grating_filters)]
+
+        grating_extra = {"filters (client-side)": grating_filters} if grating_filters else {}
 
         # calib_level=1 is a common trap: callers use it hoping to get raw /
         # uncalibrated data, but JWST science observations are almost never
@@ -1695,10 +1868,12 @@ class SearchMastJwstObservations(BaseTool):
                 target_name=target_name,
                 proposal_id=proposal_id,
             )
+            observations = by_grating(observations)
             summary = _format_observations_summary(
                 observations,
                 filters=filters,
-                query_extra={"mode": "demographics (Mast.Caom.Filtered, no position)"},
+                query_extra={"mode": "demographics (Mast.Caom.Filtered, no position)",
+                             **grating_extra},
             )
             if not observations:
                 # Empty demographics result used to dead-end as a bare "No JWST
@@ -1711,6 +1886,11 @@ class SearchMastJwstObservations(BaseTool):
                     proposal_id=proposal_id,
                     target_name=target_name,
                 )
+                if grating_filters:
+                    diagnostics += (
+                        f"\nAlso check the grating filter {grating_filters}: "
+                        "rerun without `filters` to see which gratings exist."
+                    )
                 summary = f"{summary}\n\n{diagnostics}"
             saved = self._save_rows(
                 observations,
@@ -1736,6 +1916,7 @@ class SearchMastJwstObservations(BaseTool):
             calib_levels=self.calib_levels,
             proposal_id=proposal_id,
         )
+        observations = by_grating(observations)
         filters = _build_jwst_observation_filters(
             instruments=self.instruments,
             dataproduct_types=self.dataproduct_types,
@@ -1746,6 +1927,7 @@ class SearchMastJwstObservations(BaseTool):
             "mode": "per-planet cone search (Mast.Caom.Filtered.Position)",
             "planet_name": planet_name,
             "radius_deg": radius_deg,
+            **grating_extra,
         }
         if observations:
             saved = self._save_rows(observations, always=False, hint_parts=[])
@@ -1766,6 +1948,7 @@ class SearchMastJwstObservations(BaseTool):
             calib_levels=_as_int_list(self.calib_levels),
             proposal_id=proposal_id,
         )
+        recovered = by_grating(recovered)
         if recovered:
             summary = _format_observations_summary(
                 recovered, filters=filters, query_extra=query_extra
@@ -2492,6 +2675,7 @@ def download_demographic_products(
     max_planets: int | None = None,
     max_obs_per_planet: int | None = None,
     max_products_per_obs: int | None = None,
+    product_dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
     session: requests.Session | None = None,
     timeout: float = 120.0,
 ) -> dict[str, Any]:
@@ -2537,6 +2721,7 @@ def download_demographic_products(
             raw_only=raw_only,
             extensions=extensions,
             max_products_per_obs=max_products_per_obs,
+            product_dataproduct_types=product_dataproduct_types,
             session=session,
             timeout=timeout,
             label=pl_name,
@@ -3111,6 +3296,8 @@ def _format_product_listing(
     raw_only: bool,
     max_products: int | None,
     limit_per_obs: int = 40,
+    prefetched: dict[Any, list[dict[str, Any]]] | None = None,
+    product_dataproduct_types: Any = None,
 ) -> str:
     """List (do not download) MAST products for obsids, grouped by a heading."""
     lines: list[str] = ["LIST ONLY — nothing was downloaded."]
@@ -3121,11 +3308,15 @@ def _format_product_listing(
             lines.append(f"\n=== {heading} ===")
         for obsid in obsids:
             total_obs += 1
-            products = get_observation_products(
-                obsid,
-                product_subgroups=product_subgroups,
-                raw_only=raw_only,
-            )
+            if prefetched is not None:
+                products = prefetched.get((heading, obsid), [])
+            else:
+                products = get_observation_products(
+                    obsid,
+                    product_subgroups=product_subgroups,
+                    raw_only=raw_only,
+                    product_dataproduct_types=product_dataproduct_types,
+                )
             if max_products is not None:
                 products = products[:max_products]
             total_files += len(products)
@@ -3142,70 +3333,96 @@ def _format_product_listing(
 class DownloadMastJwstProducts(BaseTool):
     """
     The ONE tool for JWST product FILES on MAST: list them, or download them —
-    for one planet, an obsid list, or every row of a population CSV.
+    for a target and/or program, an obsid list, or every row of a population CSV.
 
     USE WHEN: the user wants to see which FITS products (UNCAL, RATEINTS,
-    X1DINTS, ...) exist for a JWST observation, or wants them on disk.
+    X1DINTS, ...) exist for JWST observations, or wants them on disk —
+    including "get the uncals for program 1366 / WASP-39 b / G395H" style
+    requests (this tool supersedes exoTEDRF's ``download_observations``).
 
-    NOT FOR: discovering observations (`SearchMastJwstObservations`), or
-    reduced Exoplanet-Archive transit spectra (`DownloadDataset`).
+    NOT FOR: discovering/browsing observations (`SearchMastJwstObservations`),
+    or reduced Exoplanet-Archive transit spectra (`DownloadDataset`).
 
-    Input — supply ONE of these (precedence if several: rows_path > obsids >
-    planet_name; the ignored ones are reported in the result):
-      * ``planet_name`` — cone-searches MAST for the target (optionally
-        constrained by ``instruments`` / ``dataproduct_types`` / ``ra`` /
-        ``dec`` / ``radius_deg``), then fetches each observation's products.
-        Writes ``{output_dir}/{planet_name}/{obs_id}/`` + ``manifest.json``.
+    Input — supply ONE selection (precedence if several: rows_path > obsids >
+    query; ignored inputs are reported in the result):
+      * **query** — ``planet_name`` and/or ``proposal_id``, narrowed by
+        ``instruments``, ``dataproduct_types``, ``filters`` and ``visits``:
+          - with ``planet_name``: cone search around the resolved target
+            (``ra``/``dec``/``radius_deg`` to override), optionally limited to
+            ``proposal_id``. Writes ``{output_dir}/{planet_name}/{obs_id}/``.
+          - ``proposal_id`` alone: every observation in the program. Writes
+            ``{output_dir}/{label or program_<id>}/{obs_id}/``.
       * ``obsids`` — explicit MAST obsid list (one obsid is fine). Writes
-        ``{output_dir}/{label}/{obsid}/`` + ``manifest.json``.
+        ``{output_dir}/{label}/{obsid}/``.
       * ``rows_path`` — a CSV/JSON written by ``CrossmatchJwstToPlanets`` or
         ``SearchMastJwstObservations`` (needs an ``obsid`` column). Rows with
-        ``pl_name`` are downloaded per planet under
-        ``{output_dir}/{label}/{pl_name}/{obsid}/`` with a per-planet
-        ``manifest.json`` and a top-level ``demographic_manifest.json``;
-        rows without ``pl_name`` download as one flat batch under
-        ``{output_dir}/{label}/{obsid}/``.
+        ``pl_name`` download per planet under
+        ``{output_dir}/{label}/{pl_name}/{obsid}/`` (+ a top-level
+        ``demographic_manifest.json``); rows without it download as one flat
+        batch under ``{output_dir}/{label}/{obsid}/``.
+    Every run writes a ``manifest.json``. One directory per observation is
+    deliberate: ``ReduceNirspecG395hTso`` takes ONE observation's segments
+    per ``input_dir``, and ``DiscoverPatchworkVisits`` reads headers anyway.
 
-    ``list_only=True`` lists the matching product files (subgroup, size,
-    filename, dataURI) for the same selection WITHOUT downloading — use it
-    to inspect an obsid's pipeline stages before committing to a download.
+    Selection
+    ---------
+      * ``instruments`` — bare names expand to every MAST mode ("NIRSpec");
+        full modes pass through ("NIRSPEC/SLIT", "NIRSPEC/BOTS").
+      * ``filters`` — grating/filter tokens matched against each
+        observation's CAOM ``filters`` value, e.g. ['G395H'] keeps
+        'F290LP;G395H' and drops PRISM/CLEAR; ['G395H', 'G395M'] keeps either.
+      * ``visits`` — like exoTEDRF ``visit_nos``: 1-based numbers into the
+        sorted distinct ``jwPPPPPOOOVVV`` prefixes of the whole selection
+        (listed in the result), or literal prefixes like 'jw01366004001'
+        (unambiguous; prefer these). query and
+        obsids modes only. Observation-level stage-3 files have no visit
+        prefix and are dropped when ``visits`` is set.
+      * ``raw_only=True`` — only UNCAL ramps (what exoTEDRF downloads);
+        ``product_subgroups`` for other stages (RATE, RATEINTS, CAL, CALINTS,
+        X1D, X1DINTS, S2D, S3D, WHTLT). For retrievals prefer X1DINTS.
 
-    JWST product subgroups (``product_subgroups``)
-    ----------------------------------------------
-        Raw:      "UNCAL" (or ``raw_only=True``)
-        Stage 1:  "RATE", "RATEINTS"
-        Stage 2:  "CAL", "CALINTS"
-        Stage 3:  "X1D", "X1DINTS" (time-resolved spectra), "S2D", "S3D",
-                  "WHTLT" (white-light curve)
-    For retrievals prefer X1DINTS; for re-reduction (Patchwork) use UNCAL.
+    ``list_only=True`` lists the matching files (subgroup, size, filename,
+    dataURI) for the same selection WITHOUT downloading.
 
     Caps (always set them for UNCAL — multi-GB per observation)
     -----------------------------------------------------------
       * ``max_planets``      — rows_path mode: number of planets.
-      * ``max_observations`` — observations per planet (planet_name and
-                               rows_path modes) or first N obsids (obsids mode).
+      * ``max_observations`` — observations per target/program (query and
+                               rows_path modes) or first N obsids.
       * ``max_products``     — product files per observation.
 
-    Proprietary (exclusive-access) products are skipped and listed in the
-    manifest rather than aborting the run.
+    Downloads resume interrupted files, and proprietary (exclusive-access)
+    products are skipped and listed in the manifest rather than aborting.
 
-    Examples
-    --------
-        # Inspect one observation's files (replaces the old products-listing tool)
+    exoTEDRF equivalence
+    --------------------
+        download_observations(proposal_id='1366', objectname='WASP-39b',
+                              instrument_name='NIRSPEC/SLIT', filters='G395H')
+      is
+        DownloadMastJwstProducts(proposal_id="1366", planet_name="WASP-39 b",
+                                 instruments=["NIRSPEC/SLIT"], filters=["G395H"],
+                                 dataproduct_types=["timeseries"], raw_only=True)
+      with files under mast/WASP-39_b/<obs_id>/ instead of ./DMS_uncal.
+      ``dataproduct_types=["timeseries"]`` is the part that keeps the
+      target-acquisition uncals (typed 'image', stored in the same
+      observation) out of the science directory — always pass it for TSOs.
+
+    More examples
+    -------------
         DownloadMastJwstProducts(obsids="98765", raw_only=True, list_only=True)
-
-        # Stage-3 spectra for one planet
-        DownloadMastJwstProducts(planet_name="WASP-39 b", instruments=["NIRSpec"],
-                                 product_subgroups=["X1DINTS"], max_observations=2)
-
-        # UNCAL for a whole crossmatched population
+        DownloadMastJwstProducts(proposal_id="1366", filters=["G395H"],
+                                 dataproduct_types=["timeseries"],
+                                 raw_only=True, visits=[1])
         DownloadMastJwstProducts(rows_path="mast/demographics/subneptunes.csv",
                                  label="subneptunes", raw_only=True,
                                  max_observations=1, max_products=2)
     """
 
     planet_name: str | None = OptionalRuntimeField(
-        description="planet_name mode: target name, e.g. 'WASP-39 b'.",
+        description="query: target name, e.g. 'WASP-39 b' (exoTEDRF objectname).",
+    )
+    proposal_id: str | None = OptionalRuntimeField(
+        description="query: JWST program id, e.g. '1366'. Alone, selects the whole program.",
     )
     obsids: list | str | None = OptionalRuntimeField(
         description="obsids mode: one or more MAST obsids, e.g. ['87602456'].",
@@ -3224,28 +3441,43 @@ class DownloadMastJwstProducts(BaseTool):
     output_dir: str | None = OptionalRuntimeField(
         description=(
             "Output directory relative to the workspace. Default 'mast' "
-            "(planet_name / obsids modes) or 'mast/demographics_raw' (rows_path)."
+            "(query / obsids) or 'mast/demographics_raw' (rows_path)."
         ),
     )
-    label: str = RuntimeField(
-        default="aggregate",
-        description="Subdirectory label for obsids and rows_path modes.",
+    label: str | None = OptionalRuntimeField(
+        description=(
+            "Subdirectory label for obsids, rows_path and proposal-only query "
+            "modes. Default 'aggregate' (or 'program_<id>')."
+        ),
     )
     ra: float | str | None = OptionalRuntimeField(
-        description="planet_name mode: RA in degrees if MAST cannot resolve the name.",
+        description="query: RA in degrees if MAST cannot resolve planet_name.",
     )
     dec: float | str | None = OptionalRuntimeField(
-        description="planet_name mode: Dec in degrees if MAST cannot resolve the name.",
+        description="query: Dec in degrees if MAST cannot resolve planet_name.",
     )
     radius_deg: float | str = RuntimeField(
         default=0.02,
-        description="planet_name mode: cone-search radius in degrees.",
+        description="query: cone-search radius in degrees around planet_name.",
     )
     instruments: list | str | None = OptionalRuntimeField(
-        description="planet_name mode: JWST instrument filters, e.g. ['NIRSpec'].",
+        description="query: instruments or modes, e.g. ['NIRSpec'] or ['NIRSPEC/SLIT'].",
     )
     dataproduct_types: list | str | None = OptionalRuntimeField(
-        description="planet_name mode: dataproduct filters, e.g. ['timeseries'].",
+        description=(
+            "Dataproduct filter, e.g. ['timeseries']. Narrows the query AND each "
+            "product's own type (drops target-acquisition 'image' exposures); "
+            "the product-level part applies in every mode."
+        ),
+    )
+    filters: list | str | None = OptionalRuntimeField(
+        description="query: grating/filter tokens, e.g. ['G395H'] (any-of).",
+    )
+    visits: list | str | None = OptionalRuntimeField(
+        description=(
+            "query/obsids: 1-based visit numbers (exoTEDRF visit_nos) or "
+            "prefixes like 'jw01366004001'."
+        ),
     )
     product_subgroups: list | str | None = OptionalRuntimeField(
         description="JWST product subgroup filters, e.g. ['X1DINTS'] or ['UNCAL'].",
@@ -3258,19 +3490,40 @@ class DownloadMastJwstProducts(BaseTool):
         description="rows_path mode: cap on the number of planets.",
     )
     max_observations: int | str | None = OptionalRuntimeField(
-        description="Cap on observations per planet (or on obsids in obsids mode).",
+        description="Cap on observations per target/program (or on obsids in obsids mode).",
     )
     max_products: int | str | None = OptionalRuntimeField(
         description="Cap on product files per observation.",
     )
     base_directory: str = StateField()
 
+    def _query_observations(self, planet_name, proposal_id, ra, dec, radius_deg,
+                            filters, max_observations):
+        """Observation rows for query mode (planet cone and/or program)."""
+        if planet_name:
+            rows = search_jwst_observations(
+                planet_name, ra=ra, dec=dec, radius_deg=radius_deg,
+                instruments=self.instruments,
+                dataproduct_types=self.dataproduct_types,
+                proposal_id=proposal_id,
+            )
+        else:
+            rows, _ = search_all_jwst_observations(
+                instruments=self.instruments,
+                dataproduct_types=self.dataproduct_types,
+                proposal_id=proposal_id,
+            )
+        rows = [r for r in rows if _filters_match(r.get("filters"), filters)]
+        if max_observations is not None:
+            rows = rows[:max_observations]
+        return rows
+
     def _run(self) -> str:
         # Normalize LLM-supplied args: '' -> None, 'True' -> True, '10' -> 10.
         planet_name = _clean_str(self.planet_name)
+        proposal_id = _clean_str(self.proposal_id)
         rows_path = _clean_str(self.rows_path)
         obsids_list = [o for o in (_as_list(self.obsids) or []) if _clean_str(o)]
-        label = _clean_str(self.label) or "aggregate"
         list_only = _as_bool(self.list_only, "list_only", default=False)
         raw_only = _as_bool(self.raw_only, "raw_only", default=False)
         max_planets = _as_int_or_none(self.max_planets, "max_planets")
@@ -3279,33 +3532,81 @@ class DownloadMastJwstProducts(BaseTool):
         radius_deg = _as_float_or_none(self.radius_deg, "radius_deg")
         if radius_deg is None:
             radius_deg = 0.02
+        filters = [f for f in (_as_list(self.filters) or []) if _clean_str(f)] or None
+        visits = _normalize_visits(self.visits)
+        if proposal_id is not None:
+            if not re.fullmatch(r"\d{1,5}", proposal_id):
+                raise ValueError(
+                    f"proposal_id must be a JWST program number, got {proposal_id!r}."
+                )
+            # MAST stores proposal_id without leading zeros ('1366', not
+            # '01366'); the server-side filter is exact-match.
+            proposal_id = str(int(proposal_id))
 
+        query_inputs = [n for n, v in (("planet_name", planet_name),
+                                       ("proposal_id", proposal_id)) if v]
         supplied = [
             name for name, value in (
                 ("rows_path", rows_path),
                 ("obsids", obsids_list),
-                ("planet_name", planet_name),
+                ("query", query_inputs),
             ) if value
         ]
         if not supplied:
             raise ValueError(
-                "Provide one of rows_path (population CSV), obsids (explicit "
-                "list), or planet_name (single target). All are missing."
+                "Provide one of: planet_name and/or proposal_id (query), obsids "
+                "(explicit list), or rows_path (population CSV). All are missing."
             )
         mode = supplied[0]
-        note = ""
-        if len(supplied) > 1:
-            note = (
-                f"NOTE: ran in {mode} mode; ignored "
-                f"{', '.join(supplied[1:])} (supply only one input).\n\n"
+        ignored = [("+".join(query_inputs) if n == "query" else n) for n in supplied[1:]]
+        if mode != "query":
+            ignored += [n for n, v in (("filters", filters),) if v]
+        if mode == "rows_path" and visits:
+            raise ValueError(
+                "visits is not supported with rows_path (visit numbers would be "
+                "ambiguous across planets). Use obsids or a query instead."
             )
+        note = (
+            f"NOTE: ran in {mode} mode; ignored {', '.join(ignored)}.\n\n"
+            if ignored else ""
+        )
 
         default_dir = "mast/demographics_raw" if mode == "rows_path" else "mast"
         output_root = os.path.join(
             self.base_directory, _clean_str(self.output_dir) or default_dir
         )
+        label = _clean_str(self.label)
+        # Applied to each PRODUCT's dataproduct_type as well as to the
+        # observation query, so a timeseries request never pulls the
+        # target-acquisition 'image' exposures stored in the same observation.
+        dptypes = [d for d in (_as_list(self.dataproduct_types) or []) if _clean_str(d)] or None
+
+        def listing(groups):
+            if visits:
+                pairs = [
+                    (heading, obsid, get_observation_products(
+                        obsid, product_subgroups=self.product_subgroups,
+                        raw_only=raw_only, product_dataproduct_types=dptypes))
+                    for heading, ids in groups for obsid in ids
+                ]
+                kept, available, chosen = select_products_by_visit(
+                    [((h, o), p) for h, o, p in pairs], visits)
+                lookup = {key: prods for key, prods in kept}
+                text = _format_product_listing(
+                    groups, product_subgroups=self.product_subgroups,
+                    raw_only=raw_only, max_products=max_products,
+                    prefetched=lookup,
+                )
+                return text + (f"\n\nVisits available: {available}"
+                               f"\nVisits selected:  {chosen}")
+            return _format_product_listing(
+                groups, product_subgroups=self.product_subgroups,
+                raw_only=raw_only, max_products=max_products,
+                product_dataproduct_types=dptypes,
+            )
 
         if mode == "rows_path":
+            label = label or "aggregate"
             rows = _read_rows_from_path(Path(self.base_directory) / rows_path)
             if rows and "obsid" not in rows[0]:
                 raise ValueError(
@@ -3317,94 +3618,82 @@ class DownloadMastJwstProducts(BaseTool):
                 rows, max_planets=max_planets, max_obs_per_planet=max_observations
             )
             if list_only:
-                return note + _format_product_listing(
-                    [(pl or label, ids) for pl, ids in by_planet.items()],
-                    product_subgroups=self.product_subgroups,
-                    raw_only=raw_only,
-                    max_products=max_products,
-                )
+                return note + listing([(pl or label, ids) for pl, ids in by_planet.items()])
             if set(by_planet) == {""}:
                 manifest = download_observations_products(
-                    by_planet[""],
-                    output_root,
-                    product_subgroups=self.product_subgroups,
-                    raw_only=raw_only,
-                    max_products_per_obs=max_products,
-                    label=label,
+                    by_planet[""], output_root,
+                    product_subgroups=self.product_subgroups, raw_only=raw_only,
+                    max_products_per_obs=max_products, label=label,
+                    product_dataproduct_types=dptypes,
                 )
                 return note + _format_download_manifest(manifest)
             manifest = download_demographic_products(
-                rows,
-                output_root,
-                label=label,
-                product_subgroups=self.product_subgroups,
-                raw_only=raw_only,
-                max_planets=max_planets,
-                max_obs_per_planet=max_observations,
+                rows, output_root, label=label,
+                product_subgroups=self.product_subgroups, raw_only=raw_only,
+                max_planets=max_planets, max_obs_per_planet=max_observations,
                 max_products_per_obs=max_products,
+                product_dataproduct_types=dptypes,
             )
             return note + _format_demographic_summary(manifest)
 
         if mode == "obsids":
+            label = label or "aggregate"
+            obsids_list = [str(o) for o in obsids_list]
             if max_observations is not None:
                 obsids_list = obsids_list[:max_observations]
             if list_only:
-                return note + _format_product_listing(
-                    [("", [str(o) for o in obsids_list])],
-                    product_subgroups=self.product_subgroups,
-                    raw_only=raw_only,
-                    max_products=max_products,
-                )
+                return note + listing([("", obsids_list)])
             manifest = download_observations_products(
-                obsids_list,
-                output_root,
-                product_subgroups=self.product_subgroups,
-                raw_only=raw_only,
-                max_products_per_obs=max_products,
-                label=label,
+                obsids_list, output_root,
+                product_subgroups=self.product_subgroups, raw_only=raw_only,
+                max_products_per_obs=max_products, visits=visits,
+                product_dataproduct_types=dptypes, label=label,
             )
             return note + _format_download_manifest(manifest)
 
-        # planet_name mode
+        # query mode: planet_name and/or proposal_id
         ra = _as_float_or_none(self.ra, "ra")
         dec = _as_float_or_none(self.dec, "dec")
-        if list_only:
-            observations = search_jwst_observations(
-                planet_name,
-                ra=ra,
-                dec=dec,
-                radius_deg=radius_deg,
-                instruments=self.instruments,
-                dataproduct_types=self.dataproduct_types,
+        describe = " / ".join(
+            ([planet_name] if planet_name else [])
+            + ([f"program {proposal_id}"] if proposal_id else [])
+        )
+        if list_only or not planet_name:
+            observations = self._query_observations(
+                planet_name, proposal_id, ra, dec, radius_deg, filters, max_observations
             )
-            if max_observations is not None:
-                observations = observations[:max_observations]
             obsids_found = [
                 str(o["obsid"]) for o in observations if o.get("obsid") is not None
             ]
             if not obsids_found:
                 return note + (
-                    f"No JWST observations found for {planet_name} with these "
+                    f"No JWST observations found for {describe} with these "
                     "filters. Run SearchMastJwstObservations for diagnostics."
                 )
-            return note + _format_product_listing(
-                [(planet_name, obsids_found)],
-                product_subgroups=self.product_subgroups,
-                raw_only=raw_only,
-                max_products=max_products,
+            if list_only:
+                return note + listing([(describe, obsids_found)])
+            manifest = download_observations_products(
+                obsids_found, output_root,
+                product_subgroups=self.product_subgroups, raw_only=raw_only,
+                max_products_per_obs=max_products, visits=visits,
+                product_dataproduct_types=dptypes,
+                obs_dir_names={
+                    str(o["obsid"]): str(o.get("obs_id") or o["obsid"])
+                    for o in observations if o.get("obsid") is not None
+                },
+                label=label or f"program_{proposal_id}",
             )
+            return note + _format_download_manifest(manifest)
+
         manifest = download_planet_jwst_products(
-            planet_name,
-            output_root,
-            ra=ra,
-            dec=dec,
-            radius_deg=radius_deg,
+            planet_name, output_root,
+            ra=ra, dec=dec, radius_deg=radius_deg,
             instruments=self.instruments,
             dataproduct_types=self.dataproduct_types,
-            product_subgroups=self.product_subgroups,
-            raw_only=raw_only,
-            max_observations=max_observations,
-            max_products=max_products,
+            proposal_id=proposal_id, filters=filters,
+            product_subgroups=self.product_subgroups, raw_only=raw_only,
+            max_observations=max_observations, max_products=max_products,
+            visits=visits,
         )
         return note + _format_download_manifest(manifest)
 

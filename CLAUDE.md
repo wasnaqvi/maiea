@@ -80,7 +80,7 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 
 **Data Acquisition** (`aster_toolkit/data_acquisition/`):
 - `exoarchive.py` - `QueryExoplanetArchive` (one planet's parameters via `planet_name`, or a planet list via ADQL `conditions`) and `DownloadDataset` (reduced Firefly spectra)
-- `mast.py` - `SearchMastJwstObservations` (cone or population search; population mode writes its full rows CSV), `DownloadMastJwstProducts` (list or download product files for a `planet_name`, `obsids`, or a `rows_path` CSV; `list_only=True` to preview), `CrossmatchJwstToPlanets`, `AggregateJwstObservations` (groups a rows CSV; never queries MAST), `GetJwstProgramInfo`; plus `archive_tap_query()` (used by the reduction tools for ephemerides)
+- `mast.py` - `SearchMastJwstObservations` (cone or population search; population mode writes its full rows CSV), `DownloadMastJwstProducts` (list or download product files for a query — `planet_name` and/or `proposal_id`, narrowed by `instruments`, grating `filters` and `visits` (exoTEDRF `visit_nos`, numbered over sorted visit prefixes) — or `obsids`, or a `rows_path` CSV; `list_only=True` to preview; supersedes exoTEDRF's `download_observations`, which is not imported because exoTEDRF lives in its own pinned env), `CrossmatchJwstToPlanets`, `AggregateJwstObservations` (groups a rows CSV; never queries MAST), `GetJwstProgramInfo`; plus `archive_tap_query()` (used by the reduction tools for ephemerides)
 
 ASTER exposes 25 tools with one tool per task — when adding a capability, extend the tool that owns the task (a mode or flag) rather than adding an overlapping tool. `tests/scripts/test_tool_consolidation.py` pins the registry.
 

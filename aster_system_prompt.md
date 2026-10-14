@@ -25,7 +25,7 @@ then the trigger words, then the "Never use" guardrail.
 | Join JWST observations to archive planet params (population study)  | `CrossmatchJwstToPlanets` | — |
 | Count / group observation rows (by instrument, cycle, planet…)     | `AggregateJwstObservations` (`rows_path` = a Search/Crossmatch CSV) | — |
 | LIST the product files of an obsid / planet (no download)          | `DownloadMastJwstProducts(..., list_only=True)` | — |
-| Download JWST FITS — one planet, an obsid list, or a whole CSV      | `DownloadMastJwstProducts` (`planet_name` / `obsids` / `rows_path`) | — |
+| Download JWST FITS — a planet and/or program, an obsid list, or a whole CSV | `DownloadMastJwstProducts` (`planet_name`/`proposal_id` + `instruments`/`filters`/`visits`, or `obsids`, or `rows_path`) | never exoTEDRF `download_observations` or a hand-written astroquery script |
 | Download reduced transit SPECTRA (from a Firefly wget)             | `DownloadDataset` | not for raw FITS |
 | Forward-model a synthetic spectrum                                 | `RunTaurexModelTool` | — |
 | Fit an observed spectrum (retrieval)                               | `SimulateTaurexRetrieval` | needs an `observation_path` |
@@ -49,6 +49,10 @@ Never filter `calib_levels=[1]` to get raw data — search without a calib filte
 then `DownloadMastJwstProducts(obsids=..., raw_only=True)` (add `list_only=True`
 to preview). An empty calib_level=1 result does NOT mean uncalibrated data is
 unavailable.
+For time-series (transit/eclipse) raw data also pass
+`dataproduct_types=["timeseries"]`: it drops the target-acquisition uncals that
+MAST stores in the same observation, which would otherwise sit next to the
+science segments.
 
 **Before any tool call:** never invent a `table=` value or pass `planet_name=None`.
 If a required arg is missing, ask the user or resolve it with the correct tool —

@@ -1499,7 +1499,9 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
             out = self._make_tool(Tool, planet_name="WASP-39 b", list_only=True,
                                   max_observations=1, base_directory="/tmp")._run()
         search.assert_called_once()
-        listing.assert_called_once_with("11", product_subgroups=None, raw_only=False)
+        listing.assert_called_once()
+        self.assertEqual(listing.call_args.args, ("11",))
+        self.assertFalse(listing.call_args.kwargs["raw_only"])
         self.assertIn("=== WASP-39 b ===", out)
 
     def test_download_tool_reports_ignored_inputs(self):
@@ -1845,7 +1847,7 @@ class LlmArgCoercionTests(unittest.TestCase):
 
         def fake_download(obsids, out_dir, *, product_subgroups=None,
                           raw_only=False, max_products_per_obs=None,
-                          label="aggregate"):
+                          label="aggregate", visits=None, **_):
             seen.update(
                 obsids=obsids, out_dir=out_dir, raw_only=raw_only,
                 max_products=max_products_per_obs, label=label,
@@ -2293,7 +2295,7 @@ class OrchestralSchemaContractTests(unittest.TestCase):
 
         def fake_download(obsids, out_dir, *, product_subgroups=None,
                           raw_only=False, max_products_per_obs=None,
-                          label="aggregate"):
+                          label="aggregate", visits=None, **_):
             seen.update(obsids=obsids, raw_only=raw_only,
                         max_products=max_products_per_obs)
             return {"observations": obsids, "files": [], "output_dir": out_dir}
@@ -2350,3 +2352,195 @@ class OrchestralSchemaContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------- exoTEDRF download_observations parity ----------------
+
+
+class ExotedrfDownloadParityTests(unittest.TestCase):
+    """DownloadMastJwstProducts supersedes exoTEDRF's
+    extra_functions.download_observations(proposal_id, objectname,
+    instrument_name, filters, visit_nos). Fixture mirrors ERS 1366 on
+    WASP-39 b: one program, NIRSpec PRISM + G395H, NIRISS SOSS."""
+
+    OBS = [
+        {"obsid": "1", "obs_id": "jw01366-o003_t001_nirspec_clear-prism-s200a1-sub512",
+         "instrument_name": "NIRSPEC/SLIT", "filters": "CLEAR;PRISM",
+         "dataproduct_type": "timeseries", "proposal_id": "1366"},
+        {"obsid": "2", "obs_id": "jw01366-o004_t001_nirspec_f290lp-g395h-s1600a1-sub2048",
+         "instrument_name": "NIRSPEC/SLIT", "filters": "F290LP;G395H",
+         "dataproduct_type": "timeseries", "proposal_id": "1366"},
+        {"obsid": "3", "obs_id": "jw01366-o001_t001_niriss_clear-gr700xd-substrip256",
+         "instrument_name": "NIRISS/SOSS", "filters": "CLEAR;GR700XD",
+         "dataproduct_type": "timeseries", "proposal_id": "1366"},
+    ]
+
+    @staticmethod
+    def _uncal(prefix, seg, det):
+        name = f"{prefix}_04101_00001-seg{seg:03d}_{det}_uncal.fits"
+        return {"productFilename": name, "dataURI": f"mast:JWST/product/{name}",
+                "productSubGroupDescription": "UNCAL", "productType": "SCIENCE",
+                "dataRights": "PUBLIC", "size": 1}
+
+    def _products(self, obsid, raw_only=False, product_subgroups=None, **_):
+        """Fake MAST listing that still runs the real filter_products."""
+        return self.mast.filter_products(
+            self._raw_products(obsid), raw_only=raw_only,
+            product_subgroups=product_subgroups,
+        )
+
+    def _raw_products(self, obsid):
+        if obsid == "1":
+            return [self._uncal("jw01366003001", 1, "nrs1")]
+        if obsid == "2":   # two visits, two segments, two detectors
+            return [self._uncal(p, s, d) for p in ("jw01366004001", "jw01366004002")
+                    for s in (1, 2) for d in ("nrs1", "nrs2")] + [
+                {"productFilename": "jw01366-o004_t001_nirspec_x1dints.fits",
+                 "dataURI": "mast:JWST/product/x1dints.fits", "productType": "SCIENCE",
+                 "productSubGroupDescription": "X1DINTS", "dataRights": "PUBLIC"}]
+        return [self._uncal("jw01366001001", 1, "nis")]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mast = load_mast_module()
+
+    def _tool(self, **kw):
+        kw.setdefault("base_directory", self.tmp)
+        return _construct_tool(self.mast.DownloadMastJwstProducts, **kw)
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp = self._td.name
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _fake_download(self, data_uri, out_dir, filename=None, **_):
+        path = pathlib.Path(out_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        return path
+
+    def _downloaded(self):
+        return sorted(str(p.relative_to(self.tmp))
+                      for p in pathlib.Path(self.tmp).rglob("*.fits"))
+
+    # --- unit: selection helpers ---
+
+    def test_filters_match_tokens(self):
+        m = self.mast._filters_match
+        self.assertTrue(m("F290LP;G395H", ["G395H"]))
+        self.assertTrue(m("F290LP;G395H", ["g395h"]))
+        self.assertTrue(m("F290LP;G395H", ["F290LP;G395H"]))
+        self.assertTrue(m("F290LP;G395H", ["PRISM", "G395H"]))
+        self.assertFalse(m("CLEAR;PRISM", ["G395H"]))
+        self.assertFalse(m("F290LP;G395M", ["G395H"]))   # no substring leakage
+        self.assertTrue(m("anything", None))
+
+    def test_visit_numbering_is_global_and_sorted(self):
+        sets = [(k, self._raw_products(k)) for k in ("2", "1")]
+        kept, available, chosen = self.mast.select_products_by_visit(sets, [2, "jw01366004002"])
+        self.assertEqual(available, ["jw01366003001", "jw01366004001", "jw01366004002"])
+        self.assertEqual(chosen, ["jw01366004001", "jw01366004002"])
+        names = [p["productFilename"] for _, ps in kept for p in ps]
+        self.assertEqual(len(names), 8)                       # 2 visits x 2 seg x 2 det
+        self.assertFalse(any("x1dints" in n for n in names))  # no visit prefix -> dropped
+        with self.assertRaisesRegex(ValueError, "visit 4, but only 3"):
+            self.mast.select_products_by_visit(sets, [4])
+        with self.assertRaisesRegex(ValueError, "jw01366"):
+            self.mast.select_products_by_visit(sets, ["jw1366"])
+
+    # --- the exoTEDRF docstring example ---
+
+    def test_exotedrf_example_call(self):
+        """download_observations(proposal_id='1366', objectname='WASP-39b',
+        instrument_name='NIRSPEC/SLIT', filters='G395H')"""
+        nirspec = [o for o in self.OBS if o["instrument_name"] == "NIRSPEC/SLIT"]
+        with patch.object(self.mast, "search_jwst_observations", return_value=nirspec) as s, \
+             patch.object(self.mast, "get_observation_products", side_effect=self._products), \
+             patch.object(self.mast, "download_mast_product", side_effect=self._fake_download):
+            out = self._tool(proposal_id="1366", planet_name="WASP-39b",
+                             instruments="NIRSPEC/SLIT", filters="G395H",
+                             dataproduct_types=["timeseries"], raw_only=True)._run()
+        kw = s.call_args.kwargs
+        self.assertEqual(s.call_args.args[0], "WASP-39b")
+        self.assertEqual(kw["proposal_id"], "1366")
+        self.assertEqual(kw["instruments"], "NIRSPEC/SLIT")
+        files = self._downloaded()
+        self.assertEqual(len(files), 8)
+        self.assertTrue(all("jw01366004" in f for f in files))     # PRISM dropped
+        self.assertTrue(all(f.startswith(
+            "mast/WASP-39b/jw01366-o004_t001_nirspec_f290lp-g395h") for f in files))
+        self.assertIn("Files downloaded: 8", out)
+        self.assertNotIn("NOTE: ran in", out)   # planet+proposal is ONE query
+
+    def test_proposal_only_downloads_whole_program_named_by_obs_id(self):
+        with patch.object(self.mast, "search_all_jwst_observations",
+                          return_value=(self.OBS, [])) as s, \
+             patch.object(self.mast, "get_observation_products", side_effect=self._products), \
+             patch.object(self.mast, "download_mast_product", side_effect=self._fake_download):
+            out = self._tool(proposal_id="1366", filters=["G395H"], raw_only=True,
+                             visits=[2])._run()
+        self.assertEqual(s.call_args.kwargs["proposal_id"], "1366")
+        files = self._downloaded()
+        self.assertEqual(len(files), 4)
+        self.assertTrue(all(f.startswith("mast/program_1366/jw01366-o004") for f in files))
+        self.assertTrue(all("jw01366004002_" in f for f in files))
+        self.assertIn("Visits selected: ['jw01366004002']", out)
+        manifest = json.loads((pathlib.Path(self.tmp) / "mast/program_1366/manifest.json").read_text())
+        self.assertEqual(manifest["visits_available"], ["jw01366004001", "jw01366004002"])
+
+    def test_list_only_with_visits_downloads_nothing(self):
+        with patch.object(self.mast, "search_all_jwst_observations",
+                          return_value=(self.OBS, [])), \
+             patch.object(self.mast, "get_observation_products", side_effect=self._products), \
+             patch.object(self.mast, "download_mast_product") as dl:
+            out = self._tool(proposal_id="1366", filters="G395H", raw_only=True,
+                             visits="[1]", list_only="true")._run()
+        dl.assert_not_called()
+        self.assertIn("LIST ONLY", out)
+        self.assertIn("jw01366004001_04101_00001-seg001_nrs1_uncal.fits", out)
+        self.assertNotIn("jw01366004002", out.split("Visits available")[0])
+        self.assertIn("Visits selected:  ['jw01366004001']", out)
+
+    def test_obsids_mode_supports_visits(self):
+        with patch.object(self.mast, "get_observation_products", side_effect=self._products), \
+             patch.object(self.mast, "download_mast_product", side_effect=self._fake_download):
+            self._tool(obsids=["2"], visits=["jw01366004001"], raw_only=True)._run()
+        files = self._downloaded()
+        self.assertEqual(len(files), 4)
+        self.assertTrue(all(f.startswith("mast/aggregate/2/jw01366004001_") for f in files))
+
+    def test_guards(self):
+        with self.assertRaisesRegex(ValueError, "program number"):
+            self._tool(proposal_id="ERS-1366")._run()
+        pathlib.Path(self.tmp, "x.csv").write_text("pl_name,obsid\nA b,2\n")
+        with self.assertRaisesRegex(ValueError, "visits is not supported with rows_path"):
+            self._tool(rows_path="x.csv", visits=[1])._run()
+        with patch.object(self.mast, "search_all_jwst_observations", return_value=(self.OBS, [])):
+            out = self._tool(proposal_id="1366", filters="G395M")._run()
+        self.assertIn("No JWST observations found for program 1366", out)
+
+    def test_filters_ignored_outside_query_mode_is_reported(self):
+        with patch.object(self.mast, "download_observations_products",
+                          return_value={"label": "aggregate", "obsids": ["2"], "downloaded": []}):
+            out = self._tool(obsids=["2"], filters=["G395H"])._run()
+        self.assertIn("ignored filters", out)
+
+    def test_search_tool_filters_by_grating(self):
+        with patch.object(self.mast, "search_all_jwst_observations",
+                          return_value=(self.OBS, [])):
+            out = _construct_tool(self.mast.SearchMastJwstObservations,
+                                  proposal_id="1366", filters=["G395H"],
+                                  base_directory=self.tmp)._run()
+        self.assertIn("Found 1 JWST observation", out)
+        self.assertIn("F290LP;G395H", out)
+        self.assertIn("filters (client-side)", out)
+
+    def test_no_exotedrf_or_astroquery_import(self):
+        """exoTEDRF lives in its own pinned env (numpy<2, jwst 1.17.1) and
+        astroquery is not an ASTER dependency: the capability is native."""
+        src = MAST_PATH.read_text()
+        self.assertNotIn("import exotedrf", src)
+        self.assertNotIn("from exotedrf", src)
+        self.assertNotIn("astroquery.mast import", src)
