@@ -43,6 +43,16 @@ from typing import Any
 try:
     from orchestral.tools.base.tool import BaseTool
     from orchestral.tools.base.field_utils import RuntimeField, StateField
+    from pydantic import Field as _PydanticField
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        """LLM-visible OPTIONAL field. orchestral marks RuntimeField(default=None)
+        as REQUIRED; a default_factory is the only way to declare optional-None
+        (same helper as data_acquisition/mast.py)."""
+        kwargs.pop("default", None)
+        return _PydanticField(json_schema_extra={"runtime": True},
+                              default_factory=lambda: None,
+                              description=description, **kwargs)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps plain reduction wrappers importable without Orchestral."""
@@ -52,6 +62,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
 
 
 DEFAULT_EXOTEDRF_PYTHON = "/opt/anaconda3/envs/exotedrf/bin/python"
@@ -860,37 +873,23 @@ def _format_reduction_manifest(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-class InspectNirspecG395hUncalData(BaseTool):
-    """
-    Inventory raw JWST NIRSpec/G395H uncal files for one observation
-    before reduction. (Header logic is generic JWST, but the Patchwork
-    workflow and downstream reduction are G395H-specific.)
+def _float_or_none(value: Any) -> float | None:
+    """'' / None -> None; '3250' -> 3250.0 (LLMs stuff strings into numerics)."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return float(value)
 
-    Reports, per detector (NRS1/NRS2), which exposure segments are present
-    versus expected (EXSEGNUM / EXSEGTOT), plus NINTS, NGROUPS, subarray,
-    and readout pattern.
 
-    ALWAYS run this before ``ReduceNirspecG395hTso``: a missing segment
-    means part of the transit is absent and the reduction, while it will
-    run, is not usable for science.
-
-    Example
-    -------
-        InspectNirspecG395hUncalData(
-            input_dir="mast/jwst_raw/GJ_1214_b/jw01185-o018_t009_nirspec_f290lp-g395h-s1600a1-sub2048"
-        )
-    """
-
-    input_dir: str = RuntimeField(
-        description="Directory containing *_uncal.fits files for ONE observation."
-    )
-    base_directory: str = StateField()
-
-    def _run(self) -> str:
-        path = self.input_dir
-        if not os.path.isabs(path):
-            path = os.path.join(self.base_directory, path)
-        return _format_inspection(inspect_uncal_directory(path))
+def _stages_or_none(value: Any) -> list[int] | None:
+    """None / '' -> None (default stages); '[3]' or [3] -> [3]."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str):
+        import ast
+        value = ast.literal_eval(value)
+    if isinstance(value, (int, float)):
+        value = [value]
+    return [int(v) for v in value]
 
 
 class ReduceNirspecG395hTso(BaseTool):
@@ -900,6 +899,14 @@ class ReduceNirspecG395hTso(BaseTool):
     stellar spectra. This tool is G395H-specific — the frozen config
     assumes the SUB2048 subarray, NRSRAPID readout, and NRS1/NRS2
     detectors. Do not point it at SOSS/MIRI/NIRCam data.
+
+    Segment preflight (built in — there is no separate inspection tool):
+    every call first inventories the uncal headers in ``input_dir`` per
+    detector (EXSEGNUM/EXSEGTOT segments present vs expected, NINTS,
+    NGROUPS, subarray, readout, truncated files) and prints it at the top
+    of the result. A missing segment means part of the transit is absent:
+    the reduction still runs, but the output is NOT usable for science.
+    Use ``inspect_only=True`` to get just the inventory without reducing.
 
     Runs exoTEDRF Stages 1-3 (superbias, group-level 1/f destriping, jump
     detection, ramp fitting, WCS/wavelength calibration, bad-pixel cleanup,
@@ -935,28 +942,30 @@ class ReduceNirspecG395hTso(BaseTool):
     input_dir: str = RuntimeField(
         description="Directory with the *_uncal.fits segments of ONE observation."
     )
-    output_dir: str = RuntimeField(
-        description="Directory for reduction outputs (created if missing)."
+    output_dir: str | None = OptionalRuntimeField(
+        description="Directory for reduction outputs (created if missing). "
+                    "Required unless inspect_only=True."
+    )
+    inspect_only: bool = RuntimeField(
+        default=False,
+        description="If True, only report the segment/header inventory of "
+                    "input_dir and do not reduce.",
     )
     detectors: list | str = RuntimeField(
         default=["NRS1", "NRS2"],
         description="Detectors to reduce: ['NRS1'], ['NRS2'], or both.",
     )
-    stages: list | None = RuntimeField(
-        default=None,
+    stages: list | str | None = OptionalRuntimeField(
         description="Pipeline stages to run, default [1, 2, 3]. Rerunning with "
                     "[3] reuses existing Stage 2 outputs.",
     )
-    st_teff: float | None = RuntimeField(
-        default=None,
+    st_teff: float | str | None = OptionalRuntimeField(
         description="Stellar Teff in K (wavelength-calibration refinement; optional).",
     )
-    st_logg: float | None = RuntimeField(
-        default=None,
+    st_logg: float | str | None = OptionalRuntimeField(
         description="Stellar log g (optional).",
     )
-    st_met: float | None = RuntimeField(
-        default=None,
+    st_met: float | str | None = OptionalRuntimeField(
         description="Stellar [Fe/H] (optional).",
     )
     planet_letter: str = RuntimeField(
@@ -969,7 +978,28 @@ class ReduceNirspecG395hTso(BaseTool):
         input_dir = self.input_dir
         if not os.path.isabs(input_dir):
             input_dir = os.path.join(self.base_directory, input_dir)
+
+        inventory = inspect_uncal_directory(input_dir)
+        inventory_text = _format_inspection(inventory)
+        if self.inspect_only:
+            return inventory_text
+        incomplete = [
+            det for det, entry in inventory["detectors"].items()
+            if not entry.get("complete")
+        ]
+        if incomplete:
+            inventory_text = (
+                "WARNING: incomplete or unverifiable segment set on "
+                f"{', '.join(sorted(incomplete))} — this reduction is NOT "
+                "science-usable.\n" + inventory_text
+            )
+
         output_dir = self.output_dir
+        if not output_dir:
+            raise ValueError(
+                "output_dir is required to reduce (or pass inspect_only=True "
+                "to just inventory the uncal files).\n\n" + inventory_text
+            )
         if not os.path.isabs(output_dir):
             output_dir = os.path.join(self.base_directory, output_dir)
 
@@ -986,13 +1016,13 @@ class ReduceNirspecG395hTso(BaseTool):
             input_dir,
             output_dir,
             detectors=list(detectors),
-            stages=self.stages,
-            st_teff=self.st_teff,
-            st_logg=self.st_logg,
-            st_met=self.st_met,
+            stages=_stages_or_none(self.stages),
+            st_teff=_float_or_none(self.st_teff),
+            st_logg=_float_or_none(self.st_logg),
+            st_met=_float_or_none(self.st_met),
             planet_letter=self.planet_letter,
         )
-        return _format_reduction_manifest(manifest)
+        return inventory_text + "\n\n" + _format_reduction_manifest(manifest)
 
 
 class VerifyPatchworkEnvironment(BaseTool):
@@ -1016,6 +1046,11 @@ class VerifyPatchworkEnvironment(BaseTool):
     Fixes for anything reported are in
     ``scripts/patchwork/patch_exotedrf_env.py``.
 
+    Also reports the OPTIONAL stellar-contamination backends importable in
+    the ASTER environment — SPOTROD (occulted spots), stctm (unocculted
+    contamination retrieval), SAGE (forward models). None is required;
+    check this before promising a referee a SPOTROD/stctm comparison.
+
     Example
     -------
         VerifyPatchworkEnvironment()
@@ -1027,8 +1062,15 @@ class VerifyPatchworkEnvironment(BaseTool):
         try:
             report = verify_exotedrf_environment()
         except FileNotFoundError as exc:
-            return f"Cannot locate the exoTEDRF interpreter.\n{exc}"
-        return format_environment_report(report)
+            text = f"Cannot locate the exoTEDRF interpreter.\n{exc}"
+        else:
+            text = format_environment_report(report)
+        try:
+            from .contamination import format_contamination_backends
+            text += "\n\n" + format_contamination_backends()
+        except Exception as exc:  # never let the optional probe mask the gate
+            text += f"\n\n(Contamination-backend probe failed: {exc})"
+        return text
 
 
 class MakeUncalTestSubset(BaseTool):

@@ -8,34 +8,27 @@ _EXPORTS = {
     'SetTaurexPaths': '.taurex.set_paths',
     'SimulateTaurexRetrieval': '.taurex.retrieval',
     'PlotCornerPosteriors': '.taurex.corner_plot',
-    'GetExoplanetParameters': '.data_acquisition.exoarchive',
+    'QueryExoplanetArchive': '.data_acquisition.exoarchive',
     'DownloadDataset': '.data_acquisition.exoarchive',
-    'FindExoplanetsByCondition': '.data_acquisition.exoarchive',
     'SearchMastJwstObservations': '.data_acquisition.mast',
-    'GetMastObservationProducts': '.data_acquisition.mast',
     'DownloadMastJwstProducts': '.data_acquisition.mast',
     'CrossmatchJwstToPlanets': '.data_acquisition.mast',
     'AggregateJwstObservations': '.data_acquisition.mast',
-    'DownloadDemographicJwstProducts': '.data_acquisition.mast',
     'GetJwstProgramInfo': '.data_acquisition.mast',
     'DiscoverPatchworkVisits': '.data_reduction.discover',
     'VerifyPatchworkEnvironment': '.data_reduction.exotedrf',
-    'InspectNirspecG395hUncalData': '.data_reduction.exotedrf',
     'ReduceNirspecG395hTso': '.data_reduction.exotedrf',
     'MakeUncalTestSubset': '.data_reduction.exotedrf',
-    'DetectNirspecTiltEvents': '.data_reduction.lightcurves',
     'DetectTiltEvents': '.data_reduction.lightcurves',
     'FitNirspecG395hWhiteLight': '.data_reduction.juliet',
     'FitNirspecG395hTransmissionSpectrum': '.data_reduction.juliet',
     'CombineNirspecG395hVisits': '.data_reduction.juliet',
     'DetectLightCurveAnomalies': '.data_reduction.contamination',
     'ModelStellarContamination': '.data_reduction.contamination',
-    'VerifyContaminationBackends': '.data_reduction.contamination',
     'RunPatchworkTarget': '.data_reduction.survey',
-    'GeneratePatchworkFirJob': '.data_reduction.survey',
+    'GenerateFirJobs': '.data_reduction.survey',
     'OptimizeNirspecG395hReduction': '.data_reduction.optimize',
     'SummarizeG395hOptimization': '.data_reduction.optimize',
-    'GenerateFirOptimizerJobs': '.data_reduction.optimize',
 }
 
 __all__ = [
@@ -43,34 +36,27 @@ __all__ = [
     'SetTaurexPaths',
     'SimulateTaurexRetrieval',
     'PlotCornerPosteriors',
-    'GetExoplanetParameters',
+    'QueryExoplanetArchive',
     'DownloadDataset',
-    'FindExoplanetsByCondition',
     'SearchMastJwstObservations',
-    'GetMastObservationProducts',
     'DownloadMastJwstProducts',
     'CrossmatchJwstToPlanets',
     'AggregateJwstObservations',
-    'DownloadDemographicJwstProducts',
     'GetJwstProgramInfo',
     'DiscoverPatchworkVisits',
     'VerifyPatchworkEnvironment',
-    'InspectNirspecG395hUncalData',
     'ReduceNirspecG395hTso',
     'MakeUncalTestSubset',
-    'DetectNirspecTiltEvents',
     'DetectTiltEvents',
     'FitNirspecG395hWhiteLight',
     'FitNirspecG395hTransmissionSpectrum',
     'CombineNirspecG395hVisits',
     'DetectLightCurveAnomalies',
     'ModelStellarContamination',
-    'VerifyContaminationBackends',
     'RunPatchworkTarget',
-    'GeneratePatchworkFirJob',
+    'GenerateFirJobs',
     'OptimizeNirspecG395hReduction',
     'SummarizeG395hOptimization',
-    'GenerateFirOptimizerJobs',
 ]
 
 
@@ -85,21 +71,3 @@ def __getattr__(name):
     value = getattr(module, name)
     globals()[name] = value
     return value
-
-# from .taurex_tools import (
-#     SimulateTaurexSpectrum,
-#     SimulateTaurexRetrieval,
-#     CheckTaurexOpacityCiaPaths,
-#     PlotCornerPosteriors,
-# )
-# from .exoplanet_tools import GetExoplanetParameters
-# from .data_tools import DownloadDataset
-
-# __all__ = [
-#     "SimulateTaurexSpectrum",
-#     "SimulateTaurexRetrieval",
-#     "CheckTaurexOpacityCiaPaths",
-#     "PlotCornerPosteriors",
-#     "GetExoplanetParameters",
-#     "DownloadDataset",
-# ]

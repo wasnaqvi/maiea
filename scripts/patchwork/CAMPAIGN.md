@@ -94,7 +94,7 @@ Stellar contamination — fit v1.3 (referee feedback 2026-08-03):
   moves a depth ~20 ppm, below the channel errors. Quote ε(λ) and the
   f_het upper limit, never f_het alone (it is degenerate with T_het).
 - `spotrod` / `stctm` / `sage` are optional cross-check backends only.
-  `VerifyContaminationBackends` reports what is importable; nothing in
+  `VerifyPatchworkEnvironment` reports what is importable; nothing in
   the survey path needs them.
 
 Tilt events — rewritten (also fit v1.3, Stage 4 → 1.2):
@@ -123,7 +123,7 @@ Tilt events — rewritten (also fit v1.3, Stage 4 → 1.2):
 - Rate guard: tilt events are rare (~1/day → ~0.2 per visit). Several
   detections in one visit raises `tilt_handling.rate_warning` instead of
   quietly fitting a step per false positive.
-- Tool renamed `DetectTiltEvents` (`DetectNirspecTiltEvents` still works).
+- Tool renamed `DetectTiltEvents` (the old name has since been retired).
   Pass `reduction_dir` to it or its answer is the weak one.
 
 ## 1. One-time setup on Fir (before anything)

@@ -11,6 +11,15 @@ from tqdm import tqdm
 try:
     from orchestral.tools.base.tool import BaseTool
     from orchestral.tools.base.field_utils import RuntimeField, StateField
+    from pydantic import Field as _PydanticField
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        """LLM-visible OPTIONAL field (see mast.py: orchestral treats
+        RuntimeField(default=None) as REQUIRED)."""
+        kwargs.pop("default", None)
+        return _PydanticField(json_schema_extra={"runtime": True},
+                              default_factory=lambda: None,
+                              description=description, **kwargs)
 except ModuleNotFoundError:
     # Fallback so the pure query helpers (get_exoplanet_params_tap,
     # find_exoplanets_by_condition) stay importable/testable without the full
@@ -24,6 +33,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):  # type: ignore[misc]
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):  # type: ignore[misc]
+        return None
 
 
 def process_wgets_file(base_directory, wgets_file_path: str, data_path: str) -> None:
@@ -294,255 +306,177 @@ def find_exoplanets_by_condition(conditions: list[str] | str, return_columns: li
     return results
 
 
-class FindExoplanetsByCondition(BaseTool):
+_ARCHIVE_TABLES = ("pscomppars", "ps")
+
+_PLANET_DEFAULT_COLUMNS = ["pl_radj", "pl_bmassj", "pl_eqt"]
+
+# Parameter display mapping for single-planet results (column -> (label, unit)).
+_PARAM_LABELS = {
+    'pl_name': ('Planet Name', ''),
+    'pl_radj': ('Planet Radius', 'RJup'),
+    'pl_rade': ('Planet Radius', 'REarth'),
+    'pl_bmassj': ('Planet Mass', 'MJup'),
+    'pl_bmasse': ('Planet Mass', 'MEarth'),
+    'pl_eqt': ('Equilibrium Temp', 'K'),
+    'pl_orbper': ('Orbital Period', 'days'),
+    'pl_orbsmax': ('Semi-major Axis', 'AU'),
+    'hostname': ('Star Name', ''),
+    'st_rad': ('Star Radius', 'Rsun'),
+    'st_teff': ('Star Temp', 'K'),
+    'st_mass': ('Star Mass', 'Msun'),
+    'st_met': ('Stellar Metallicity', 'dex'),
+    'st_logg': ('Stellar log(g)', 'log10(cm/s^2)'),
+}
+
+
+def _as_str_list(value) -> list[str]:
+    """Coerce LLM-supplied list-ish input ('a', "['a','b']", ['a']) to list[str]."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text[0] in "[(" and text[-1] in "])":
+            import ast
+            try:
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                return [text]
+            if isinstance(parsed, (list, tuple)):
+                return [str(v) for v in parsed if str(v).strip()]
+        return [text]
+    return [str(v) for v in value if str(v).strip()]
+
+
+def _format_planet_parameters(planet_name: str, result: dict) -> str:
+    output = f"Parameters for {planet_name}:\n\n"
+    for param, value in result.items():
+        label, unit = _PARAM_LABELS.get(param, (param, ''))
+        try:
+            formatted = f"{float(value):.5g}"
+        except (ValueError, TypeError):
+            formatted = value
+        output += f"  {label}: {formatted} {unit}".rstrip() + "\n"
+    return output
+
+
+class QueryExoplanetArchive(BaseTool):
     """
-    Find a LIST of planets/systems matching physical criteria (NASA Exoplanet Archive TAP).
+    The ONE tool for the NASA Exoplanet Archive parameter tables (TAP):
+    one named planet's parameters, or a list of planets matching criteria.
 
-    USE WHEN: the user wants every planet satisfying conditions — "sub-Neptunes
-    within 50 pc", "planets with Teq > 1000 K in multi-planet systems". Returns
-    many rows.
+    USE WHEN:
+      * a named planet's / host star's measured properties — radius, mass,
+        Teq, period, a, st_teff, st_logg, st_met... → pass ``planet_name``.
+      * every planet satisfying conditions — "sub-Neptunes within 50 pc",
+        "Teq > 1000 K in multi-planet systems" → pass ``conditions``.
 
-    NOT FOR: a single named planet's parameters (use `GetExoplanetParameters`),
-    or anything about JWST observations/instruments/programs (use the MAST tools).
+    NOT FOR: "who observed X", instruments, JWST programs/PIs/cycles — the
+    archive parameter tables have no observation logs. Route those to
+    `SearchMastJwstObservations` / `GetJwstProgramInfo`. To join JWST
+    observations to a planet population, use `CrossmatchJwstToPlanets`.
 
-    Query the NASA Exoplanet Archive using the TAP (Table Access Protocol) service to retrieve exoplanets or planetary systems that satisfy user-defined conditions.
+    Modes (supply exactly one of ``planet_name`` / ``conditions``)
+    -------------------------------------------------------------
+    * ``planet_name`` — exact archive name ('GJ 9827 d', 'WASP-39 b').
+      ``columns`` defaults to ['pl_radj', 'pl_bmassj', 'pl_eqt'].
+    * ``conditions`` — ADQL WHERE expressions combined with AND, e.g.
+      ["pl_bmassj > 0.3", "pl_eqt > 1000", "discoverymethod = 'Transit'"]
+      (quote strings; numbers unquoted). ``columns`` defaults to ['pl_name'];
+      ``distinct`` and ``limit`` apply.
 
-    This tool enables flexible, condition-based searches over the Exoplanet Archive by allowing users to specify one or more constraints using ADQL (Astronomical Data Query Language) syntax. 
+    Common columns: pl_name, hostname, pl_orbper [d], pl_orbsmax [AU],
+    pl_rade / pl_radj, pl_bmasse / pl_bmassj, pl_eqt [K], st_rad [Rsun],
+    st_teff [K], st_mass [Msun], st_met [dex], st_logg, sy_dist [pc],
+    sy_pnum. Full list: https://exoplanetarchive.ipac.caltech.edu/docs/API_PS_columns.html
 
-    The query is constructed dynamically as:
+    ``table`` accepts ONLY 'pscomppars' (default; composite, may not be
+    self-consistent) or 'ps' (all parameter sets). Never a file path.
 
-        SELECT [DISTINCT] <column_1>, <column_2>, ...
-        FROM <table>
-        WHERE <condition_1> AND <condition_2> AND ...
+    Cite the NASA Exoplanet Archive if results are used in research.
 
-    Key Features:
-    - Supports ADQL WHERE conditions
-    - Allows filtering on planetary system parameters
-    - Can return one or more valid columns, including planet names, host names, or physical parameters
-    - Supports optional deduplication via DISTINCT
-    - Supports limiting result size for performance
-
-    Parameters
-    ----------
-    conditions : list[str]
-        A list of ADQL-compatible conditional expressions used in the WHERE clause.
-        Each condition should be a valid SQL/ADQL boolean expression.
-
-        Examples:
-            ["sy_pnum >= 2"]
-            ["pl_eqt > 1000", "pl_bmassj > 0.5"]
-            ["st_teff BETWEEN 5000 AND 6000"]
-            ["discoverymethod = 'Transit'"]
-
-        Multiple conditions are combined using logical AND.
-
-    return_columns : list[str]
-        The columns whose values will be returned from the query.
-
-        Common options include:
-            - "pl_name"   : planet names
-            - "hostname"  : host star / system names
-            - any valid column in the selected table
-
-    table : str
-        The Exoplanet Archive table to query.
-            - "pscomppars" : composite parameters (recommended)
-            - "ps"         : full parameter sets
-
-    distinct : bool
-        If True, duplicate rows across the selected columns are removed using DISTINCT.
-        If False, all matching rows are returned (including duplicates).
-
-        Example:
-            - DISTINCT hostname → unique systems
-            - non-DISTINCT pl_name → all planets (including multiple per system)
-
-    limit : int | None
-        Maximum number of rows to return.
-
-        Useful for avoiding large downloads
-        If None, all matching rows are returned.
-
-    Returns
-    -------
-    str
-        A formatted string listing the matching rows and their requested column values.
-
-    Notes
-    -----
-    - This tool directly exposes ADQL condition strings; malformed queries may result in TAP service errors.
-    - String values in conditions must be quoted: "discoverymethod = 'Transit'"
-    - Numerical comparisons do not require quotes: "pl_eqt > 1000"
-
-    Example Queries
-    ---------------
-    - Systems with multiple planets:
-        conditions = ["sy_pnum >= 2"]
-        return_columns = ["hostname"]
-    
-    - Planets in multi-planet systems with semi-major axis:
-        conditions = ["sy_pnum >= 2"]
-        return_columns = ["pl_name", "pl_orbsmax"]
-    
-    - Hot Jupiter candidates (massive, hot planets):
-        conditions = ["pl_bmassj > 0.3", "pl_eqt > 1000"]
-        return_columns = ["pl_name", "pl_bmassj", "pl_eqt"]
-    
-    - Nearby planetary systems (within 50 pc):
-        conditions = ["sy_dist < 50"]
-        return_columns = ["hostname", "sy_dist"]
-
-    Important
-    ---------
-    Users should cite the NASA Exoplanet Archive if results are used for scientific research.
+    Examples
+    --------
+        QueryExoplanetArchive(planet_name="WASP-39 b",
+                              columns=["pl_radj", "pl_bmassj", "st_teff"])
+        QueryExoplanetArchive(conditions=["sy_pnum >= 2"],
+                              columns=["pl_name", "pl_orbsmax"])
     """
 
-    conditions: list = RuntimeField(
-        description="List of ADQL WHERE conditions, e.g. ['sy_pnum >= 2', 'pl_eqt > 1000']"
+    planet_name: str | None = OptionalRuntimeField(
+        description="Single-planet mode: exact archive name, e.g. 'Kepler-10 b'.",
     )
-    return_columns: list = RuntimeField(
-        description="Columns to return, e.g. ['pl_name', 'pl_orbsmax']"
+    conditions: list | str | None = OptionalRuntimeField(
+        description="List mode: ADQL WHERE conditions, e.g. ['sy_pnum >= 2', 'pl_eqt > 1000'].",
+    )
+    columns: list | str | None = OptionalRuntimeField(
+        description=(
+            "Columns to return. Default ['pl_radj','pl_bmassj','pl_eqt'] "
+            "(planet_name mode) or ['pl_name'] (conditions mode)."
+        ),
     )
     table: str = RuntimeField(
         default="pscomppars",
-        description="TAP table name: 'pscomppars' or 'ps'"
+        description="TAP table: 'pscomppars' (composite) or 'ps' (all parameter sets).",
     )
-    distinct: bool = RuntimeField(
+    distinct: bool | str = RuntimeField(
         default=True,
-        description="Whether to return unique values only"
+        description="conditions mode: return unique rows only.",
     )
-    limit: int | None = RuntimeField( 
-        description="Optional max number of rows to return"
+    limit: int | str | None = OptionalRuntimeField(
+        description="conditions mode: optional max number of rows.",
     )
 
     def _run(self) -> str:
-        matches = find_exoplanets_by_condition(
-            conditions=self.conditions,
-            return_columns=self.return_columns,
-            table=self.table,
-            distinct=self.distinct,
-            limit=self.limit,
-        )
+        planet_name = (self.planet_name or "").strip() or None
+        conditions = _as_str_list(self.conditions)
+        columns = _as_str_list(self.columns)
+        table = (self.table or "pscomppars").strip() or "pscomppars"
+        if table not in _ARCHIVE_TABLES:
+            raise ValueError(
+                f"table must be one of {_ARCHIVE_TABLES}, got {table!r}. "
+                "This tool queries archive tables, not files."
+            )
+        if planet_name and conditions:
+            raise ValueError(
+                "Supply planet_name OR conditions, not both. To filter around "
+                "one planet, add \"pl_name = '<name>'\" to conditions instead."
+            )
+        if not planet_name and not conditions:
+            raise ValueError("Supply planet_name (one planet) or conditions (a list).")
 
+        if planet_name:
+            # ADQL string literal: double any single quote so a name cannot
+            # break out of the WHERE clause.
+            safe_name = planet_name.replace("'", "''")
+            result = get_exoplanet_params_tap(
+                planet_name=safe_name,
+                columns=columns or list(_PLANET_DEFAULT_COLUMNS),
+                table=table,
+            )
+            if result is None:
+                return f"No data found for planet '{planet_name}' in table '{table}'"
+            return _format_planet_parameters(planet_name, result)
+
+        distinct = self.distinct
+        if isinstance(distinct, str):
+            distinct = distinct.strip().lower() not in ("false", "0", "no", "")
+        limit = self.limit
+        if isinstance(limit, str):
+            limit = int(limit) if limit.strip() else None
+        matches = find_exoplanets_by_condition(
+            conditions=conditions,
+            return_columns=columns or ["pl_name"],
+            table=table,
+            distinct=bool(distinct),
+            limit=limit,
+        )
         if not matches:
             return "No matching results found."
-
-        output = "Matching results:\n\n"
+        output = f"Matching results ({len(matches)} rows):\n\n"
         for i, row in enumerate(matches, start=1):
-            line = ", ".join(f"{k}: {v}" for k, v in row.items())
-            output += f"{i}. {line}\n"
-
-        return output
-
-
-class GetExoplanetParameters(BaseTool):
-    """
-    Get one planet/star's physical parameters from the NASA Exoplanet Archive.
-
-    USE WHEN: the user asks for a named planet's measured properties — radius,
-    mass, equilibrium temperature, orbital period, semi-major axis, or its host
-    star's radius/temperature/mass/metallicity.
-
-    NOT FOR: "who observed X", "what instrument", "which JWST program/proposal/PI"
-    — this tool queries a PARAMETER table (pscomppars/ps) with NO observation
-    logs, instruments, or programs. Route those to `SearchMastJwstObservations`
-    or `GetJwstProgramInfo`. For a LIST of planets matching criteria, use
-    `FindExoplanetsByCondition`.
-
-    `table` accepts ONLY 'pscomppars' (default) or 'ps'. Never pass a file path
-    or CSV name. `planet_name` is required and must match the archive exactly
-    (e.g. 'GJ 9827 d', 'WASP-39 b').
-
-    This tool allows programmatic access to exoplanet data from the NASA Exoplanet Archive.
-    Uses the "pscomppars" table by default, which provides composite parameters for confirmed
-    exoplanets combining data from multiple sources. Note that parameters may not be self-consistent
-    as they come from different sources.
-
-    IMPORTANT: Users should cite the archive's DOI if they use any datasets for research.
-    """
-
-    planet_name: str = RuntimeField(
-        description="Name of the exoplanet (e.g., 'Kepler-10 b'), must match exactly with the archive."
-    )
-    columns: list = RuntimeField(
-        default=["pl_radj", "pl_bmassj", "pl_eqt"],
-        # Uncomment below to include orbital parameters for forward modeling:
-        # default=["pl_radj", "pl_bmassj", "pl_eqt", "pl_orbper", "pl_orbsmax"],
-        description="""List of parameter columns to retrieve. Common columns include:
-        - pl_name: Planet name
-        - hostname: Stellar name
-        - pl_orbper: Orbital Period [days]
-        - pl_orbsmax: Semi-major Axis [AU]
-        - pl_rade: Planet Radius [Earth Radii]
-        - pl_radj: Planet Radius [Jupiter Radii]
-        - pl_bmasse: Planet Mass [Earth Masses]
-        - pl_bmassj: Planet Mass [Jupiter Masses]
-        - pl_eqt: Planet Equilibrium Temperature [K]
-        - st_rad: Star Radius [Solar Radii]
-        - st_teff: Star Temperature [K]
-        - st_mass: Star Mass [Solar Masses]
-        - st_met: Stellar Metallicity [dex]
-        - st_logg: Stellar surface gravity [log10(cm/s^2)]
-
-        Full list at: https://exoplanetarchive.ipac.caltech.edu/docs/API_PS_columns.html"""
-    )
-    table: str = RuntimeField(
-        default="pscomppars",
-        description="TAP table name: 'pscomppars' (composite parameters) or 'ps' (all parameter sets)"
-    )
-
-    def _run(self) -> str:
-        """Query NASA Exoplanet Archive and return formatted results."""
-        result = get_exoplanet_params_tap(
-            planet_name=self.planet_name,
-            columns=self.columns,
-            table=self.table
-        )
-
-        if result is None:
-            return f"No data found for planet '{self.planet_name}' in table '{self.table}'"
-
-        # Parameter display mapping (column_name -> (label, unit))
-        param_labels = {
-            # Planet parameters
-            'pl_name': ('Planet Name', ''),
-            'pl_radj': ('Planet Radius', 'RJup'),
-            'pl_rade': ('Planet Radius', 'REarth'),
-            'pl_bmassj': ('Planet Mass', 'MJup'),
-            'pl_bmasse': ('Planet Mass', 'MEarth'),
-            'pl_eqt': ('Equilibrium Temp', 'K'),
-            'pl_orbper': ('Orbital Period', 'days'),
-            'pl_orbsmax': ('Semi-major Axis', 'AU'),
-
-            # Stellar parameters
-            'hostname': ('Star Name', ''),
-            'st_rad': ('Star Radius', 'Rsun'),
-            'st_teff': ('Star Temp', 'K'),
-            'st_mass': ('Star Mass', 'Msun'),
-            'st_met': ('Stellar Metallicity', 'dex'),
-            'st_logg': ('Stellar log(g)', 'log10(cm/s^2)'),
-        }
-
-        # Format output
-        output = f"Parameters for {self.planet_name}:\n\n"
-        for param, value in result.items():
-            if param in param_labels:
-                label, unit = param_labels[param]
-                # Format numeric values with 5 significant figures
-                try:
-                    numeric_value = float(value)
-                    formatted_value = f"{numeric_value:.5g}"
-                except (ValueError, TypeError):
-                    formatted_value = value
-
-                if unit:
-                    output += f"  {label}: {formatted_value} {unit}\n"
-                else:
-                    output += f"  {label}: {formatted_value}\n"
-            else:
-                # Fallback for any column not in our mapping
-                output += f"  {param}: {value}\n"
-
+            output += f"{i}. " + ", ".join(f"{k}: {v}" for k, v in row.items()) + "\n"
         return output
 
 

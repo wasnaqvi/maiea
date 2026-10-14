@@ -17,40 +17,38 @@ then the trigger words, then the "Never use" guardrail.
 
 | User wants…                                                        | Route to | Never use |
 |--------------------------------------------------------------------|----------|-----------|
-| A planet/star's physical params (radius, mass, Teq, period, Teff)  | `GetExoplanetParameters` | not an observation-log tool |
-| A LIST of planets matching criteria (e.g. "sub-Neptunes < 50 pc")  | `FindExoplanetsByCondition` | — |
-| WHO observed a planet / WHAT instrument / WHICH JWST program       | `SearchMastJwstObservations` (per-planet: pass `planet_name`) | never `GetExoplanetParameters` |
-| ALL JWST obs matching filters, no single target (demographics)     | `SearchMastJwstObservations` (omit planet_name/ra/dec) | — |
-| The file list / products for a known `obsid`                       | `GetMastObservationProducts` | — |
-| A program's cycle / PI / title from a `proposal_id`                | `GetJwstProgramInfo` | never `GetExoplanetParameters` |
+| A planet/star's physical params (radius, mass, Teq, period, Teff)  | `QueryExoplanetArchive` (pass `planet_name`) | not an observation-log tool |
+| A LIST of planets matching criteria (e.g. "sub-Neptunes < 50 pc")  | `QueryExoplanetArchive` (pass `conditions`) | — |
+| WHO observed a planet / WHAT instrument / WHICH JWST program       | `SearchMastJwstObservations` (per-planet: pass `planet_name`) | never `QueryExoplanetArchive` |
+| ALL JWST obs matching filters, no single target (demographics)     | `SearchMastJwstObservations` (omit planet_name/ra/dec; writes a rows CSV) | — |
+| A program's cycle / PI / title from a `proposal_id`                | `GetJwstProgramInfo` | never `QueryExoplanetArchive` |
 | Join JWST observations to archive planet params (population study)  | `CrossmatchJwstToPlanets` | — |
-| Count / group observation rows (by instrument, cycle, planet…)     | `AggregateJwstObservations` | — |
+| Count / group observation rows (by instrument, cycle, planet…)     | `AggregateJwstObservations` (`rows_path` = a Search/Crossmatch CSV) | — |
+| LIST the product files of an obsid / planet (no download)          | `DownloadMastJwstProducts(..., list_only=True)` | — |
+| Download JWST FITS — one planet, an obsid list, or a whole CSV      | `DownloadMastJwstProducts` (`planet_name` / `obsids` / `rows_path`) | — |
 | Download reduced transit SPECTRA (from a Firefly wget)             | `DownloadDataset` | not for raw FITS |
-| Download JWST FITS products for one planet or an obsid list        | `DownloadMastJwstProducts` | — |
-| Download FITS across many planets from a crossmatch/aggregate CSV  | `DownloadDemographicJwstProducts` | — |
 | Forward-model a synthetic spectrum                                 | `RunTaurexModelTool` | — |
 | Fit an observed spectrum (retrieval)                               | `SimulateTaurexRetrieval` | needs an `observation_path` |
 
 **Trigger words → tool family.** Any of "observed", "observation", "instrument",
 "NIRSpec / NIRISS / MIRI / NIRCam", "JWST data", "program", "proposal", "PI",
 "cycle" ⇒ a MAST/JWST tool (`SearchMastJwstObservations`, `GetJwstProgramInfo`,
-`GetMastObservationProducts`), NEVER `GetExoplanetParameters` or
-`FindExoplanetsByCondition` — those query a PARAMETER table and contain no
-observation logs, instruments, or programs.
+`DownloadMastJwstProducts`), NEVER `QueryExoplanetArchive` — it queries a
+PARAMETER table and contains no observation logs, instruments, or programs.
 
-**Population / demographics is a 3-step pipeline, not one tool:**
-1. `SearchMastJwstObservations` (demographics mode) → raw observation rows.
-2. `CrossmatchJwstToPlanets` → attach archive planet parameters (+ optional cycle/event type).
-3. `AggregateJwstObservations` → counts / groupings for the final answer.
-Use only the steps the question needs; feed each step's output CSV to the next.
+**Population / demographics pipeline (use only the steps the question needs):**
+1. `SearchMastJwstObservations` (demographics mode) → raw observation rows, saved to CSV.
+2. `CrossmatchJwstToPlanets` → (planet, obs) rows with archive parameters (+ cycle/event type), saved to CSV.
+3. `AggregateJwstObservations(rows_path=<CSV from 1 or 2>)` → counts / groupings.
+4. `DownloadMastJwstProducts(rows_path=<CSV from 1 or 2>)` → files on disk.
 
 **Raw / uncalibrated (UNCAL) JWST data:** `calib_level` is the observation's
 processing stage, NOT a raw-vs-calibrated file filter. JWST science obs are
 almost always calib_level 3, and the raw UNCAL ramps are PRODUCTS under them.
 Never filter `calib_levels=[1]` to get raw data — search without a calib filter,
-then pull UNCAL with `GetMastObservationProducts(obsid, raw_only=True)` or
-`DownloadMastJwstProducts(..., raw_only=True)`. An empty calib_level=1 result
-does NOT mean uncalibrated data is unavailable.
+then `DownloadMastJwstProducts(obsids=..., raw_only=True)` (add `list_only=True`
+to preview). An empty calib_level=1 result does NOT mean uncalibrated data is
+unavailable.
 
 **Before any tool call:** never invent a `table=` value or pass `planet_name=None`.
 If a required arg is missing, ask the user or resolve it with the correct tool —

@@ -649,7 +649,7 @@ class OptimizeNirspecG395hReduction(BaseTool):
     Compute warning: ~50 Stage 1-3 trials — DAYS on a full TSO even with
     the optimizer's stage caching. On the laptop, only ever on a
     MakeUncalTestSubset trim; real runs belong on Fir via
-    ``GenerateFirOptimizerJobs``. Requires the exoTEDRF 'optimizer'
+    ``GenerateFirJobs(job='optimizer')``. Requires the exoTEDRF 'optimizer'
     branch checkout (ASTER_EXOTEDRF_REPO).
 
     Outputs under {output_dir}/{nrs1|nrs2}/: run_optimize.yaml (frozen
@@ -758,98 +758,5 @@ class SummarizeG395hOptimization(BaseTool):
         lines.append(
             "Adoption gate: reduce with overrides AND defaults, fit both, "
             "compare depths before touching the survey config."
-        )
-        return "\n".join(lines)
-
-
-class GenerateFirOptimizerJobs(BaseTool):
-    """
-    Write the SLURM sbatch scripts that run the frozen Patchwork
-    optimizer on DRAC Fir — one job per visit x detector of a target
-    manifest (a sweep is ~50 reductions; visit x detector jobs must
-    never be bundled). Does NOT submit anything.
-
-    Each script activates the ASTER env, points ASTER_EXOTEDRF_PYTHON at
-    the pinned exoTEDRF env and ASTER_EXOTEDRF_REPO at the pulled
-    'optimizer'-branch checkout (the pip release does not ship the
-    optimizer), and invokes ``python -m
-    aster_toolkit.data_reduction.optimize`` for that visit/detector.
-    Default walltime is 3 days; deep targets (K2-18-length visits) need
-    more.
-
-    Example
-    -------
-        GenerateFirOptimizerJobs(
-            manifest_path="patchwork/manifests/GJ_9827_d.json",
-            output_root="/scratch/wasi/patchwork",
-            exotedrf_repo="~/exoTEDRF",
-        )
-    """
-
-    manifest_path: str = RuntimeField(description="Path to the target manifest JSON.")
-    output_root: str = RuntimeField(
-        description="Output root ON FIR (e.g. /scratch/<user>/patchwork)."
-    )
-    visits: str | None = RuntimeField(
-        default=None,
-        description="Comma-separated visit keys; default all in the manifest.",
-    )
-    detectors: str = RuntimeField(
-        default="NRS1,NRS2", description="Comma-separated detectors."
-    )
-    account: str = RuntimeField(default="def-ncowan", description="DRAC allocation.")
-    time: str = RuntimeField(default="3-00:00:00", description="SLURM walltime per job.")
-    cpus: int = RuntimeField(default=16, description="CPUs per task.")
-    mem: str = RuntimeField(default="64G", description="Memory request.")
-    aster_env: str = RuntimeField(
-        default="~/aster/aster-env", description="Fir path to the ASTER venv."
-    )
-    aster_repo: str = RuntimeField(
-        default="~/aster/maiea",
-        description="Fir path to the repo containing aster_toolkit/ "
-                    "(exported as PYTHONPATH).",
-    )
-    python_module: str = RuntimeField(
-        default="python/3.13.2",
-        description="Module providing the python that aster_env was built from.",
-    )
-    exotedrf_python: str = RuntimeField(
-        default="~/bin/exotedrf-python",
-        description="Fir path to the exoTEDRF interpreter (prefer a wrapper "
-                    "that module-loads its own python).",
-    )
-    exotedrf_repo: str = RuntimeField(
-        default="~/exoTEDRF",
-        description="Fir path to the pulled exoTEDRF optimizer-branch checkout.",
-    )
-    base_directory: str = StateField()
-
-    def _run(self) -> str:
-        manifest_path = self.manifest_path
-        if not os.path.isabs(manifest_path):
-            manifest_path = os.path.join(self.base_directory, manifest_path)
-        visits = ([v.strip() for v in self.visits.split(",") if v.strip()]
-                  if self.visits else None)
-        written = write_fir_optimizer_slurm_scripts(
-            manifest_path,
-            self.output_root,
-            visits=visits,
-            detectors=tuple(d.strip().upper() for d in self.detectors.split(",")),
-            account=self.account,
-            time=self.time,
-            cpus=self.cpus,
-            mem=self.mem,
-            aster_env=self.aster_env,
-            aster_repo=self.aster_repo,
-            python_module=self.python_module,
-            exotedrf_python=self.exotedrf_python,
-            exotedrf_repo=self.exotedrf_repo,
-        )
-        lines = [f"Wrote {len(written)} optimizer sbatch script(s):"]
-        lines += [f"  {p}" for p in written]
-        lines.append(
-            "Copy to Fir with the manifest, verify aster_env / "
-            "exotedrf_python / exotedrf_repo paths, then sbatch each. "
-            "After completion: SummarizeG395hOptimization on the cost tables."
         )
         return "\n".join(lines)

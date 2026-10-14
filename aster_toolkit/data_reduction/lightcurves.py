@@ -1191,8 +1191,3 @@ class DetectTiltEvents(BaseTool):
         if report["rate_warning"]:
             lines.append(f"  WARNING: {report['rate_warning']}")
         return "\n".join(lines)
-
-
-# Pre-v1.3 name; the tool now searches the PSF diagnostics rather than
-# the out-of-transit flux alone.
-DetectNirspecTiltEvents = DetectTiltEvents

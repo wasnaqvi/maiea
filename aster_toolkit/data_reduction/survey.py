@@ -60,6 +60,7 @@ except ModuleNotFoundError:
 
 from .exotedrf import (
     CRDS_CONTEXT,
+    OptionalRuntimeField,
     inspect_uncal_directory,
     run_reduction,
 )
@@ -855,7 +856,7 @@ class RunPatchworkTarget(BaseTool):
     Compute warning: the reduce step is HOURS per visit and the fit step
     is hours more. On the laptop use this only on subset data
     (``MakeUncalTestSubset``); full targets belong on Fir via
-    ``GeneratePatchworkFirJob``. Restartable — rerun with a later
+    ``GenerateFirJobs``. Restartable — rerun with a later
     ``steps`` subset to continue from existing on-disk products.
 
     Manifest format (see module docstring): planet_name, planet_letter,
@@ -914,39 +915,78 @@ class RunPatchworkTarget(BaseTool):
         return "\n".join(lines)
 
 
-class GeneratePatchworkFirJob(BaseTool):
+# Per-job-type SLURM resource defaults (walltime, cpus, mem). The optimizer
+# runs ~50 Stage 1-3 trials per visit x detector, hence the longer default.
+FIR_JOB_DEFAULTS = {
+    "patchwork": {"time": "24:00:00", "cpus": 8, "mem": "40G"},
+    "optimizer": {"time": "3-00:00:00", "cpus": 16, "mem": "64G"},
+}
+
+
+class GenerateFirJobs(BaseTool):
     """
-    Write the SLURM sbatch script that runs one Patchwork target
-    end-to-end on the Digital Research Alliance of Canada **Fir** cluster
-    (where the full uncal data and the exoTEDRF/juliet environments
-    live). Does NOT submit anything — copy the manifest + script to Fir,
-    check the environment paths, then ``sbatch`` it yourself.
+    The ONE tool that writes SLURM sbatch scripts for DRAC **Fir** (where
+    the full uncal data and the pinned exoTEDRF/juliet environments live).
+    Does NOT submit anything — copy the manifest + script(s) to Fir, check
+    the environment paths, then ``sbatch`` them yourself.
 
-    The script loads StdEnv/2023 python, activates the ASTER environment
-    (juliet + aster_toolkit), points ASTER_EXOTEDRF_PYTHON at the pinned
-    exoTEDRF environment, sets CRDS and ExoTiC-LD caches on scratch, and
-    invokes ``python -m aster_toolkit.data_reduction.survey``.
+    ``job`` selects what the scripts run:
+      * ``"patchwork"`` (default) — ONE script running the full Patchwork
+        chain for one target (``python -m aster_toolkit.data_reduction.survey``);
+        ``steps`` picks the subset. Defaults: 24:00:00, 8 CPUs, 40G.
+      * ``"optimizer"`` — ONE script PER visit x detector running the frozen
+        Class-2 optimizer sweep (``python -m aster_toolkit.data_reduction.optimize``;
+        ~50 reductions each, so never bundled). ``visits`` / ``detectors``
+        pick the subset; ``exotedrf_repo`` must be the pulled
+        'optimizer'-branch checkout. Defaults: 3-00:00:00, 16 CPUs, 64G.
+        After completion, run ``SummarizeG395hOptimization`` on the cost tables.
 
-    Example
-    -------
-        GeneratePatchworkFirJob(
-            manifest_path="patchwork/GJ_9827_d.json",
-            output_root="/scratch/wasi/patchwork",
-            account="def-ncowan",
-            time="36:00:00",
-        )
+    Every script loads the python module, activates the ASTER env, points
+    ASTER_EXOTEDRF_PYTHON / ASTER_EXOTEDRF_REPO at the exoTEDRF interpreter
+    and checkout, and puts the CRDS (and ExoTiC-LD) caches on scratch.
+    Manifest paths (raw_root, etc.) must be Fir paths.
+
+    Examples
+    --------
+        GenerateFirJobs(manifest_path="patchwork/manifests/GJ_9827_d.json",
+                        output_root="/scratch/wasi/patchwork", time="36:00:00")
+        GenerateFirJobs(job="optimizer",
+                        manifest_path="patchwork/manifests/GJ_9827_d.json",
+                        output_root="/scratch/wasi/patchwork", detectors="NRS1")
     """
 
     manifest_path: str = RuntimeField(description="Path to the target manifest JSON.")
     output_root: str = RuntimeField(
         description="Output root ON FIR (e.g. /scratch/<user>/patchwork)."
     )
+    job: str = RuntimeField(
+        default="patchwork",
+        description="'patchwork' (full target chain, one script) or "
+                    "'optimizer' (one script per visit x detector).",
+    )
+    steps: str = RuntimeField(
+        default="inspect,reduce,fit,combine,contamination",
+        description="job='patchwork' only: comma-separated steps to run.",
+    )
+    visits: str | None = OptionalRuntimeField(
+        description="job='optimizer' only: comma-separated visit keys; default all.",
+    )
+    detectors: str = RuntimeField(
+        default="NRS1,NRS2",
+        description="job='optimizer' only: comma-separated detectors.",
+    )
     account: str = RuntimeField(
         default="def-ncowan", description="DRAC allocation account."
     )
-    time: str = RuntimeField(default="24:00:00", description="SLURM walltime.")
-    cpus: int = RuntimeField(default=8, description="CPUs per task.")
-    mem: str = RuntimeField(default="40G", description="Memory request.")
+    time: str | None = OptionalRuntimeField(
+        description="SLURM walltime; default 24:00:00 (patchwork) or 3-00:00:00 (optimizer).",
+    )
+    cpus: int | str | None = OptionalRuntimeField(
+        description="CPUs per task; default 8 (patchwork) or 16 (optimizer).",
+    )
+    mem: str | None = OptionalRuntimeField(
+        description="Memory request; default 40G (patchwork) or 64G (optimizer).",
+    )
     aster_env: str = RuntimeField(
         default="~/aster/aster-env",
         description="Path on Fir to the venv with juliet and the aster deps.",
@@ -960,46 +1000,69 @@ class GeneratePatchworkFirJob(BaseTool):
         default="python/3.13.2",
         description="Module providing the python that aster_env was built from.",
     )
-    exotedrf_repo: str = RuntimeField(
-        default="~/exoTEDRF",
-        description="Fir path to the exoTEDRF checkout that shadows the "
-                    "installed release (keeps reductions and optimizer sweeps "
-                    "on one stage-code tree).",
-    )
     exotedrf_python: str = RuntimeField(
         default="~/bin/exotedrf-python",
-        description="Path on Fir to the exoTEDRF interpreter. Prefer a wrapper "
-                    "that module-loads its own python, since that env runs a "
-                    "different python version than aster_env.",
+        description="Path on Fir to the exoTEDRF interpreter (prefer a wrapper "
+                    "that module-loads its own python).",
     )
-    steps: str = RuntimeField(
-        default="inspect,reduce,fit,combine,contamination",
-        description="Steps the job should run.",
+    exotedrf_repo: str = RuntimeField(
+        default="~/exoTEDRF",
+        description="Fir path to the exoTEDRF checkout (the 'optimizer' branch "
+                    "for job='optimizer'; it also shadows the release for "
+                    "reductions so both share one stage-code tree).",
     )
     base_directory: str = StateField()
 
     def _run(self) -> str:
+        job = (self.job or "patchwork").strip().lower()
+        if job not in FIR_JOB_DEFAULTS:
+            raise ValueError(f"job must be one of {sorted(FIR_JOB_DEFAULTS)}, got {job!r}.")
+        defaults = FIR_JOB_DEFAULTS[job]
+        time = (self.time or "").strip() or defaults["time"]
+        cpus = int(self.cpus) if str(self.cpus or "").strip() else defaults["cpus"]
+        mem = (self.mem or "").strip() or defaults["mem"]
+
         manifest_path = self.manifest_path
         if not os.path.isabs(manifest_path):
             manifest_path = os.path.join(self.base_directory, manifest_path)
-        path = write_fir_slurm_script(
-            manifest_path,
-            self.output_root,
-            account=self.account,
-            time=self.time,
-            cpus=self.cpus,
-            mem=self.mem,
-            aster_env=self.aster_env,
-            aster_repo=self.aster_repo,
+        common = dict(
+            account=self.account, time=time, cpus=cpus, mem=mem,
+            aster_env=self.aster_env, aster_repo=self.aster_repo,
             python_module=self.python_module,
             exotedrf_python=self.exotedrf_python,
             exotedrf_repo=self.exotedrf_repo,
-            steps=self.steps,
         )
-        return (
-            f"Wrote {path}.\n"
-            "Copy the manifest + this script to Fir, verify aster_env / "
-            "exotedrf_python paths, then submit with: sbatch "
-            f"{os.path.basename(str(path))}\n"
-            "NOTE: manifest paths (raw_root, etc.) must be Fir paths."
+
+        if job == "patchwork":
+            path = write_fir_slurm_script(
+                manifest_path, self.output_root, steps=self.steps, **common
+            )
+            return (
+                f"Wrote {path} (job=patchwork, {time}, {cpus} CPUs, {mem}).\n"
+                "Copy the manifest + this script to Fir, verify aster_env / "
+                "exotedrf_python paths, then submit with: sbatch "
+                f"{os.path.basename(str(path))}\n"
+                "NOTE: manifest paths (raw_root, etc.) must be Fir paths."
+            )
+
+        from .optimize import write_fir_optimizer_slurm_scripts
+
+        visits = ([v.strip() for v in self.visits.split(",") if v.strip()]
+                  if self.visits else None)
+        written = write_fir_optimizer_slurm_scripts(
+            manifest_path,
+            self.output_root,
+            visits=visits,
+            detectors=tuple(d.strip().upper() for d in self.detectors.split(",")
+                            if d.strip()),
+            **common,
         )
+        lines = [f"Wrote {len(written)} optimizer sbatch script(s) "
+                 f"(job=optimizer, {time}, {cpus} CPUs, {mem}):"]
+        lines += [f"  {p}" for p in written]
+        lines.append(
+            "Copy to Fir with the manifest, verify aster_env / "
+            "exotedrf_python / exotedrf_repo paths, then sbatch each. "
+            "After completion: SummarizeG395hOptimization on the cost tables."
+        )
+        return "\n".join(lines)

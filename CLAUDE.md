@@ -79,18 +79,19 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 - `set_paths.py` - `SetTaurexPaths` for configuring opacity/CIA data paths
 
 **Data Acquisition** (`aster_toolkit/data_acquisition/`):
-- `exoarchive.py` - `GetExoplanetParameters` for TAP queries to NASA Exoplanet Archive
-- `exoarchive.py` - `DownloadDataset` for downloading and processing spectra from NASA archive
-- `mast.py` - MAST search/download of raw JWST products, plus `archive_tap_query()` (used by the reduction tools for ephemerides)
+- `exoarchive.py` - `QueryExoplanetArchive` (one planet's parameters via `planet_name`, or a planet list via ADQL `conditions`) and `DownloadDataset` (reduced Firefly spectra)
+- `mast.py` - `SearchMastJwstObservations` (cone or population search; population mode writes its full rows CSV), `DownloadMastJwstProducts` (list or download product files for a `planet_name`, `obsids`, or a `rows_path` CSV; `list_only=True` to preview), `CrossmatchJwstToPlanets`, `AggregateJwstObservations` (groups a rows CSV; never queries MAST), `GetJwstProgramInfo`; plus `archive_tap_query()` (used by the reduction tools for ephemerides)
+
+ASTER exposes 25 tools with one tool per task — when adding a capability, extend the tool that owns the task (a mode or flag) rather than adding an overlapping tool. `tests/scripts/test_tool_consolidation.py` pins the registry.
 
 **Data Reduction** (`aster_toolkit/data_reduction/`) — the Patchwork pipeline:
 - `discover.py` - `DiscoverPatchworkVisits`: index a raw tree, identify planets, write manifests
-- `exotedrf.py` - `ReduceNirspecG395hTso`, `InspectNirspecG395hUncalData`, `VerifyPatchworkEnvironment`, `MakeUncalTestSubset` (Stages 1-3)
-- `lightcurves.py` - `DetectTiltEvents` (Stage 4; pure numpy/astropy. `DetectNirspecTiltEvents` is a back-compat alias)
+- `exotedrf.py` - `ReduceNirspecG395hTso` (always prints the uncal segment inventory first; `inspect_only=True` for just the inventory), `VerifyPatchworkEnvironment` (exoTEDRF preflight + optional contamination backends), `MakeUncalTestSubset` (Stages 1-3)
+- `lightcurves.py` - `DetectTiltEvents` (Stage 4; pure numpy/astropy)
 - `juliet.py` - `FitNirspecG395hWhiteLight`, `FitNirspecG395hTransmissionSpectrum`, `CombineNirspecG395hVisits` (Stages 5-6)
-- `contamination.py` - `DetectLightCurveAnomalies` (Stage 5.5), `ModelStellarContamination` (Stage 6.5), `VerifyContaminationBackends`
-- `survey.py` - `RunPatchworkTarget`, `GeneratePatchworkFirJob` (end-to-end driver)
-- `optimize.py` - `OptimizeNirspecG395hReduction`, `SummarizeG395hOptimization`, `GenerateFirOptimizerJobs`
+- `contamination.py` - `DetectLightCurveAnomalies` (Stage 5.5), `ModelStellarContamination` (Stage 6.5)
+- `survey.py` - `RunPatchworkTarget` (end-to-end driver), `GenerateFirJobs` (Fir sbatch scripts: `job="patchwork"` or `job="optimizer"`)
+- `optimize.py` - `OptimizeNirspecG395hReduction`, `SummarizeG395hOptimization`
 
 ### TauREx Path Configuration
 
@@ -174,9 +175,10 @@ Output files in `workspace/`:
 The `exoarchive.py` module provides access to NASA Exoplanet Archive data:
 
 **Tools**:
-- `GetExoplanetParameters` - TAP queries for planet/star parameters from pscomppars table
-  - Parameters: `planet_name`, `columns` (list of parameter names), `table` (default: "pscomppars")
-  - Returns: Dictionary with requested parameters
+- `QueryExoplanetArchive` - TAP queries against pscomppars / ps
+  - One planet: `planet_name` (+ optional `columns`, default radius/mass/Teq)
+  - A planet list: `conditions` (ADQL WHERE list) + `columns`, `distinct`, `limit`
+  - `table`: "pscomppars" (default) or "ps" only
 
 - `DownloadDataset` - Download and process spectra from NASA archive
   - **Three input methods** (provide only ONE):
@@ -438,7 +440,7 @@ Two limits, both load-bearing:
   targets with NIRISS SOSS overlap).
 
 `spotrod`, `stctm` and `sage` are **optional** cross-check backends,
-probed by `VerifyContaminationBackends` and never imported at module
+reported by `VerifyPatchworkEnvironment` and never imported at module
 scope. Nothing in the survey path requires them.
 
 ### VERIFY PHYSICS, NOT EXIT CODES
@@ -609,13 +611,15 @@ Agent: DownloadDataset(wgets_file_path="wgets.txt")
 
 ### Querying Exoplanet Data
 
-Use `GetExoplanetParameters` tool for programmatic access to archive data:
+Use `QueryExoplanetArchive` for programmatic access to archive data:
 ```python
-# Get planet parameters
-GetExoplanetParameters(
+# One planet's parameters
+QueryExoplanetArchive(
     planet_name="WASP-39 b",
     columns=["pl_radj", "pl_bmassj", "st_rad", "st_teff"]
 )
+# A planet list
+QueryExoplanetArchive(conditions=["sy_pnum >= 2"], columns=["pl_name", "pl_orbsmax"])
 ```
 
 ## Workspace Organization

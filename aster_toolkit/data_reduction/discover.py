@@ -704,7 +704,7 @@ class DiscoverPatchworkVisits(BaseTool):
 
     Run this FIRST on the cluster, before any reduction — the manifests
     it writes are the input to ``RunPatchworkTarget`` /
-    ``GeneratePatchworkFirJob``.
+    ``GenerateFirJobs``.
 
     Example
     -------
@@ -758,6 +758,6 @@ class DiscoverPatchworkVisits(BaseTool):
             )
             report += (
                 "\n\nNext: RunPatchworkTarget (local subset test) or "
-                "GeneratePatchworkFirJob (full run on Fir) per manifest."
+                "GenerateFirJobs (full run on Fir) per manifest."
             )
         return report

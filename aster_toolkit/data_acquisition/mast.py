@@ -1479,9 +1479,10 @@ class SearchMastJwstObservations(BaseTool):
     which JWST program or PI, or wants to discover JWST data for a target or a
     whole population. This is the FIRST step for any observation question.
 
-    NOT FOR: a planet's physical parameters (`GetExoplanetParameters`). It returns
+    NOT FOR: a planet's physical parameters (`QueryExoplanetArchive`). It returns
     observation rows (obsid, instrument, filters, proposal_id, PI) — not files.
-    To get files for an obsid, call `GetMastObservationProducts` next.
+    To list or fetch files for an obsid, call `DownloadMastJwstProducts` next
+    (``list_only=True`` to just list them).
 
     Three modes:
       * **Per-planet cone search** — supply ``planet_name`` (resolved to RA/Dec
@@ -1497,8 +1498,10 @@ class SearchMastJwstObservations(BaseTool):
     Workflow
     --------
     1. Call this tool to discover JWST observations (returns obsid + metadata).
-    2. Pick an obsid of interest and call ``GetMastObservationProducts`` to list files.
-    3. Call ``DownloadMastJwstProducts`` (one-shot) OR fetch specific products directly.
+    2. ``DownloadMastJwstProducts(obsids=..., list_only=True)`` to list files.
+    3. ``DownloadMastJwstProducts`` (same arguments, list_only=False) to fetch them.
+    4. For counts/breakdowns, pass the rows CSV this tool writes to
+       ``AggregateJwstObservations``.
 
     Why coordinate-centered (per-planet mode)
     -----------------------------------------
@@ -1551,15 +1554,21 @@ class SearchMastJwstObservations(BaseTool):
         Do NOT filter ``calib_levels=[1]`` to find raw data. A calib_level-3
         observation still CONTAINS the raw UNCAL ramps as products. To fetch
         them, search WITHOUT a calib_level filter, then call
-        ``GetMastObservationProducts(obsid, raw_only=True)`` (or
-        ``DownloadMastJwstProducts(..., raw_only=True)``). Filtering by
+        ``DownloadMastJwstProducts(obsids=..., raw_only=True)`` (add
+        ``list_only=True`` to preview). Filtering by
         calib_level=1 will return nothing and falsely imply "no raw data exists".
 
     Returns
     -------
-    A line-per-observation summary including obsid, instrument, dataproduct_type,
-    filters, calib_level, proposal_id, and target_name. Use the obsid values
-    with ``GetMastObservationProducts`` or ``DownloadMastJwstProducts``.
+    A line-per-observation summary (first 50 rows) including obsid, instrument,
+    dataproduct_type, filters, calib_level, proposal_id, and target_name. Use
+    the obsid values with ``DownloadMastJwstProducts``.
+
+    The FULL row set is written to CSV — always in demographics mode
+    (auto-named under ``mast/demographics/search_*.csv`` unless ``output_csv``
+    is given), and in cone mode when ``output_csv`` is given. That CSV is the
+    input for ``AggregateJwstObservations`` and for
+    ``DownloadMastJwstProducts(rows_path=...)``.
 
     Examples
     --------
@@ -1620,6 +1629,32 @@ class SearchMastJwstObservations(BaseTool):
             "target_name_filter=True semantics."
         ),
     )
+    output_csv: str | None = OptionalRuntimeField(
+        description=(
+            "Optional CSV path (relative to the workspace) for the full rows. "
+            "Demographics mode always writes one (auto-named if unset)."
+        ),
+    )
+    base_directory: str | None = StateField(default=None)
+
+    def _save_rows(self, rows: list[dict[str, Any]], *, always: bool,
+                   hint_parts: list[Any]) -> str:
+        """Write the full observation rows to CSV; return a result-string line."""
+        output_csv = _clean_str(self.output_csv)
+        if not rows or not self.base_directory or not (always or output_csv):
+            return ""
+        if output_csv:
+            path = Path(self.base_directory) / output_csv
+        else:
+            path = _autoname_csv_path(
+                self.base_directory, kind="search", hint_parts=hint_parts
+            )
+        _write_rows_csv(path, rows)
+        return (
+            f"Full rows ({len(rows)}) written to: {path}\n"
+            "(Count/group them with AggregateJwstObservations(rows_path=...); "
+            "fetch files with DownloadMastJwstProducts(rows_path=...).)\n\n"
+        )
 
     def _run(self) -> str:
         # LLM callers routinely pass "" for unused fields and numbers as
@@ -1647,8 +1682,8 @@ class SearchMastJwstObservations(BaseTool):
                 "nothing. Raw/uncalibrated (UNCAL) data is NOT obtained this way "
                 "— it exists as PRODUCTS under calib_level 2/3 observations. To "
                 "get raw data: re-run this search WITHOUT calib_levels, then call "
-                "GetMastObservationProducts(obsid, raw_only=True) or "
-                "DownloadMastJwstProducts(..., raw_only=True). An empty result "
+                "DownloadMastJwstProducts(obsids=..., raw_only=True) (add "
+                "list_only=True to preview). An empty result "
                 "here does NOT mean uncalibrated data is unavailable."
             )
 
@@ -1677,7 +1712,13 @@ class SearchMastJwstObservations(BaseTool):
                     target_name=target_name,
                 )
                 summary = f"{summary}\n\n{diagnostics}"
-            return summary + raw_note
+            saved = self._save_rows(
+                observations,
+                always=True,
+                hint_parts=[self.instruments, self.dataproduct_types,
+                            self.calib_levels, proposal_id, target_name],
+            )
+            return saved + summary + raw_note
 
         if (ra is None) != (dec is None):
             raise ValueError(
@@ -1707,7 +1748,8 @@ class SearchMastJwstObservations(BaseTool):
             "radius_deg": radius_deg,
         }
         if observations:
-            return _format_observations_summary(
+            saved = self._save_rows(observations, always=False, hint_parts=[])
+            return saved + _format_observations_summary(
                 observations, filters=filters, query_extra=query_extra
             ) + raw_note
 
@@ -1728,248 +1770,16 @@ class SearchMastJwstObservations(BaseTool):
             summary = _format_observations_summary(
                 recovered, filters=filters, query_extra=query_extra
             )
-            return f"{diagnostics}\n\n{summary}{raw_note}"
+            saved = self._save_rows(recovered, always=False, hint_parts=[])
+            return f"{saved}{diagnostics}\n\n{summary}{raw_note}"
         empty_summary = _format_observations_summary(
             [], filters=filters, query_extra=query_extra
         )
         return f"{empty_summary}\n\n{diagnostics}{raw_note}"
 
 
-class GetMastObservationProducts(BaseTool):
-    """
-    List downloadable MAST product files for one JWST observation id (obsid).
-
-    USE WHEN: you already have an `obsid` (from `SearchMastJwstObservations`) and
-    want to see the available files/pipeline stages before downloading.
-
-    NOT FOR: discovering observations (use `SearchMastJwstObservations`) or
-    actually downloading (use `DownloadMastJwstProducts`). Requires a real obsid.
-
-    Workflow
-    --------
-    Call ``SearchMastJwstObservations`` first to obtain obsid values, then
-    invoke this tool to inspect available product files before downloading.
-
-    JWST product subgroups
-    ----------------------
-    Choose ``product_subgroups`` based on the pipeline stage you need:
-
-    Raw (pipeline input):
-        - "UNCAL"     : raw uncalibrated ramps (use ``raw_only=True`` shortcut)
-
-    Stage 1 (countrate):
-        - "RATE"      : countrate per exposure
-        - "RATEINTS"  : countrate per integration (time series)
-
-    Stage 2 (calibrated per-exposure):
-        - "CAL"       : calibrated image / spectrum per exposure
-        - "CALINTS"   : calibrated per integration
-
-    Stage 3 (science-ready):
-        - "X1D"       : extracted 1-D spectrum (per exposure)
-        - "X1DINTS"   : extracted 1-D spectrum per integration (transit/eclipse)
-        - "S2D"       : resampled 2-D spectrum
-        - "S3D"       : IFU spectral cube
-        - "WHTLT"     : white-light curve
-
-    For atmospheric retrievals, prefer ``X1DINTS`` (time-resolved) or ``X1D``.
-    For full-reduction-from-scratch workflows, use ``raw_only=True`` for UNCAL.
-
-    Returns
-    -------
-    A line-per-product summary with subgroup, file size, filename, and dataURI.
-    Pass any dataURI to a download helper to fetch the file.
-
-    Example
-    -------
-        GetMastObservationProducts(obsid="98765", product_subgroups=["X1DINTS"])
-        GetMastObservationProducts(obsid="98765", raw_only=True)  # UNCAL shortcut
-    """
-
-    obsid: str = RuntimeField(
-        description="MAST observation id from a JWST observation search result."
-    )
-    product_subgroups: list | str | None = OptionalRuntimeField(
-        description="Optional JWST product subgroup filters, e.g. ['UNCAL', 'RATEINTS', 'X1DINTS'].",
-    )
-    raw_only: bool | str = RuntimeField(
-        default=False,
-        description="If True, return only raw JWST UNCAL products.",
-    )
-
-    def _run(self) -> str:
-        obsid = _clean_str(self.obsid)
-        if obsid is None:
-            raise ValueError("obsid is required (from a JWST observation search result).")
-        products = get_observation_products(
-            obsid,
-            product_subgroups=self.product_subgroups,
-            raw_only=_as_bool(self.raw_only, "raw_only", default=False),
-        )
-        return _format_products_summary(products)
-
-
-class DownloadMastJwstProducts(BaseTool):
-    """
-    One-shot download of JWST FITS products for ONE planet or an obsid list.
-
-    USE WHEN: the user wants JWST FITS files (X1DINTS, UNCAL, …) for a single
-    target, or for a specific list of obsids.
-
-    NOT FOR: reduced Exoplanet-Archive transit spectra (use `DownloadDataset`),
-    or bulk downloads across many planets from a crossmatch/aggregate CSV (use
-    `DownloadDemographicJwstProducts`).
-
-    Two modes:
-      * **Per-planet** — supply ``planet_name``. Runs search + product listing
-        + download for that target. Writes under
-        ``{base_directory}/{output_dir}/{planet_name}/{obs_id}/`` with a
-        ``manifest.json``.
-      * **Batch by obsid** — supply ``obsids`` (list of MAST obsid strings,
-        typically obtained from a demographics ``SearchMastJwstObservations``
-        call). Writes under ``{base_directory}/{output_dir}/{label}/{obsid}/``
-        with a ``manifest.json``.
-
-    Workflow
-    --------
-    1. (Optional) Use ``SearchMastJwstObservations`` first to preview matches.
-    2. Call this tool with the same filters (or with ``obsids=[...]``) to
-       actually download files.
-    3. Use ``max_observations`` and ``max_products`` to bound download size.
-
-    Important warnings
-    ------------------
-    - Raw JWST UNCAL files are large (several GB per integration set). Always
-      cap with ``max_observations`` and ``max_products`` when using ``raw_only=True``.
-    - For atmospheric retrievals, you usually do NOT need raw data. Filter to
-      ``product_subgroups=['X1DINTS']`` (stage-3 extracted) instead.
-
-    JWST instruments / dataproduct types / subgroups
-    ------------------------------------------------
-    Same vocabulary as ``SearchMastJwstObservations`` and
-    ``GetMastObservationProducts``. See those tools' docstrings for the full enum.
-
-    Returns
-    -------
-    A summary listing observations matched, files downloaded, and local paths
-    of every saved file. Pass any path to retrieval / analysis tools.
-
-    Examples
-    --------
-    Stage-3 extracted spectra (small, retrieval-ready):
-        DownloadMastJwstProducts(
-            planet_name="WASP-39 b",
-            instruments=["NIRSpec"],
-            product_subgroups=["X1DINTS"],
-            max_observations=2,
-        )
-
-    Raw UNCAL for reprocessing (cap aggressively):
-        DownloadMastJwstProducts(
-            planet_name="WASP-39 b",
-            instruments=["NIRSpec"],
-            raw_only=True,
-            max_observations=1,
-            max_products=2,
-        )
-    """
-
-    planet_name: str | None = OptionalRuntimeField(
-        description=(
-            "Exoplanet or host-star target name, e.g. 'WASP-39 b'. Leave None "
-            "when downloading by an explicit ``obsids`` list."
-        ),
-    )
-    obsids: list | str | None = OptionalRuntimeField(
-        description=(
-            "Optional list of MAST obsids to download in batch (e.g. obsids "
-            "from a demographics SearchMastJwstObservations result). When set, "
-            "planet_name / ra / dec / radius_deg are ignored."
-        ),
-    )
-    label: str = RuntimeField(
-        default="aggregate",
-        description="Subdirectory label used in batch (obsids) mode.",
-    )
-    output_dir: str = RuntimeField(
-        default="mast",
-        description="Output directory relative to the ASTER workspace.",
-    )
-    ra: float | str | None = OptionalRuntimeField(
-        description="Right ascension in degrees. Optional if MAST can resolve planet_name.",
-    )
-    dec: float | str | None = OptionalRuntimeField(
-        description="Declination in degrees. Optional if MAST can resolve planet_name.",
-    )
-    radius_deg: float | str = RuntimeField(
-        default=0.02,
-        description="Cone-search radius in degrees.",
-    )
-    instruments: list | str | None = OptionalRuntimeField(
-        description="Optional JWST instrument filters.",
-    )
-    dataproduct_types: list | str | None = OptionalRuntimeField(
-        description="Optional dataproduct filters.",
-    )
-    product_subgroups: list | str | None = OptionalRuntimeField(
-        description="Optional JWST product subgroup filters.",
-    )
-    raw_only: bool | str = RuntimeField(
-        default=False,
-        description="If True, download only raw JWST UNCAL FITS files.",
-    )
-    max_observations: int | str | None = OptionalRuntimeField(
-        description="Optional maximum number of observations to process.",
-    )
-    max_products: int | str | None = OptionalRuntimeField(
-        description="Optional maximum number of products per observation.",
-    )
-    base_directory: str = StateField()
-
-    def _run(self) -> str:
-        # Normalize LLM-supplied args: '' -> None, 'True' -> True, '10' -> 10.
-        planet_name = _clean_str(self.planet_name)
-        label = _clean_str(self.label) or "aggregate"
-        output_dir = _clean_str(self.output_dir) or "mast"
-        raw_only = _as_bool(self.raw_only, "raw_only", default=False)
-        max_observations = _as_int_or_none(self.max_observations, "max_observations")
-        max_products = _as_int_or_none(self.max_products, "max_products")
-        radius_deg = _as_float_or_none(self.radius_deg, "radius_deg")
-        if radius_deg is None:
-            radius_deg = 0.02
-
-        obsids_list = _as_list(self.obsids)
-        if obsids_list:
-            manifest = download_observations_products(
-                obsids_list,
-                os.path.join(self.base_directory, output_dir),
-                product_subgroups=self.product_subgroups,
-                raw_only=raw_only,
-                max_products_per_obs=max_products,
-                label=label,
-            )
-            return _format_download_manifest(manifest)
-
-        if planet_name is None:
-            raise ValueError(
-                "Provide either planet_name (per-planet mode) or obsids "
-                "(batch mode). Both are missing."
-            )
-
-        manifest = download_planet_jwst_products(
-            planet_name,
-            os.path.join(self.base_directory, output_dir),
-            ra=_as_float_or_none(self.ra, "ra"),
-            dec=_as_float_or_none(self.dec, "dec"),
-            radius_deg=radius_deg,
-            instruments=self.instruments,
-            dataproduct_types=self.dataproduct_types,
-            product_subgroups=self.product_subgroups,
-            raw_only=raw_only,
-            max_observations=max_observations,
-            max_products=max_products,
-        )
-        return _format_download_manifest(manifest)
+# (Listing products for an obsid is DownloadMastJwstProducts(list_only=True);
+#  the merged download tool is defined after download_demographic_products.)
 
 
 # -------------------- JWST program info (observing cycle) --------------------
@@ -2311,7 +2121,7 @@ def archive_tap_query(
 
     Used by ``CrossmatchJwstToPlanets`` so mast.py stays standalone (no
     coupling to exoarchive.py / orchestral imports). For richer archive
-    queries use ``FindExoplanetsByCondition`` in exoarchive.py.
+    queries use ``QueryExoplanetArchive`` in exoarchive.py.
     """
     if isinstance(conditions, str):
         conditions = [conditions]
@@ -2791,8 +2601,8 @@ class CrossmatchJwstToPlanets(BaseTool):
 
     NOT FOR: a single target (use `SearchMastJwstObservations`), just counting
     rows you already have (use `AggregateJwstObservations`), or a planet-list
-    with no observations (use `FindExoplanetsByCondition`). Feed the output CSV
-    to `AggregateJwstObservations` or `DownloadDemographicJwstProducts`.
+    with no observations (use `QueryExoplanetArchive`). Feed the output CSV
+    to `AggregateJwstObservations` or `DownloadMastJwstProducts(rows_path=...)`.
 
     Workflow
     --------
@@ -3079,36 +2889,35 @@ class AggregateJwstObservations(BaseTool):
     Group JWST rows by one or more keys and count. (Population pipeline, step 3 of 3.)
 
     USE WHEN: the answer is a count or breakdown — "how many planets per
-    instrument", "observations by cycle". Either aggregates a rows CSV from
-    `CrossmatchJwstToPlanets`, or runs its own demographics search first.
+    instrument", "observations by cycle". Aggregates a rows CSV/JSON that
+    an earlier tool wrote.
 
     NOT FOR: discovering observations (`SearchMastJwstObservations`) or joining
-    to planet params (`CrossmatchJwstToPlanets`).
+    to planet params (`CrossmatchJwstToPlanets`). This tool never queries
+    MAST itself — it only groups rows already on disk.
 
-    Input modes (provide exactly one):
-      * ``rows_path`` — path (relative to ``base_directory``) to a CSV or JSON
-        of rows from an earlier ``CrossmatchJwstToPlanets`` or other dump.
-        Use this to aggregate crossmatched (planet, obs) rows, e.g. to find
-        planets observed with multiple instruments.
-      * MAST filter fields (``instruments``, ``dataproduct_types``,
-        ``calib_levels``, ``proposal_id``, ``target_name``) — tool runs a fresh
-        no-position demographics search and aggregates the raw observation
-        rows (no planet attribution).
+    Input: ``rows_path`` — path (relative to ``base_directory``) to a CSV or
+    JSON of rows from either
+      * ``SearchMastJwstObservations`` (demographics mode always writes its
+        full row set to CSV — raw observation rows, no planet attribution), or
+      * ``CrossmatchJwstToPlanets`` ((planet, obs) rows with archive params).
 
     Useful aggregations
     -------------------
-    * Per instrument:
-        AggregateJwstObservations(
+    * Per instrument (two calls: search writes the CSV, this groups it):
+        SearchMastJwstObservations(
             instruments=['NIRSpec','NIRCam','MIRI','NIRISS'],
             dataproduct_types=['spectrum','timeseries'],
             calib_levels=[3],
+        )   # -> "Full rows written to: mast/demographics/search_....csv"
+        AggregateJwstObservations(
+            rows_path='mast/demographics/search_....csv',
             group_by=['instrument_name'],
         )
 
     * Per instrument × filter:
         AggregateJwstObservations(
-            ... same filters ...
-            group_by=['instrument_name', 'filters'],
+            rows_path=..., group_by=['instrument_name', 'filters'],
         )
 
     * Planets observed with multiple instruments (chain with crossmatch CSV):
@@ -3153,16 +2962,17 @@ class AggregateJwstObservations(BaseTool):
             "each planet when group_by=['pl_name']."
         ),
     )
-    rows_path: str | None = OptionalRuntimeField(
+    rows_path: str = RuntimeField(
         description=(
-            "Path (relative to base_directory) to a CSV or JSON dump of rows "
-            "to aggregate. Mutually exclusive with the MAST filter fields."
+            "Path (relative to base_directory) to the CSV or JSON of rows to "
+            "aggregate — written by SearchMastJwstObservations or "
+            "CrossmatchJwstToPlanets."
         ),
     )
     add_obs_type: bool | str = RuntimeField(
         default=False,
         description=(
-            "rows_path mode only. If True, classify every row as transit / "
+            "If True, classify every row as transit / "
             "eclipse / phase_curve / baseline / unknown from its ephemeris "
             "columns (t_min/t_max vs pl_tranmid/pl_orbper/pl_trandur) before "
             "aggregating, and write the annotated rows to "
@@ -3170,21 +2980,6 @@ class AggregateJwstObservations(BaseTool):
             "automatically (without writing that file) whenever group_by / "
             "distinct_fields request obs_type columns missing from the file."
         ),
-    )
-    instruments: list | str | None = OptionalRuntimeField(
-        description="Demographics-mode JWST instrument filters.",
-    )
-    dataproduct_types: list | str | None = OptionalRuntimeField(
-        description="Demographics-mode dataproduct filters.",
-    )
-    calib_levels: list | str | None = OptionalRuntimeField(
-        description="Demographics-mode MAST calibration levels.",
-    )
-    proposal_id: str | None = OptionalRuntimeField(
-        description="Demographics-mode JWST proposal id filter.",
-    )
-    target_name: str | None = OptionalRuntimeField(
-        description="Demographics-mode free-text target_name filter.",
     )
     output_csv: str | None = OptionalRuntimeField(
         description=(
@@ -3204,60 +2999,54 @@ class AggregateJwstObservations(BaseTool):
             raise ValueError("group_by must contain at least one key.")
 
         rows_path = _clean_str(self.rows_path)
-        target_name = _clean_str(self.target_name)
-        proposal_id = _clean_str(self.proposal_id)
+        if rows_path is None:
+            raise ValueError(
+                "rows_path is required. To count fresh MAST results, first run "
+                "SearchMastJwstObservations (demographics mode writes its full "
+                "rows CSV) or CrossmatchJwstToPlanets, then pass that CSV here."
+            )
         output_csv = _clean_str(self.output_csv)
 
         obs_type_lines: list[str] = []
-        if rows_path:
-            full_path = Path(self.base_directory) / rows_path
-            rows = _read_rows_from_path(full_path)
+        full_path = Path(self.base_directory) / rows_path
+        rows = _read_rows_from_path(full_path)
 
-            obs_type_keys = {
-                "obs_type", "n_transits_in_window",
-                "n_eclipses_in_window", "obs_type_note",
-            }
-            force = _as_bool(self.add_obs_type, "add_obs_type", default=False)
-            requested = (set(group_keys) | set(distinct_keys)) & obs_type_keys
-            needs_annotation = rows and (
-                force or (requested and any(k not in rows[0] for k in requested))
+        obs_type_keys = {
+            "obs_type", "n_transits_in_window",
+            "n_eclipses_in_window", "obs_type_note",
+        }
+        force = _as_bool(self.add_obs_type, "add_obs_type", default=False)
+        requested = (set(group_keys) | set(distinct_keys)) & obs_type_keys
+        needs_annotation = rows and (
+            force or (requested and any(k not in rows[0] for k in requested))
+        )
+        if needs_annotation:
+            classified = annotate_rows_with_event_types(rows)
+            obs_type_lines.append(
+                f"Event classification: {classified}/{len(rows)} rows "
+                "typed (transit/eclipse/phase_curve/baseline); 'unknown' "
+                "rows lack pl_tranmid/pl_orbper — see obs_type_note."
             )
-            if needs_annotation:
-                classified = annotate_rows_with_event_types(rows)
+            notes: dict[str, int] = {}
+            for row in rows:
+                note = row.get("obs_type_note")
+                if note:
+                    notes[str(note)] = notes.get(str(note), 0) + 1
+            if notes:
                 obs_type_lines.append(
-                    f"Event classification: {classified}/{len(rows)} rows "
-                    "typed (transit/eclipse/phase_curve/baseline); 'unknown' "
-                    "rows lack pl_tranmid/pl_orbper — see obs_type_note."
+                    "obs_type_note breakdown (read before trusting "
+                    "eclipse/baseline calls):"
                 )
-                notes: dict[str, int] = {}
-                for row in rows:
-                    note = row.get("obs_type_note")
-                    if note:
-                        notes[str(note)] = notes.get(str(note), 0) + 1
-                if notes:
-                    obs_type_lines.append(
-                        "obs_type_note breakdown (read before trusting "
-                        "eclipse/baseline calls):"
+                obs_type_lines.extend(
+                    f"  - (x{count}) {note}"
+                    for note, count in sorted(
+                        notes.items(), key=lambda kv: -kv[1]
                     )
-                    obs_type_lines.extend(
-                        f"  - (x{count}) {note}"
-                        for note, count in sorted(
-                            notes.items(), key=lambda kv: -kv[1]
-                        )
-                    )
-                if force:
-                    typed_path = full_path.with_name(f"{full_path.stem}_typed.csv")
-                    _write_rows_csv(typed_path, rows)
-                    obs_type_lines.append(f"Annotated rows saved to: {typed_path}")
-        else:
-            observations, _filters = search_all_jwst_observations(
-                instruments=self.instruments,
-                dataproduct_types=self.dataproduct_types,
-                calib_levels=self.calib_levels,
-                target_name=target_name,
-                proposal_id=proposal_id,
-            )
-            rows = observations
+                )
+            if force:
+                typed_path = full_path.with_name(f"{full_path.stem}_typed.csv")
+                _write_rows_csv(typed_path, rows)
+                obs_type_lines.append(f"Annotated rows saved to: {typed_path}")
 
         groups = aggregate_observations(
             rows,
@@ -3271,16 +3060,7 @@ class AggregateJwstObservations(BaseTool):
             csv_path = _autoname_csv_path(
                 self.base_directory,
                 kind="aggregate",
-                hint_parts=[
-                    group_keys,
-                    distinct_keys,
-                    self.instruments,
-                    self.dataproduct_types,
-                    self.calib_levels,
-                    proposal_id,
-                    target_name,
-                    rows_path,
-                ],
+                hint_parts=[group_keys, distinct_keys, rows_path],
             )
         _write_rows_csv(csv_path, groups)
 
@@ -3296,107 +3076,337 @@ class AggregateJwstObservations(BaseTool):
         return summary
 
 
-class DownloadDemographicJwstProducts(BaseTool):
+def _obsids_by_planet(
+    rows: list[dict[str, Any]],
+    *,
+    max_planets: int | None = None,
+    max_obs_per_planet: int | None = None,
+) -> dict[str, list[str]]:
+    """Group the unique obsids of crossmatch rows by planet (first-seen order).
+
+    Rows without a ``pl_name`` / ``planet_name`` column are grouped under the
+    empty key ``""`` so a plain ``SearchMastJwstObservations`` CSV (no planet
+    attribution) still downloads, as one flat batch.
     """
-    Bulk-download JWST products for EVERY planet in a demographic (from a CSV).
+    by_planet: dict[str, list[str]] = {}
+    for row in rows:
+        obsid = row.get("obsid")
+        if obsid in (None, ""):
+            continue
+        pl = row.get("pl_name") or row.get("planet_name") or ""
+        bucket = by_planet.setdefault(str(pl), [])
+        if str(obsid) not in bucket:
+            bucket.append(str(obsid))
+    if max_planets is not None:
+        by_planet = dict(list(by_planet.items())[:max_planets])
+    if max_obs_per_planet is not None:
+        by_planet = {k: v[:max_obs_per_planet] for k, v in by_planet.items()}
+    return by_planet
 
-    USE WHEN: you have a `CrossmatchJwstToPlanets` rows CSV and want to fetch
-    files for all planets in it at once.
 
-    NOT FOR: one planet or a hand-picked obsid list (use
-    `DownloadMastJwstProducts`), or reduced archive spectra (use `DownloadDataset`).
+def _format_product_listing(
+    groups: list[tuple[str, list[str]]],
+    *,
+    product_subgroups: Any,
+    raw_only: bool,
+    max_products: int | None,
+    limit_per_obs: int = 40,
+) -> str:
+    """List (do not download) MAST products for obsids, grouped by a heading."""
+    lines: list[str] = ["LIST ONLY — nothing was downloaded."]
+    total_files = 0
+    total_obs = 0
+    for heading, obsids in groups:
+        if heading:
+            lines.append(f"\n=== {heading} ===")
+        for obsid in obsids:
+            total_obs += 1
+            products = get_observation_products(
+                obsid,
+                product_subgroups=product_subgroups,
+                raw_only=raw_only,
+            )
+            if max_products is not None:
+                products = products[:max_products]
+            total_files += len(products)
+            lines.append(f"\nobsid={obsid}:")
+            lines.append(_format_products_summary(products, limit=limit_per_obs))
+    lines.insert(
+        1,
+        f"Observations listed: {total_obs}; matching product files: {total_files}. "
+        "Re-run with list_only=False (same arguments) to download them.",
+    )
+    return "\n".join(lines)
 
-    Reads a crossmatch dump (the CSV/JSON written by
-    ``CrossmatchJwstToPlanets`` — must contain ``pl_name`` and ``obsid``
-    columns), groups obsids by planet, and downloads each planet's products
-    under ``{base_directory}/{output_dir}/{label}/{pl_name}/{obsid}/*.fits``.
 
-    Per-planet directories contain a ``manifest.json``; a top-level
-    ``demographic_manifest.json`` summarizes the entire run.
+class DownloadMastJwstProducts(BaseTool):
+    """
+    The ONE tool for JWST product FILES on MAST: list them, or download them —
+    for one planet, an obsid list, or every row of a population CSV.
 
-    Why this exists
-    ---------------
-    ``DownloadMastJwstProducts`` either downloads one planet's products
-    (per-planet mode) or one flat obsid bucket (batch mode). Neither lays out
-    the result tree per planet across a whole population. This tool closes
-    that gap so an agent can do:
+    USE WHEN: the user wants to see which FITS products (UNCAL, RATEINTS,
+    X1DINTS, ...) exist for a JWST observation, or wants them on disk.
 
-        CrossmatchJwstToPlanets(...)             # -> crossmatch.csv
-        DownloadDemographicJwstProducts(
-            rows_path='crossmatch.csv',
-            label='warm_hot_jupiters',
-            product_subgroups=['X1DINTS'],
-        )
+    NOT FOR: discovering observations (`SearchMastJwstObservations`), or
+    reduced Exoplanet-Archive transit spectra (`DownloadDataset`).
 
-    Important caps
-    --------------
-    UNCAL ramps are multi-GB per obs. Always cap with one or more of
-    ``max_planets``, ``max_obs_per_planet``, ``max_products_per_obs`` when
-    using ``raw_only=True``.
+    Input — supply ONE of these (precedence if several: rows_path > obsids >
+    planet_name; the ignored ones are reported in the result):
+      * ``planet_name`` — cone-searches MAST for the target (optionally
+        constrained by ``instruments`` / ``dataproduct_types`` / ``ra`` /
+        ``dec`` / ``radius_deg``), then fetches each observation's products.
+        Writes ``{output_dir}/{planet_name}/{obs_id}/`` + ``manifest.json``.
+      * ``obsids`` — explicit MAST obsid list (one obsid is fine). Writes
+        ``{output_dir}/{label}/{obsid}/`` + ``manifest.json``.
+      * ``rows_path`` — a CSV/JSON written by ``CrossmatchJwstToPlanets`` or
+        ``SearchMastJwstObservations`` (needs an ``obsid`` column). Rows with
+        ``pl_name`` are downloaded per planet under
+        ``{output_dir}/{label}/{pl_name}/{obsid}/`` with a per-planet
+        ``manifest.json`` and a top-level ``demographic_manifest.json``;
+        rows without ``pl_name`` download as one flat batch under
+        ``{output_dir}/{label}/{obsid}/``.
 
-    Example
-    -------
-        DownloadDemographicJwstProducts(
-            rows_path='mast/demographics/warm_hot_jupiters_jwst.csv',
-            output_dir='mast/raw',
-            label='warm_hot_jupiters',
-            raw_only=True,
-            max_obs_per_planet=1,
-            max_products_per_obs=2,
-        )
+    ``list_only=True`` lists the matching product files (subgroup, size,
+    filename, dataURI) for the same selection WITHOUT downloading — use it
+    to inspect an obsid's pipeline stages before committing to a download.
+
+    JWST product subgroups (``product_subgroups``)
+    ----------------------------------------------
+        Raw:      "UNCAL" (or ``raw_only=True``)
+        Stage 1:  "RATE", "RATEINTS"
+        Stage 2:  "CAL", "CALINTS"
+        Stage 3:  "X1D", "X1DINTS" (time-resolved spectra), "S2D", "S3D",
+                  "WHTLT" (white-light curve)
+    For retrievals prefer X1DINTS; for re-reduction (Patchwork) use UNCAL.
+
+    Caps (always set them for UNCAL — multi-GB per observation)
+    -----------------------------------------------------------
+      * ``max_planets``      — rows_path mode: number of planets.
+      * ``max_observations`` — observations per planet (planet_name and
+                               rows_path modes) or first N obsids (obsids mode).
+      * ``max_products``     — product files per observation.
+
+    Proprietary (exclusive-access) products are skipped and listed in the
+    manifest rather than aborting the run.
+
+    Examples
+    --------
+        # Inspect one observation's files (replaces the old products-listing tool)
+        DownloadMastJwstProducts(obsids="98765", raw_only=True, list_only=True)
+
+        # Stage-3 spectra for one planet
+        DownloadMastJwstProducts(planet_name="WASP-39 b", instruments=["NIRSpec"],
+                                 product_subgroups=["X1DINTS"], max_observations=2)
+
+        # UNCAL for a whole crossmatched population
+        DownloadMastJwstProducts(rows_path="mast/demographics/subneptunes.csv",
+                                 label="subneptunes", raw_only=True,
+                                 max_observations=1, max_products=2)
     """
 
-    rows_path: str = RuntimeField(
+    planet_name: str | None = OptionalRuntimeField(
+        description="planet_name mode: target name, e.g. 'WASP-39 b'.",
+    )
+    obsids: list | str | None = OptionalRuntimeField(
+        description="obsids mode: one or more MAST obsids, e.g. ['87602456'].",
+    )
+    rows_path: str | None = OptionalRuntimeField(
         description=(
-            "Path (relative to base_directory) to a CSV or JSON dump from "
-            "CrossmatchJwstToPlanets. Must contain pl_name and obsid columns."
+            "rows_path mode: CSV/JSON (relative to the workspace) from "
+            "CrossmatchJwstToPlanets or SearchMastJwstObservations; must have "
+            "an obsid column (pl_name enables the per-planet layout)."
         ),
     )
-    output_dir: str = RuntimeField(
-        default="mast/demographics_raw",
-        description="Output directory relative to base_directory.",
+    list_only: bool | str = RuntimeField(
+        default=False,
+        description="If True, list matching product files without downloading.",
+    )
+    output_dir: str | None = OptionalRuntimeField(
+        description=(
+            "Output directory relative to the workspace. Default 'mast' "
+            "(planet_name / obsids modes) or 'mast/demographics_raw' (rows_path)."
+        ),
     )
     label: str = RuntimeField(
         default="aggregate",
-        description="Subdirectory under output_dir grouping this demographic's downloads.",
+        description="Subdirectory label for obsids and rows_path modes.",
+    )
+    ra: float | str | None = OptionalRuntimeField(
+        description="planet_name mode: RA in degrees if MAST cannot resolve the name.",
+    )
+    dec: float | str | None = OptionalRuntimeField(
+        description="planet_name mode: Dec in degrees if MAST cannot resolve the name.",
+    )
+    radius_deg: float | str = RuntimeField(
+        default=0.02,
+        description="planet_name mode: cone-search radius in degrees.",
+    )
+    instruments: list | str | None = OptionalRuntimeField(
+        description="planet_name mode: JWST instrument filters, e.g. ['NIRSpec'].",
+    )
+    dataproduct_types: list | str | None = OptionalRuntimeField(
+        description="planet_name mode: dataproduct filters, e.g. ['timeseries'].",
     )
     product_subgroups: list | str | None = OptionalRuntimeField(
-        description=(
-            "Optional JWST product subgroup filters, e.g. ['X1DINTS'] for "
-            "stage-3 time-resolved spectra. Leave None to keep all SCIENCE FITS."
-        ),
+        description="JWST product subgroup filters, e.g. ['X1DINTS'] or ['UNCAL'].",
     )
     raw_only: bool | str = RuntimeField(
         default=False,
-        description="If True, download only raw JWST UNCAL FITS files (large).",
+        description="If True, only raw JWST UNCAL files.",
     )
     max_planets: int | str | None = OptionalRuntimeField(
-        description="Optional cap on the number of planets to process.",
+        description="rows_path mode: cap on the number of planets.",
     )
-    max_obs_per_planet: int | str | None = OptionalRuntimeField(
-        description="Optional cap on the number of obsids downloaded per planet.",
+    max_observations: int | str | None = OptionalRuntimeField(
+        description="Cap on observations per planet (or on obsids in obsids mode).",
     )
-    max_products_per_obs: int | str | None = OptionalRuntimeField(
-        description="Optional cap on the number of products per observation.",
+    max_products: int | str | None = OptionalRuntimeField(
+        description="Cap on product files per observation.",
     )
     base_directory: str = StateField()
 
     def _run(self) -> str:
+        # Normalize LLM-supplied args: '' -> None, 'True' -> True, '10' -> 10.
+        planet_name = _clean_str(self.planet_name)
         rows_path = _clean_str(self.rows_path)
-        if rows_path is None:
-            raise ValueError("rows_path is required (CSV/JSON from CrossmatchJwstToPlanets).")
-        rows = _read_rows_from_path(Path(self.base_directory) / rows_path)
-        manifest = download_demographic_products(
-            rows,
-            os.path.join(self.base_directory, _clean_str(self.output_dir) or "mast/demographics_raw"),
-            label=_clean_str(self.label) or "aggregate",
-            product_subgroups=self.product_subgroups,
-            raw_only=_as_bool(self.raw_only, "raw_only", default=False),
-            max_planets=_as_int_or_none(self.max_planets, "max_planets"),
-            max_obs_per_planet=_as_int_or_none(self.max_obs_per_planet, "max_obs_per_planet"),
-            max_products_per_obs=_as_int_or_none(self.max_products_per_obs, "max_products_per_obs"),
+        obsids_list = [o for o in (_as_list(self.obsids) or []) if _clean_str(o)]
+        label = _clean_str(self.label) or "aggregate"
+        list_only = _as_bool(self.list_only, "list_only", default=False)
+        raw_only = _as_bool(self.raw_only, "raw_only", default=False)
+        max_planets = _as_int_or_none(self.max_planets, "max_planets")
+        max_observations = _as_int_or_none(self.max_observations, "max_observations")
+        max_products = _as_int_or_none(self.max_products, "max_products")
+        radius_deg = _as_float_or_none(self.radius_deg, "radius_deg")
+        if radius_deg is None:
+            radius_deg = 0.02
+
+        supplied = [
+            name for name, value in (
+                ("rows_path", rows_path),
+                ("obsids", obsids_list),
+                ("planet_name", planet_name),
+            ) if value
+        ]
+        if not supplied:
+            raise ValueError(
+                "Provide one of rows_path (population CSV), obsids (explicit "
+                "list), or planet_name (single target). All are missing."
+            )
+        mode = supplied[0]
+        note = ""
+        if len(supplied) > 1:
+            note = (
+                f"NOTE: ran in {mode} mode; ignored "
+                f"{', '.join(supplied[1:])} (supply only one input).\n\n"
+            )
+
+        default_dir = "mast/demographics_raw" if mode == "rows_path" else "mast"
+        output_root = os.path.join(
+            self.base_directory, _clean_str(self.output_dir) or default_dir
         )
-        return _format_demographic_summary(manifest)
+
+        if mode == "rows_path":
+            rows = _read_rows_from_path(Path(self.base_directory) / rows_path)
+            if rows and "obsid" not in rows[0]:
+                raise ValueError(
+                    f"{rows_path} has no 'obsid' column (columns: "
+                    f"{sorted(rows[0])[:12]}...). Pass the CSV written by "
+                    "CrossmatchJwstToPlanets or SearchMastJwstObservations."
+                )
+            by_planet = _obsids_by_planet(
+                rows, max_planets=max_planets, max_obs_per_planet=max_observations
+            )
+            if list_only:
+                return note + _format_product_listing(
+                    [(pl or label, ids) for pl, ids in by_planet.items()],
+                    product_subgroups=self.product_subgroups,
+                    raw_only=raw_only,
+                    max_products=max_products,
+                )
+            if set(by_planet) == {""}:
+                manifest = download_observations_products(
+                    by_planet[""],
+                    output_root,
+                    product_subgroups=self.product_subgroups,
+                    raw_only=raw_only,
+                    max_products_per_obs=max_products,
+                    label=label,
+                )
+                return note + _format_download_manifest(manifest)
+            manifest = download_demographic_products(
+                rows,
+                output_root,
+                label=label,
+                product_subgroups=self.product_subgroups,
+                raw_only=raw_only,
+                max_planets=max_planets,
+                max_obs_per_planet=max_observations,
+                max_products_per_obs=max_products,
+            )
+            return note + _format_demographic_summary(manifest)
+
+        if mode == "obsids":
+            if max_observations is not None:
+                obsids_list = obsids_list[:max_observations]
+            if list_only:
+                return note + _format_product_listing(
+                    [("", [str(o) for o in obsids_list])],
+                    product_subgroups=self.product_subgroups,
+                    raw_only=raw_only,
+                    max_products=max_products,
+                )
+            manifest = download_observations_products(
+                obsids_list,
+                output_root,
+                product_subgroups=self.product_subgroups,
+                raw_only=raw_only,
+                max_products_per_obs=max_products,
+                label=label,
+            )
+            return note + _format_download_manifest(manifest)
+
+        # planet_name mode
+        ra = _as_float_or_none(self.ra, "ra")
+        dec = _as_float_or_none(self.dec, "dec")
+        if list_only:
+            observations = search_jwst_observations(
+                planet_name,
+                ra=ra,
+                dec=dec,
+                radius_deg=radius_deg,
+                instruments=self.instruments,
+                dataproduct_types=self.dataproduct_types,
+            )
+            if max_observations is not None:
+                observations = observations[:max_observations]
+            obsids_found = [
+                str(o["obsid"]) for o in observations if o.get("obsid") is not None
+            ]
+            if not obsids_found:
+                return note + (
+                    f"No JWST observations found for {planet_name} with these "
+                    "filters. Run SearchMastJwstObservations for diagnostics."
+                )
+            return note + _format_product_listing(
+                [(planet_name, obsids_found)],
+                product_subgroups=self.product_subgroups,
+                raw_only=raw_only,
+                max_products=max_products,
+            )
+        manifest = download_planet_jwst_products(
+            planet_name,
+            output_root,
+            ra=ra,
+            dec=dec,
+            radius_deg=radius_deg,
+            instruments=self.instruments,
+            dataproduct_types=self.dataproduct_types,
+            product_subgroups=self.product_subgroups,
+            raw_only=raw_only,
+            max_observations=max_observations,
+            max_products=max_products,
+        )
+        return note + _format_download_manifest(manifest)
 
 
 class GetJwstProgramInfo(BaseTool):
@@ -3409,7 +3419,7 @@ class GetJwstProgramInfo(BaseTool):
     and need its cycle, title, PI, or status.
 
     NOT FOR: finding observations (use `SearchMastJwstObservations`) or planet
-    parameters (use `GetExoplanetParameters`). Requires a proposal id, not a
+    parameters (use `QueryExoplanetArchive`). Requires a proposal id, not a
     planet name.
 
     Why this tool exists

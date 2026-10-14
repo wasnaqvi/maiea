@@ -1232,33 +1232,71 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
             self.assertEqual(per_planet["WASP-39 b"]["instrument_name_distinct"], "2")
             self.assertIn("NIRCAM/GRISM", per_planet["WASP-39 b"]["instrument_name_values"])
 
-    def test_aggregate_basetool_demographics_mode(self):
-        Tool = self.mast.AggregateJwstObservations
+    def test_search_csv_feeds_aggregate(self):
+        """Population counts are now Search (writes full rows CSV) ->
+        Aggregate(rows_path). Aggregate never queries MAST itself."""
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(
                 self.mast,
                 "search_all_jwst_observations",
                 return_value=(self.OBSERVATIONS, []),
             ) as call:
-                tool = self._make_tool(
-                    Tool,
-                    group_by=["instrument_name", "filters"],
-                    distinct_fields=None,
-                    rows_path=None,
+                search = self._make_tool(
+                    self.mast.SearchMastJwstObservations,
                     instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
                     dataproduct_types=["spectrum", "timeseries"],
                     calib_levels=[3],
-                    proposal_id=None,
-                    target_name=None,
+                    base_directory=tmpdir,
+                )
+                search_out = search._run()
+            call.assert_called_once()
+            self.assertIn("Full rows (4) written to:", search_out)
+            csvs = list((pathlib.Path(tmpdir) / "mast" / "demographics").glob("search_*.csv"))
+            self.assertEqual(len(csvs), 1)
+
+            with patch.object(self.mast, "search_all_jwst_observations") as no_call:
+                agg = self._make_tool(
+                    self.mast.AggregateJwstObservations,
+                    group_by=["instrument_name", "filters"],
+                    distinct_fields=None,
+                    rows_path=str(csvs[0].relative_to(tmpdir)),
                     output_csv=None,
                     base_directory=tmpdir,
                 )
-                output = tool._run()
-
-            call.assert_called_once()
+                output = agg._run()
+            no_call.assert_not_called()
             self.assertIn("Aggregated 4 row(s)", output)
             self.assertIn("NIRSPEC/SLIT", output)
             self.assertIn("filters=", output)
+
+    def test_aggregate_requires_rows_path(self):
+        tool = self._make_tool(
+            self.mast.AggregateJwstObservations,
+            group_by=["instrument_name"],
+            distinct_fields=None,
+            rows_path="",  # LLM empty-string stuffing
+            output_csv=None,
+            base_directory="/tmp",
+        )
+        with self.assertRaisesRegex(ValueError, "SearchMastJwstObservations"):
+            tool._run()
+
+    def test_search_cone_mode_writes_csv_only_when_asked(self):
+        rows = [{"obsid": "1", "instrument_name": "NIRSPEC/BOTS"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(self.mast, "search_jwst_observations", return_value=rows):
+                out = self._make_tool(
+                    self.mast.SearchMastJwstObservations,
+                    planet_name="WASP-39 b", base_directory=tmpdir,
+                )._run()
+                self.assertNotIn("written to", out)
+                out = self._make_tool(
+                    self.mast.SearchMastJwstObservations,
+                    planet_name="WASP-39 b", output_csv="w39.csv",
+                    base_directory=tmpdir,
+                )._run()
+            self.assertIn("written to", out)
+            self.assertTrue((pathlib.Path(tmpdir) / "w39.csv").is_file())
 
     # ---- DownloadDemographicJwstProducts ----
 
@@ -1337,8 +1375,9 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
         a_call = next(r for r in recorded if r[0] == "A")
         self.assertEqual(a_call[1], ["1", "2"])
 
-    def test_download_demographic_basetool_reads_csv_and_runs(self):
-        Tool = self.mast.DownloadDemographicJwstProducts
+    def test_download_tool_rows_path_mode_per_planet(self):
+        """The former DownloadDemographicJwstProducts, now rows_path mode."""
+        Tool = self.mast.DownloadMastJwstProducts
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = pathlib.Path(tmpdir) / "xmatch.csv"
             self.mast._write_rows_csv(
@@ -1365,10 +1404,6 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
                     output_dir="mast/raw",
                     label="warm_hot_jupiters",
                     product_subgroups=["X1DINTS"],
-                    raw_only=False,
-                    max_planets=None,
-                    max_obs_per_planet=None,
-                    max_products_per_obs=None,
                     base_directory=tmpdir,
                 )
                 output = tool._run()
@@ -1381,18 +1416,107 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
             root = pathlib.Path(tmpdir) / "mast" / "raw" / "warm_hot_jupiters"
             self.assertTrue((root / "demographic_manifest.json").is_file())
 
+    def test_download_tool_rows_path_default_dir_and_caps(self):
+        Tool = self.mast.DownloadMastJwstProducts
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.mast._write_rows_csv(
+                pathlib.Path(tmpdir) / "x.csv",
+                [{"pl_name": "A b", "obsid": "1"}, {"pl_name": "A b", "obsid": "2"},
+                 {"pl_name": "B b", "obsid": "3"}],
+            )
+            with patch.object(
+                self.mast, "download_demographic_products",
+                return_value={"label": "aggregate", "planet_count": 1,
+                              "total_files_downloaded": 0, "per_planet": []},
+            ) as call:
+                self._make_tool(Tool, rows_path="x.csv", max_planets="1",
+                                max_observations="1", max_products="2",
+                                base_directory=tmpdir)._run()
+            args, kwargs = call.call_args
+            self.assertTrue(args[1].endswith(os.path.join("mast", "demographics_raw")))
+            self.assertEqual(kwargs["max_planets"], 1)
+            self.assertEqual(kwargs["max_obs_per_planet"], 1)
+            self.assertEqual(kwargs["max_products_per_obs"], 2)
+
+    def test_download_tool_rows_path_without_pl_name_is_flat_batch(self):
+        """A SearchMastJwstObservations CSV (no planet attribution) downloads
+        as one flat obsid batch."""
+        Tool = self.mast.DownloadMastJwstProducts
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.mast._write_rows_csv(
+                pathlib.Path(tmpdir) / "s.csv",
+                [{"obsid": "7", "instrument_name": "NIRSPEC/BOTS"},
+                 {"obsid": "7", "instrument_name": "NIRSPEC/BOTS"},
+                 {"obsid": "8", "instrument_name": "NIRSPEC/BOTS"}],
+            )
+            with patch.object(
+                self.mast, "download_observations_products",
+                return_value={"label": "bots", "obsids": ["7", "8"], "downloaded": []},
+            ) as call:
+                out = self._make_tool(Tool, rows_path="s.csv", label="bots",
+                                      base_directory=tmpdir)._run()
+            self.assertEqual(call.call_args[0][0], ["7", "8"])
+            self.assertIn("batch 'bots'", out)
+
+    def test_download_tool_rows_path_rejects_csv_without_obsid(self):
+        Tool = self.mast.DownloadMastJwstProducts
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.mast._write_rows_csv(pathlib.Path(tmpdir) / "p.csv",
+                                      [{"pl_name": "A b", "pl_rade": "2.1"}])
+            with self.assertRaisesRegex(ValueError, "obsid"):
+                self._make_tool(Tool, rows_path="p.csv", base_directory=tmpdir)._run()
+
+    def test_download_tool_list_only_never_downloads(self):
+        """The former GetMastObservationProducts, now list_only=True."""
+        Tool = self.mast.DownloadMastJwstProducts
+        products = [
+            {"productSubGroupDescription": "UNCAL", "productFilename": "a_uncal.fits",
+             "productType": "SCIENCE", "dataURI": "mast:JWST/a_uncal.fits", "size": 1},
+            {"productSubGroupDescription": "UNCAL", "productFilename": "b_uncal.fits",
+             "productType": "SCIENCE", "dataURI": "mast:JWST/b_uncal.fits", "size": 2},
+        ]
+        with patch.object(self.mast, "get_observation_products",
+                          return_value=products) as listing, \
+             patch.object(self.mast, "download_mast_product") as dl, \
+             patch.object(self.mast, "download_observations_products") as batch:
+            out = self._make_tool(Tool, obsids="98765", raw_only="True",
+                                  list_only=True, max_products=1,
+                                  base_directory="/tmp")._run()
+        listing.assert_called_once()
+        self.assertTrue(listing.call_args.kwargs["raw_only"])
+        dl.assert_not_called()
+        batch.assert_not_called()
+        self.assertIn("LIST ONLY", out)
+        self.assertIn("obsid=98765", out)
+        self.assertIn("a_uncal.fits", out)
+        self.assertNotIn("b_uncal.fits", out)  # max_products respected
+
+    def test_download_tool_list_only_planet_mode_searches_first(self):
+        Tool = self.mast.DownloadMastJwstProducts
+        with patch.object(self.mast, "search_jwst_observations",
+                          return_value=[{"obsid": "11"}, {"obsid": "12"}]) as search, \
+             patch.object(self.mast, "get_observation_products", return_value=[]) as listing:
+            out = self._make_tool(Tool, planet_name="WASP-39 b", list_only=True,
+                                  max_observations=1, base_directory="/tmp")._run()
+        search.assert_called_once()
+        listing.assert_called_once_with("11", product_subgroups=None, raw_only=False)
+        self.assertIn("=== WASP-39 b ===", out)
+
+    def test_download_tool_reports_ignored_inputs(self):
+        Tool = self.mast.DownloadMastJwstProducts
+        with patch.object(self.mast, "download_observations_products",
+                          return_value={"label": "x", "obsids": ["1"], "downloaded": []}):
+            out = self._make_tool(Tool, obsids=["1"], planet_name="WASP-39 b",
+                                  base_directory="/tmp")._run()
+        self.assertIn("ran in obsids mode; ignored planet_name", out)
+
     def test_aggregate_basetool_rejects_empty_group_by(self):
         Tool = self.mast.AggregateJwstObservations
         tool = self._make_tool(
             Tool,
             group_by=[],
             distinct_fields=None,
-            rows_path=None,
-            instruments=None,
-            dataproduct_types=None,
-            calib_levels=None,
-            proposal_id=None,
-            target_name=None,
+            rows_path="rows.csv",
             output_csv=None,
             base_directory="/tmp",
         )
@@ -1542,24 +1666,16 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
     def test_aggregate_auto_writes_csv_when_output_csv_omitted(self):
         Tool = self.mast.AggregateJwstObservations
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.object(
-                self.mast, "search_all_jwst_observations",
-                return_value=(self.OBSERVATIONS, []),
-            ):
-                tool = self._make_tool(
-                    Tool,
-                    group_by=["instrument_name"],
-                    distinct_fields=None,
-                    rows_path=None,
-                    instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
-                    dataproduct_types=["spectrum", "timeseries"],
-                    calib_levels=[3],
-                    proposal_id=None,
-                    target_name=None,
-                    output_csv=None,
-                    base_directory=tmpdir,
-                )
-                output = tool._run()
+            self.mast._write_rows_csv(pathlib.Path(tmpdir) / "obs.csv", self.OBSERVATIONS)
+            tool = self._make_tool(
+                Tool,
+                group_by=["instrument_name"],
+                distinct_fields=None,
+                rows_path="obs.csv",
+                output_csv=None,
+                base_directory=tmpdir,
+            )
+            output = tool._run()
 
             self.assertIn("FULL RESULTS", output)
             demographics_dir = pathlib.Path(tmpdir) / "mast" / "demographics"
@@ -2158,17 +2274,15 @@ class OrchestralSchemaContractTests(unittest.TestCase):
     def test_only_genuinely_required_fields_are_required(self):
         expected = {
             "SearchMastJwstObservations": [],
-            "GetMastObservationProducts": ["obsid"],
             "DownloadMastJwstProducts": [],
             "CrossmatchJwstToPlanets": [],
-            "AggregateJwstObservations": ["group_by"],
-            "DownloadDemographicJwstProducts": ["rows_path"],
+            "AggregateJwstObservations": sorted(["group_by", "rows_path"]),
             "GetJwstProgramInfo": ["proposal_ids"],
         }
         for name, required in expected.items():
             tool_cls = getattr(self.mast, name)
             self.assertEqual(
-                tool_cls._get_required_fields(), required,
+                sorted(tool_cls._get_required_fields()), required,
                 f"{name}: unexpected required-field list",
             )
 
@@ -2224,10 +2338,14 @@ class OrchestralSchemaContractTests(unittest.TestCase):
         self.assertNotIn("Missing Required Fields", output)
 
     def test_execute_missing_required_field_still_errors(self):
-        tool = self.mast.GetMastObservationProducts(base_directory="/tmp/aster_ws")
-        output = tool.execute()
+        tool = self.mast.AggregateJwstObservations(base_directory="/tmp/aster_ws")
+        output = tool.execute(group_by="['pl_name']")
         self.assertIn("Missing Required Fields", output)
-        self.assertIn("obsid", output)
+        self.assertIn("rows_path", output)
+
+    def test_retired_tools_are_gone(self):
+        for name in ("GetMastObservationProducts", "DownloadDemographicJwstProducts"):
+            self.assertFalse(hasattr(self.mast, name), name)
 
 
 if __name__ == "__main__":

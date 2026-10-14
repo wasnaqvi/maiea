@@ -30,7 +30,7 @@ def require_groq_credentials():
 
 
 def get_llm_provider():
-    # Default to 'openai': tool-routing accuracy across ASTER's ~14 tools is
+    # Default to 'openai': tool-routing accuracy across ASTER's 25 tools is
     # poor on small local models (llama3.2 routinely picks the wrong tool and
     # invents arguments). '.env' can still override to 'ollama' or 'groq'.
     return os.getenv('ASTER_LLM_PROVIDER', 'openai').lower()
@@ -138,19 +138,15 @@ from aster_toolkit import (
     SetTaurexPaths,
     SimulateTaurexRetrieval,
     PlotCornerPosteriors,
-    GetExoplanetParameters,
+    QueryExoplanetArchive,
     DownloadDataset,
-    FindExoplanetsByCondition,
     SearchMastJwstObservations,
-    GetMastObservationProducts,
     DownloadMastJwstProducts,
     CrossmatchJwstToPlanets,
     AggregateJwstObservations,
-    DownloadDemographicJwstProducts,
     GetJwstProgramInfo,
     DiscoverPatchworkVisits,
     VerifyPatchworkEnvironment,
-    InspectNirspecG395hUncalData,
     ReduceNirspecG395hTso,
     MakeUncalTestSubset,
     DetectTiltEvents,
@@ -159,12 +155,10 @@ from aster_toolkit import (
     CombineNirspecG395hVisits,
     DetectLightCurveAnomalies,
     ModelStellarContamination,
-    VerifyContaminationBackends,
     RunPatchworkTarget,
-    GeneratePatchworkFirJob,
+    GenerateFirJobs,
     OptimizeNirspecG395hReduction,
     SummarizeG395hOptimization,
-    GenerateFirOptimizerJobs,
 )
 
 base_directory = 'workspace'
@@ -198,24 +192,20 @@ tools = [
     SimulateTaurexRetrieval(base_directory=base_directory),
     PlotCornerPosteriors(base_directory=base_directory),
 
-    # Data acquisition tools
-    GetExoplanetParameters(),
+    # NASA Exoplanet Archive tools
+    QueryExoplanetArchive(),
     DownloadDataset(base_directory=base_directory),
-    FindExoplanetsByCondition(),
 
     # MAST / JWST tools
-    SearchMastJwstObservations(),
-    GetMastObservationProducts(),
+    SearchMastJwstObservations(base_directory=base_directory),
     DownloadMastJwstProducts(base_directory=base_directory),
     CrossmatchJwstToPlanets(base_directory=base_directory),
     AggregateJwstObservations(base_directory=base_directory),
-    DownloadDemographicJwstProducts(base_directory=base_directory),
     GetJwstProgramInfo(base_directory=base_directory),
 
     # Patchwork data reduction / fitting tools
     DiscoverPatchworkVisits(base_directory=base_directory),
     VerifyPatchworkEnvironment(base_directory=base_directory),
-    InspectNirspecG395hUncalData(base_directory=base_directory),
     ReduceNirspecG395hTso(base_directory=base_directory),
     MakeUncalTestSubset(base_directory=base_directory),
     DetectTiltEvents(base_directory=base_directory),
@@ -224,18 +214,17 @@ tools = [
     CombineNirspecG395hVisits(base_directory=base_directory),
     DetectLightCurveAnomalies(base_directory=base_directory),
     ModelStellarContamination(base_directory=base_directory),
-    VerifyContaminationBackends(base_directory=base_directory),
     RunPatchworkTarget(base_directory=base_directory),
-    GeneratePatchworkFirJob(base_directory=base_directory),
+    GenerateFirJobs(base_directory=base_directory),
     OptimizeNirspecG395hReduction(base_directory=base_directory),
     SummarizeG395hOptimization(base_directory=base_directory),
-    GenerateFirOptimizerJobs(base_directory=base_directory),
 ]
 
 if llm_provider == 'openai':
     tools.insert(5, WebSearchTool())
 
-# Tool profiles. All ~28 schemas are sent on EVERY request; the Patchwork
+# Tool profiles. All 33 schemas (25 ASTER + 8 orchestral built-ins; 34
+# with WebSearch on openai) are sent on EVERY request; the Patchwork
 # tools have long docstrings, so the full set costs ~11k tokens before the
 # conversation starts -- enough to exhaust a 30k TPM tier in one turn.
 #

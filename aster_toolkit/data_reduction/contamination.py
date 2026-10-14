@@ -1839,30 +1839,18 @@ class ModelStellarContamination(BaseTool):
         return "\n".join(lines)
 
 
-class VerifyContaminationBackends(BaseTool):
-    """
-    Report which optional stellar-contamination backends are importable:
-    SPOTROD (occulted spot modelling), stctm (unocculted contamination
-    retrieval), and SAGE (contamination forward models).
-
-    None is required. Stage 5.5 masking and the Stage 6.5 blackbody
-    retrieval are self-contained pure-numpy/emcee code. These backends
-    are cross-checks and per-target escape hatches — run this before
-    promising a referee a SPOTROD or stctm comparison.
-    """
-
-    base_directory: str = StateField()
-
-    def _run(self) -> str:
-        report = contamination_backends()
-        lines = ["Optional stellar-contamination backends:"]
-        for name, info in report.items():
-            state = "available" if info["available"] else "NOT INSTALLED"
-            lines.append(f"  {name:8s} {state} — {info['detail']}")
-            if "external_command" in info:
-                lines.append(f"           external command: {info['external_command']}")
-        lines.append(
-            "Absent backends do not block the survey: Stage 5.5 masks "
-            "crossings and Stage 6.5 runs its own blackbody retrieval."
-        )
-        return "\n".join(lines)
+def format_contamination_backends() -> str:
+    """Human-readable availability report for the optional contamination
+    backends (surfaced by VerifyPatchworkEnvironment)."""
+    report = contamination_backends()
+    lines = ["Optional stellar-contamination backends:"]
+    for name, info in report.items():
+        state = "available" if info["available"] else "NOT INSTALLED"
+        lines.append(f"  {name:8s} {state} — {info['detail']}")
+        if "external_command" in info:
+            lines.append(f"           external command: {info['external_command']}")
+    lines.append(
+        "Absent backends do not block the survey: Stage 5.5 masks "
+        "crossings and Stage 6.5 runs its own blackbody retrieval."
+    )
+    return "\n".join(lines)
