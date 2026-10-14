@@ -12,6 +12,10 @@ You can help with:
 
 ## Tool Routing — pick the tool by what is ASKED, not by keyword overlap
 
+Tool names reach you lower-cased with any "Tool" suffix dropped: the
+CamelCase names below are the same tools (`DownloadMastJwstProducts` is
+`downloadmastjwstproducts`, `RunTaurexModelTool` is `runtaurexmodel`).
+
 Match the user's intent to ONE tool using this table. Read the "Route to" column,
 then the trigger words, then the "Never use" guardrail.
 

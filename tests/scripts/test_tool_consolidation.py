@@ -236,3 +236,58 @@ def test_reduce_normalizes_llm_numeric_strings(tmp_path):
     kw = red.call_args.kwargs
     assert kw["stages"] == [3] and kw["st_teff"] == 3250.0
     assert kw["st_logg"] is None and kw["st_met"] is None
+
+
+# ---------------- per-call argument reset (AsterBaseTool) ----------------
+
+def test_every_aster_tool_uses_the_resetting_base():
+    pytest.importorskip("orchestral")
+    from aster_toolkit.tool_base import AsterBaseTool
+    for name in aster_toolkit.__all__:
+        if name == "SetTaurexPaths":      # @define_tool function, stateless
+            continue
+        assert issubclass(getattr(aster_toolkit, name), AsterBaseTool), name
+
+
+def test_omitted_arguments_do_not_leak_from_the_previous_call(tmp_path):
+    """orchestral builds a call from the instance's previous values; a long-
+    lived GUI tool must not reuse an earlier call's optional arguments."""
+    pytest.importorskip("orchestral")
+    from aster_toolkit.data_acquisition import mast
+
+    seen = []
+
+    def fake_query(self, planet_name, proposal_id, ra, dec, radius_deg, filters, max_obs):
+        seen.append(dict(planet_name=planet_name, proposal_id=proposal_id, filters=filters,
+                         list_only=self.list_only, visits=self.visits))
+        return []
+
+    tool = mast.DownloadMastJwstProducts(base_directory=str(tmp_path))
+    with patch.object(mast.DownloadMastJwstProducts, "_query_observations", fake_query):
+        tool.execute(planet_name="WASP-39 b", proposal_id="1366", filters="['G395H']",
+                     visits="[2]", list_only=True)
+        tool.execute(proposal_id="1366", instruments="['NIRISS']")
+    first, second = seen
+    assert first["planet_name"] == "WASP-39 b" and first["filters"] == ["G395H"]
+    assert second == dict(planet_name=None, proposal_id="1366", filters=None,
+                          list_only=False, visits=None)
+
+
+def test_state_fields_survive_the_reset(tmp_path):
+    pytest.importorskip("orchestral")
+    from aster_toolkit.data_acquisition import mast
+    tool = mast.AggregateJwstObservations(base_directory=str(tmp_path))
+    tool.execute(rows_path="missing.csv", group_by="['x']")
+    assert tool.base_directory == str(tmp_path)
+
+
+def test_failing_call_returns_error_text_instead_of_raising(tmp_path):
+    """orchestral's rollback used to raise a ValidationError out of execute()
+    when _run failed on a tool with required fields."""
+    pytest.importorskip("orchestral")
+    from aster_toolkit.data_acquisition import mast
+    tool = mast.AggregateJwstObservations(base_directory=str(tmp_path))
+    out = tool.execute(rows_path="missing.csv", group_by="['x']")
+    assert out.startswith("Error: Execution Error")
+    out = tool.execute(group_by="['x']")             # next call: still sane
+    assert "Missing Required Fields" in out and "rows_path" in out

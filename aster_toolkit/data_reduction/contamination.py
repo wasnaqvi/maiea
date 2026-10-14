@@ -50,7 +50,14 @@ import numpy as np
 from .lightcurves import refine_step_shape
 
 try:
-    from orchestral.tools.base.tool import BaseTool
+    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
+        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
+        if _exc.name != "aster_toolkit":
+            raise
+        import sys as _sys, pathlib as _pl
+        _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
+        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
     from orchestral.tools.base.field_utils import RuntimeField, StateField
 except ModuleNotFoundError:
     class BaseTool:

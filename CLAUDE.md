@@ -533,6 +533,39 @@ single-detector excursions never masked, the chromatic amplitude ratio,
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` avoids an unrelated `pkg_resources`
 breakage in the local pytest plugins.
 
+## Testing the agent end to end
+
+Three layers, cheapest first:
+
+1. **Unit / contract** — `pytest tests/scripts` (no network). Includes
+   `test_tool_consolidation.py` (the 25-tool registry, per-call argument
+   reset) and `test_exotedrf_parity.py` (DownloadMastJwstProducts vs the real
+   exoTEDRF `download_observations`; set `ASTER_EXOTEDRF_REPO` to your
+   exoTEDRF checkout or the parity half is skipped).
+2. **GUI end to end** — `pytest tests/e2e` (~20 s, offline). Launches the
+   unmodified `run_aster.py`, drives the web GUI over its `/ws` websocket like
+   the browser, and checks natural-language requests ("which JWST
+   observations of WASP-39 b used G395H…", "download those", "list visit 2,
+   don't download") end in the right MAST queries and files on disk. The
+   model is a deterministic stand-in (`tests/e2e/fake_openai_server.py`,
+   reached through `OPENAI_BASE_URL`) that also rejects any call not
+   matching the schemas ASTER sends; MAST is `tests/e2e/fake_mast_server.py`
+   (reached through `ASTER_MAST_BASE_URL`, unset in normal use).
+3. **Real-model routing** — `python scripts/eval_aster_nl.py` with your
+   provider credentials in `.env`. Same GUI path, your actual model, graded
+   on outcomes. Fake MAST by default; `--live-mast` runs the search/list
+   scenarios against mast.stsci.edu. Use `--repeat N` (routing is stochastic)
+   and run it after changing the system prompt or a tool docstring.
+
+Two orchestral behaviours the GUI layer exposed, both handled in
+`aster_toolkit/tool_base.py` (every ASTER tool subclasses `AsterBaseTool`):
+tool instances live for the whole session and orchestral builds each call
+from the previous call's values, so omitted optional arguments used to leak
+between calls (now reset per call); and a failing `_run` could raise a
+ValidationError out of `execute()` during rollback (now returns the error
+text to the model). Also note orchestral shows tool names to the model
+lower-cased with any `Tool` suffix dropped (`downloadmastjwstproducts`).
+
 ## Common Workflows
 
 ### Running a Forward Model

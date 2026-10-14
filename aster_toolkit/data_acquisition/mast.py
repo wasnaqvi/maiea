@@ -17,7 +17,14 @@ from urllib.parse import quote
 import requests
 
 try:
-    from orchestral.tools.base.tool import BaseTool
+    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
+        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
+        if _exc.name != "aster_toolkit":
+            raise
+        import sys as _sys, pathlib as _pl
+        _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
+        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
     from orchestral.tools.base.field_utils import RuntimeField, StateField
     from pydantic import Field as _PydanticField
 
@@ -53,8 +60,11 @@ except ModuleNotFoundError:
         return None
 
 
-MAST_INVOKE_URL = "https://mast.stsci.edu/api/v0/invoke"
-MAST_DOWNLOAD_URL = "https://mast.stsci.edu/api/v0.1/Download/file"
+# ASTER_MAST_BASE_URL exists for end-to-end tests (tests/e2e) that point the
+# real agent at a local fake MAST; leave it unset in normal use.
+MAST_BASE_URL = os.environ.get("ASTER_MAST_BASE_URL", "https://mast.stsci.edu").rstrip("/")
+MAST_INVOKE_URL = f"{MAST_BASE_URL}/api/v0/invoke"
+MAST_DOWNLOAD_URL = f"{MAST_BASE_URL}/api/v0.1/Download/file"
 EXOARCHIVE_TAP_SYNC_URL = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
 
 # Authoritative per-proposal program metadata (Cycle, title, PI, status).
