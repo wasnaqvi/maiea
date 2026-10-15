@@ -252,8 +252,9 @@
         `<div class="aaf-reminder"><b>${escapeHtml(p.release_date)}</b>
            ${escapeHtml(p.target)} · GO ${escapeHtml(p.proposal_id)}</div>`).join('');
       const more = pending.length > 8 ? `<div class="aaf-reminder">…and ${pending.length - 8} more</div>` : '';
+      const missing = (data.missing || []).map(escapeHtml).join(', ') || 'ASTER_ALERT_SMTP_*';
       const warn = data.email_configured ? '' :
-        '<div class="aaf-reminder aaf-warn">Email not configured: set ASTER_ALERT_SMTP_* in .env</div>';
+        `<div class="aaf-reminder aaf-warn">Email not configured: fill ${missing} in .env, then restart the GUI</div>`;
       bell.querySelector('.aaf-reminders-list').innerHTML =
         `<div class="aaf-reminders-head">ASTER Alert will email you on</div>${rows}${more}${warn}`;
       const cardOpen = card && card.classList.contains('aaf-visible');

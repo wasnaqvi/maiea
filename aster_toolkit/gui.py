@@ -45,6 +45,7 @@ def subscription_summary(base_directory: str | os.PathLike[str]) -> dict[str, An
                     for s in pending],
         "sent": sum(s.get("status") == "sent" for s in subs),
         "email_configured": alert.smtp_configured(),
+        "missing": alert.smtp_missing(),
     }
 
 

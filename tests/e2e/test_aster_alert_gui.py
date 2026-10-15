@@ -147,7 +147,7 @@ def test_nl_email_me_on_release_day_is_delivered_by_the_gui(stack):
             if summary["sent"] == 1:
                 break
             time.sleep(0.2)
-        assert summary == {"pending": [], "sent": 1, "email_configured": True}
+        assert summary == {"pending": [], "sent": 1, "email_configured": True, "missing": []}
         assert any("[aster-alert] emailed astro@example.org" in line for line in gui.log)
     finally:
         fake_mast_archive.LOCKED_RELEASE_MJD = saved
