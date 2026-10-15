@@ -225,11 +225,13 @@ After FIT:
 - [ ] `depth_check.status` is `ok` or `indicative` — **not** `suspect`.
       `indicative` just means the only reference was the optical archive
       value; check `depth_check.band` before reacting to a % offset
-- [ ] `fit_version` is exactly `1.3` — a `-noscan` or `-nopca` suffix
+- [ ] `fit_version` is exactly `1.5` — earlier versions do not include the
+      current grazing-transit and per-channel limb-darkening safeguards
       means this fit is NOT uniform with the survey
 - [ ] `median_depth_err_ppm` << depth (tens of ppm, not ~1500)
-- [ ] white rms hundreds of ppm; `rednoise.beta_median` ~ 1 (record it;
-      > ~1.2 = flag for error inflation, per COMPASS)
+- [ ] white rms hundreds of ppm; record `rednoise.beta_median`. Treat
+      beta > 3 as a survey-quality flag and sensitivity test, not an automatic
+      per-channel error multiplier (doing so over-inflates these spectra)
 - [ ] `ld_source: "exotic-ld"`, `priors_source: "archive"` (cache
       fallback means the node was offline — fine, but note it)
 - [ ] ~29 (NRS1) + ~24 (NRS2) channels at R=100;

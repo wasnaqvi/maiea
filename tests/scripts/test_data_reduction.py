@@ -43,6 +43,7 @@ from aster_toolkit.data_reduction.lightcurves import (  # noqa: E402
 )
 from aster_toolkit.data_reduction.juliet import (  # noqa: E402
     CROSS_BAND_TOL_FRAC,
+    LD_FIX_IMPACT_PARAM,
     combine_visit_spectra,
     detector_offset_ppm,
     evaluate_depth_check,
@@ -67,6 +68,7 @@ from aster_toolkit.data_reduction.contamination import (  # noqa: E402
     running_mean,
 )
 from aster_toolkit.data_reduction.discover import (  # noqa: E402
+    build_manifests,
     group_visits,
     parse_uncal_name,
     resolve_planet_from_rows,
@@ -85,6 +87,8 @@ from aster_toolkit.data_reduction.optimize import (  # noqa: E402
     write_optimize_config,
 )
 from aster_toolkit.data_reduction.survey import (  # noqa: E402
+    _expand_indexed_values,
+    _known_overlapping_transits,
     existing_fit_products,
     load_manifest,
     run_patchwork_target,
@@ -577,6 +581,28 @@ class TestResolvePlanet:
         res = resolve_planet_from_rows([], self.START, self.END)
         assert not res["confident"] and "No archive planet" in res["note"]
 
+    def test_ambiguous_visit_is_not_auto_assigned(self, monkeypatch, tmp_path):
+        import aster_toolkit.data_reduction.discover as D
+
+        visit = {
+            "visit_prefix": "jw04098017001", "target": "TOI-270",
+            "ra": 149.0, "dec": -51.0, "expstart_mjd": self.START,
+            "expend_mjd": self.END, "program": "04098", "observation": "017",
+            "sci_tag": "04102", "date_obs": "2025-01-01", "nints": 1000,
+            "complete": True, "duplicate_download": False,
+        }
+        rows = [_archive_row("TOI-270 b", 3.0, 2460500.0 - 100 * 3.0),
+                _archive_row("TOI-270 d", 5.0, 2460500.0 - 100 * 5.0)]
+        monkeypatch.setattr(D, "scan_raw_tree", lambda root: {"exposures": []})
+        monkeypatch.setattr(D, "group_visits", lambda scan: [dict(visit)])
+        monkeypatch.setattr(D, "_archive_planets_at", lambda *args: rows)
+        result = build_manifests(tmp_path)
+        assert result["manifests"] == {}
+        assert result["unresolved"][0]["planet_source"] == "ambiguous"
+        assert {m["pl_name"] for m in result["unresolved"][0]["planet_matches"]} == {
+            "TOI-270 b", "TOI-270 d"
+        }
+
 
 class TestGroupVisits:
     def _exp(self, prefix, tag, det, nints=1000, **hdr):
@@ -861,6 +887,71 @@ class TestStaging:
         assert stage_visit_uncals(str(tmp_path), tmp_path / "x") == str(tmp_path)
 
 
+class TestSummaryMerge:
+    def test_a_step_subset_does_not_erase_other_blocks(self, tmp_path, monkeypatch):
+        # Regression 2026-09-04: STEPS=contamination rewrote
+        # patchwork_summary.json from scratch and deleted the fit record
+        # -- depths, beta, depth_check, scan_steps_corrected -- for all
+        # 16 fitted targets, leaving "visits": {}.
+        import aster_toolkit.data_reduction.survey as S
+        root = tmp_path / "GJ_9827_d"
+        root.mkdir(parents=True)
+        prior = {"planet_name": "GJ 9827 d", "steps": ["fit", "combine"],
+                 "visits": {"o010": {"fits": {"NRS1": {"white_depth_ppm":
+                                                       {"median": 957.0}}}}}}
+        (root / "patchwork_summary.json").write_text(json.dumps(prior))
+        monkeypatch.setattr(S, "fetch_transit_priors",
+                            lambda n: {"st_teff": 4340, "st_logg": 4.66,
+                                       "st_met": -0.26})
+        out = S.run_patchwork_target(
+            {"planet_name": "GJ 9827 d", "visits": {}},
+            tmp_path, steps=("contamination",), log=lambda *a, **k: None)
+        assert out["visits"], "contamination-only run erased the fit record"
+        assert out["visits"]["o010"]["fits"]["NRS1"]["white_depth_ppm"]["median"] == 957.0
+        assert out.get("fit_version") is None
+
+    def test_subset_run_preserves_the_actual_fit_version(self, tmp_path):
+        root = tmp_path / "Test_b"
+        root.mkdir(parents=True)
+        (root / "patchwork_summary.json").write_text(json.dumps({
+            "planet_name": "Test b", "fit_version": "1.4", "resolution": 100,
+            "visits": {"o001": {"fits": {"NRS1": {}}}},
+        }))
+        out = run_patchwork_target(
+            {"planet_name": "Test b", "visits": {},
+             "stellar": {"st_teff": 4000, "st_logg": 4.5, "st_met": 0.0}},
+            tmp_path, steps=("contamination",), log=lambda *_: None,
+        )
+        assert out["fit_version"] == "1.4"
+        assert out["resolution"] == 100
+
+    def test_corrupt_summary_is_never_overwritten(self, tmp_path):
+        root = tmp_path / "Test_b"
+        root.mkdir(parents=True)
+        path = root / "patchwork_summary.json"
+        path.write_text("{truncated")
+        with pytest.raises(RuntimeError, match="Refusing to overwrite"):
+            run_patchwork_target(
+                {"planet_name": "Test b", "visits": {},
+                 "stellar": {"st_teff": 4000, "st_logg": 4.5, "st_met": 0.0}},
+                tmp_path, steps=("contamination",), log=lambda *_: None,
+            )
+        assert path.read_text() == "{truncated"
+
+
+class TestIndexedSeriesExpansion:
+    def test_masked_residuals_return_to_original_coordinates(self):
+        expanded = _expand_indexed_values(
+            np.array([10.0, 20.0, 30.0]), np.array([0, 2, 4]), 5
+        )
+        assert np.allclose(expanded[[0, 2, 4]], [10.0, 20.0, 30.0])
+        assert np.isnan(expanded[[1, 3]]).all()
+
+    def test_bad_index_mapping_is_refused(self):
+        with pytest.raises(ValueError, match="duplicate"):
+            _expand_indexed_values(np.ones(2), np.array([1, 1]), 3)
+
+
 class TestForceRefitGuard:
     def _manifest(self, tmp_path):
         raw = tmp_path / "raw"
@@ -881,17 +972,71 @@ class TestForceRefitGuard:
             run_patchwork_target(self._manifest(tmp_path), out,
                                  steps=("fit",), log=lambda *_: None)
 
+    def test_known_simultaneous_transits_refused(self, tmp_path):
+        manifest = self._manifest(tmp_path)
+        manifest.update({"planet_name": "TOI-270 b", "program": "GO 4098"})
+        manifest["visits"] = {"o017": manifest["visits"]["o001"]}
+        with pytest.raises(RuntimeError, match="overlapping transits"):
+            run_patchwork_target(manifest, tmp_path / "results",
+                                 steps=("fit",), log=lambda *_: None)
+
+    def test_distinct_single_candidate_visits_are_not_overlaps(self):
+        manifest = {
+            "planet_name": "Test b",
+            "visits": {
+                "o001": {"transit_candidates": ["Test b"]},
+                "o002": {"transit_candidates": ["Test c"]},
+            },
+        }
+        assert _known_overlapping_transits(manifest) == []
+
     def test_force_refit_clears(self, tmp_path):
         out = tmp_path / "results"
         fits_dir = out / "Test_b" / "fits" / "o001" / "nrs1"
         fits_dir.mkdir(parents=True)
         (fits_dir / "_dynesty_NS_posteriors.pkl").write_bytes(b"stale")
-        # no Stage 3 products exist, so the fit loop skips every detector;
-        # what matters is that the stale posteriors were deleted, not refused
         run_patchwork_target(self._manifest(tmp_path), out,
                              steps=("fit",), force_refit=True,
                              log=lambda *_: None)
         assert existing_fit_products(out / "Test_b" / "fits") == []
+
+
+class TestScienceRebinning:
+    def test_equal_or_finer_resolution_is_refused(self):
+        from scripts.patchwork.rebin_spectra import rebin
+
+        wave = np.linspace(3.0, 3.7, 20)
+        wave_err = wave / 200.0
+        with pytest.raises(ValueError, match="needs a light-curve refit"):
+            rebin(wave, wave_err, np.ones(20), np.ones(20), np.ones(20),
+                  resolution=100)
+
+    def test_underfilled_edge_bin_is_dropped(self):
+        from scripts.patchwork.rebin_spectra import rebin
+
+        wave = np.geomspace(4.08, 5.08, 23)
+        wave_err = wave / 201.0
+        rows = rebin(wave, wave_err, np.ones(23), np.ones(23), np.ones(23),
+                     resolution=50, min_merged=2)
+        assert rows
+        assert all(row["n_merged"] >= 2 for row in rows)
+
+
+class TestProfiledSpectralModulation:
+    def test_detector_step_is_not_counted_as_atmosphere(self):
+        from scripts.patchwork.plot_survey_scale_heights import amplitude_in_H
+
+        wave1 = np.linspace(2.9, 3.7, 20)
+        wave2 = np.linspace(4.1, 5.1, 20)
+        survey = {
+            "NRS1": {"wave": wave1, "depth_ppm": np.full(20, 1000.0),
+                     "depth_err_ppm": np.full(20, 20.0)},
+            "NRS2": {"wave": wave2, "depth_ppm": np.full(20, 1200.0),
+                     "depth_err_ppm": np.full(20, 20.0)},
+        }
+        result = amplitude_in_H(survey, delta_ppm=50.0)
+        assert result["detector_offset_ppm"] == pytest.approx(200.0, abs=0.1)
+        assert result["amp_H"] < 0.01
 
 
 class TestReduceFailurePropagates:
@@ -1745,6 +1890,31 @@ class TestContaminationBackends:
 
 
 # -------------------- depth check --------------------
+
+
+class TestGrazingLimbDarkening:
+    """Limb darkening is fitted per channel at moderate impact parameter,
+    where measurement showed it costs ~3%, and FIXED near grazing, where
+    L 98-59 d (b=0.94) paid 2.47x in depth error and moved 5% in depth."""
+
+    def test_threshold_sits_between_the_measured_cases(self):
+        # b=0.68 cost 1.03x and must stay free; b=0.94 cost 2.47x and
+        # must be fixed.
+        assert 0.68 < LD_FIX_IMPACT_PARAM < 0.94
+
+    def test_fixed_priors_have_no_width(self):
+        import aster_toolkit.data_reduction.juliet as J
+        ld = {"q1": 0.083, "q2": 0.17}
+        free = J._ld_prior_entries("NRS1", ld)
+        assert free["q1_NRS1"]["distribution"] == "truncatednormal"
+        # A fixed prior carries a scalar, not a (mu, sigma, lo, hi) list.
+        fixed = {"distribution": "fixed", "hyperparameters": float(ld["q1"])}
+        assert not isinstance(fixed["hyperparameters"], list)
+
+    def test_uniform_fallback_when_no_coefficients(self):
+        import aster_toolkit.data_reduction.juliet as J
+        out = J._ld_prior_entries("NRS1", None)
+        assert out["q1_NRS1"]["distribution"] == "uniform"
 
 
 class TestDepthCheck:

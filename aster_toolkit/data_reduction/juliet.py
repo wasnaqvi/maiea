@@ -124,12 +124,32 @@ def _import_juliet():
 # facula crossings are masked and the lightcurve is refit. A fit where
 # the scan did not run is stamped "1.3-noscan". The stamps compose:
 # "1.3-nopca-noscan" is possible and is not a survey fit.
-PATCHWORK_FIT_VERSION = "1.4"
+PATCHWORK_FIT_VERSION = "1.5"
 SAMPLER = "dynesty"
 N_LIVE_WHITE = 500
 N_LIVE_SPEC = 300
 LD_LAW = "quadratic"          # Kipping q1/q2 parameterization in juliet
 LD_PRIOR_SIGMA = 0.1          # Gaussian width on ExoTiC-LD (q1, q2)
+# Above this impact parameter the per-channel limb darkening is FIXED to
+# the ExoTiC-LD values instead of fitted.
+#
+# Measured on the survey's own lightcurves (2026-09-04), refitting at
+# per-channel signal-to-noise with limb darkening free versus fixed:
+#
+#   TOI-1468 c  b=0.68   3047+/-37 -> 3038+/-38 ppm   1.03x
+#   GJ 3090 b   b=0.66   1502+/-30 -> 1502+/-29 ppm   0.98x
+#   TOI-836 b   b=0.64    652+/-20 ->  652+/-21 ppm   1.03x
+#   L 98-59 d   b=0.94   2063+/-35 -> 1965+/-87 ppm   2.47x
+#
+# So freeing limb darkening costs nothing at moderate b and should stay
+# free there -- fixing it survey-wide would impose theoretical
+# coefficients for no gain. Near grazing it is different: the transit
+# turns V-shaped, limb darkening becomes degenerate with depth, the
+# error inflates 2.5x AND the depth itself moves 5%. The fitted q1
+# values show the mechanism plainly, collapsing towards zero against an
+# ExoTiC value near 0.09 (L 98-59 d 0.005, LTT 3780 c 0.010) as the fit
+# trades limb darkening against radius.
+LD_FIX_IMPACT_PARAM = 0.80
 LD_MODE = "JWST_NIRSpec_G395H"
 LD_MODEL = "mps1"
 THETA_BOUNDS = [-0.1, 0.1]    # uniform prior on every linear regressor coeff
@@ -624,11 +644,10 @@ def fit_white_lightcurve(
     (regressors used, LD source, tilt events) — the orbit is frozen to
     this in the spectroscopic fits.
 
-    ``keep_mask`` (True = use this integration) drops the occulted
-    spot/facula crossings found by the Stage 5.5 scan
-    (``contamination.anomaly_keep_mask``). Pass ``anomaly_scan`` — the
-    ``anomaly_report.json`` payload — so the summary records what was
-    masked and why; without it the fit is version-stamped ``-noscan``,
+    ``keep_mask`` (True = use this integration) drops transition samples
+    that no step/ramp regressor can represent. Occulted spot/facula
+    crossings are modelled with Gaussian regressors. Pass ``anomaly_scan``
+    so the summary records what was found; without it the fit is version-stamped ``-noscan``,
     because a fit that never looked for crossings is not uniform with
     one that looked and found none.
     """
@@ -698,7 +717,11 @@ def fit_white_lightcurve(
         "visit": visit,
         "spot_handling": {
             "scan_ran": anomaly_scan is not None,
-            "method": "mask" if anomaly_scan is not None else None,
+            "method": ("mask" if n_spot_masked else
+                       "gaussian regressor" if any(
+                           str(name).startswith("spot_gauss_")
+                           for name in (regressor_names or [])) else
+                       "none detected" if anomaly_scan is not None else None),
             "n_masked": int(n_spot_masked),
             "frac_masked": float(n_spot_masked / max(1, times.size)),
             "contam_version": (anomaly_scan or {}).get("contam_version"),
@@ -707,6 +730,7 @@ def fit_white_lightcurve(
                  ("kind", "confirmed", "amplitude_ppm", "peak_sigma",
                   "hours_from_mid", "amplitude_ratio", "achromatic")}
                 for e in (anomaly_scan or {}).get("events", [])
+                if e.get("kind") != "step"
             ],
         },
         # Tilt events are CORRECTED, not masked: one Heaviside step
@@ -726,8 +750,9 @@ def fit_white_lightcurve(
             "rate_warning": (tilt_report or {}).get("rate_warning"),
             "events": [
                 {k: e.get(k) for k in
-                 ("index", "amplitude_ppm", "hours_from_mid", "in_transit",
-                  "n_sources", "sources")}
+                 ("index", "width_ints", "amplitude_ppm", "hours_from_mid",
+                  "in_transit", "n_sources", "sources", "source",
+                  "fitted_shape")}
                 for e in ((tilt_report or {}).get("events") or [])
             ],
         },
@@ -921,7 +946,7 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
         if not keep.all():
             a1.plot(t_hr_all[~keep], lc["wl_flux"][~keep], "x", ms=3.6,
                     color=GAP_COLOR, alpha=0.9, zorder=1,
-                    label="masked (spot crossing)")
+                    label="excluded transition")
         a1.errorbar(t_hr, flux, yerr=lc["wl_err"][keep], fmt="none",
                     ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
                     alpha=0.18, zorder=1)
@@ -1015,6 +1040,10 @@ def fit_transmission_spectrum(
     }
 
     use_ld = stellar is not None and white_summary.get("ld_source") == "exotic-ld"
+    # Near-grazing geometry: fix (q1, q2) per channel rather than fit them.
+    b_white = (white_summary.get("b_p1") or {}).get("median")
+    fix_ld = bool(use_ld and b_white is not None
+                  and float(b_white) > LD_FIX_IMPACT_PARAM)
 
     # One LD computation for every channel up front (single grid load)
     # instead of one subprocess per channel.
@@ -1054,7 +1083,15 @@ def fit_transmission_spectrum(
             "omega_p1": {"distribution": "fixed", "hyperparameters": 90.0},
             "p_p1": {"distribution": "uniform", "hyperparameters": [0.0, 0.3]},
         })
-        prior_dict.update(_ld_prior_entries(instrument, ld))
+        if fix_ld and ld is not None:
+            prior_dict.update({
+                f"q1_{instrument}": {"distribution": "fixed",
+                                     "hyperparameters": float(ld["q1"])},
+                f"q2_{instrument}": {"distribution": "fixed",
+                                     "hyperparameters": float(ld["q2"])},
+            })
+        else:
+            prior_dict.update(_ld_prior_entries(instrument, ld))
         prior_dict.update(_common_instrument_priors(instrument, n_reg))
 
         dataset = juliet.load(
@@ -1094,14 +1131,14 @@ def fit_transmission_spectrum(
     dat_path = out / "transmission_spectrum.dat"
     with dat_path.open("w") as handle:
         handle.write(
-            "# wavelength_um  transit_depth  depth_err  bin_half_width_um\n"
+            "# wavelength_um  transit_depth  depth_err  bin_width_um\n"
             f"# Patchwork juliet fit v{fit_version}, instrument={instrument}, "
             f"masked_integrations={int((~keep).sum())}\n"
         )
         for r in rows:
             handle.write(
                 f"{r['wave']:.6f}  {r['depth']:.8f}  "
-                f"{r['depth_err']:.8f}  {r['wave_err']:.6f}\n"
+                f"{r['depth_err']:.8f}  {2*r['wave_err']:.6f}\n"
             )
 
     _plot_spectrum(rows, out, instrument,
@@ -1110,6 +1147,8 @@ def fit_transmission_spectrum(
                    visit=visit or white_summary.get("visit", ""))
     return {"spectrum_csv": str(csv_path), "spectrum_path": str(dat_path),
             "n_bins": len(rows), "rows": rows,
+            "ld_fixed_per_channel": fix_ld,
+            "impact_parameter": (float(b_white) if b_white is not None else None),
             "fit_version": fit_version,
             "n_masked": int((~keep).sum()),
             "median_depth_err_ppm": float(np.nanmedian(

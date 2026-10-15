@@ -64,7 +64,9 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "TOI_1231_b": ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
     "GJ_1214_b":  ("2:00:00", "15:00:00", "48G", "24G", 2,
                    "only visit o019 usable; 13430 ppm depth = easiest sanity check"),
-    "TOI_270_b":  ("2:00:00", "15:00:00", "48G", "24G", 2, "below demographic"),
+    "TOI_270_b":  ("2:00:00", "15:00:00", "48G", "24G", 4,
+                   "GO 4098 o017 contains nearly simultaneous b+d transits; "
+                   "BLOCKED until Patchwork has a two-planet light-curve model"),
     "L_98_59_d":  ("2:00:00", "15:00:00", "48G", "24G", 2, "below demographic"),
     "GJ_357_b":   ("3:00:00", "15:00:00", "48G", "24G", 2,
                    "below demographic; folder label says d, headers say b — APT check"),
@@ -180,10 +182,16 @@ def main() -> int:
         block.append(
             f"# after reduce verifies (CAMPAIGN.md checklist), submit the fit:"
         )
-        block.append(
-            f"# STEPS=fit,combine FORCE_REFIT=1 sbatch --export=ALL "
-            f"--time={fit_t} --cpus-per-task=4 --mem={fit_m}{mail} {script}"
-        )
+        if slug == "TOI_270_b":
+            block.append(
+                "# FIT BLOCKED: o017 contains TOI-270 b and d nearly "
+                "simultaneously; a one-planet fit assigns d's transit to b."
+            )
+        else:
+            block.append(
+                f"# STEPS=fit,combine FORCE_REFIT=1 sbatch --export=ALL "
+                f"--time={fit_t} --cpus-per-task=4 --mem={fit_m}{mail} {script}"
+            )
         by_wave[wave].append("\n".join(block))
 
     print(f"# Patchwork survey submission plan — {len(manifests)} targets")

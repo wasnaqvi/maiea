@@ -6,7 +6,7 @@ Ties the whole Patchwork chain together for one target:
       -> segment inventory check           (exotedrf.inspect_uncal_directory)
       -> exoTEDRF Stages 1-3 per visit     (exotedrf.run_reduction)
       -> Stage 4 lightcurves + tilt scan   (lightcurves.py)
-      -> juliet white fit, pass 1          (juliet.py, frozen v1.3)
+      -> juliet white fit, pass 1          (juliet.py, frozen v1.5)
       -> Stage 5.5 occulted-spot scan      (contamination.py)
       -> masked white refit + channels     (juliet.py)
       -> visit combination + metrics       (juliet.py Stage 6)
@@ -127,6 +127,70 @@ def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
     return manifest
 
 
+def _load_existing_summary(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open() as handle:
+            summary = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Existing Patchwork summary is unreadable: {path}. Refusing to "
+            "overwrite the target's science record; repair or move that file first."
+        ) from exc
+    if not isinstance(summary, dict):
+        raise RuntimeError(
+            f"Existing Patchwork summary is not a JSON object: {path}. "
+            "Refusing to overwrite it."
+        )
+    return summary
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _known_overlapping_transits(manifest: dict[str, Any]) -> list[str]:
+    overlaps: set[str] = set()
+    for visit, spec in manifest.get("visits", {}).items():
+        if isinstance(spec, dict):
+            candidates = {str(p) for p in spec.get("transit_candidates", [])}
+            if len(candidates) > 1:
+                overlaps.update(candidates)
+        if (manifest.get("planet_name") == "TOI-270 b"
+                and visit == "o017"
+                and "4098" in str(manifest.get("program", ""))):
+            overlaps.update(("TOI-270 b", "TOI-270 d"))
+    return sorted(overlaps)
+
+
+def _expand_indexed_values(values: np.ndarray, index: np.ndarray,
+                           n_total: int) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    index = np.asarray(index, dtype=int)
+    if values.size != index.size:
+        raise ValueError(
+            f"Indexed series has {values.size} values but {index.size} indices."
+        )
+    if index.size and (index.min() < 0 or index.max() >= int(n_total)):
+        raise ValueError("Indexed series contains an out-of-range integration.")
+    if np.unique(index).size != index.size:
+        raise ValueError("Indexed series contains duplicate integrations.")
+    expanded = np.full(int(n_total), np.nan)
+    expanded[index] = values
+    return expanded
+
+
 def stage_visit_uncals(
     visit_spec: str | dict[str, str],
     staging_dir: str | os.PathLike[str],
@@ -213,6 +277,24 @@ def run_patchwork_target(
     # fallback for compute nodes, and the expected-depth cross-check.
     cached_priors = manifest.get("priors")
 
+    # Spectral binning resolution. Frozen survey-wide at R=100 by default
+    # (see DEFAULT_RESOLUTION), but settable per target so a run can be
+    # made FINER when the products need to support several binnings.
+    # Rebinning only ever merges channels, so a coarser spectrum can be
+    # derived from a finer fit for free (scripts/patchwork/rebin_spectra.py)
+    # while the reverse needs a refit. Fitting once at R=200 therefore
+    # yields R=200, R=100 and R=50; fitting at R=100 yields only 100 and
+    # coarser. The cost is roughly linear in channel count: ~115 channels
+    # at R=200 against ~58 at R=100, so about double the fit walltime.
+    resolution = float(manifest.get("resolution") or DEFAULT_RESOLUTION)
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError(f"Manifest resolution must be positive; got {resolution!r}.")
+    if resolution != DEFAULT_RESOLUTION:
+        log(f"[{slug}] NON-DEFAULT binning R={resolution:.0f} "
+            f"(survey default {DEFAULT_RESOLUTION}); products are not "
+            "channel-for-channel comparable with default-R targets until "
+            "rebinned to a common resolution.")
+
     stellar = manifest.get("stellar")
     if stellar is None and {"reduce", "fit", "contamination"} & set(steps):
         try:
@@ -223,13 +305,28 @@ def run_patchwork_target(
             priors = cached_priors
         stellar = {k: priors[k] for k in ("st_teff", "st_logg", "st_met")}
 
-    summary: dict[str, Any] = {
+    # MERGE with any existing summary rather than starting empty. This
+    # file is the per-target record, and a run of a step SUBSET only
+    # populates the blocks belonging to those steps -- so a fresh dict
+    # silently deletes everything the other steps had written. Running
+    # `STEPS=contamination` on 2026-09-04 destroyed the fit record
+    # (depths, beta, depth_check, scan_steps_corrected, spot_handling)
+    # for all 16 fitted targets, leaving "visits": {} behind, because
+    # the contamination step never touches per-visit fits.
+    prior_path = root / "patchwork_summary.json"
+    summary = _load_existing_summary(prior_path)
+    summary.setdefault("visits", {})
+    summary.update({
         "planet_name": planet,
-        "program": program,
-        "fit_version": PATCHWORK_FIT_VERSION,
         "steps": list(steps),
-        "visits": {},
-    }
+    })
+    if program:
+        summary["program"] = program
+    else:
+        summary.setdefault("program", "")
+    if "fit" in steps:
+        summary["fit_version"] = PATCHWORK_FIT_VERSION
+        summary["resolution"] = resolution
 
     visit_dirs: dict[str, str] = {}
     for vname, spec in manifest["visits"].items():
@@ -283,8 +380,7 @@ def run_patchwork_target(
 
         if failures:
             summary_path = root / "patchwork_summary.json"
-            with summary_path.open("w") as fh:
-                json.dump(summary, fh, indent=2)
+            _write_json_atomic(summary_path, summary)
             raise RuntimeError(
                 f"[{slug}] reduction failed for {len(failures)} "
                 f"visit x detector combination(s):\n  "
@@ -297,6 +393,16 @@ def run_patchwork_target(
     if "fit" in steps:
         from .exotedrf import find_stage3_products
         import shutil
+
+        overlapping = _known_overlapping_transits(manifest)
+        if len(overlapping) > 1:
+            raise RuntimeError(
+                f"{planet} has overlapping transits in this visit: "
+                f"{', '.join(overlapping)}. Patchwork currently fits one planet, "
+                "so a single-planet fit would absorb the deeper companion transit "
+                "and assign the wrong depth/spectrum. Use a multi-planet transit "
+                "model before fitting this visit."
+            )
 
         # juliet reloads existing posteriors instead of refitting, so a rerun
         # after any change silently returns the old answers. Refuse, or clear.
@@ -347,6 +453,7 @@ def run_patchwork_target(
                     # a transit that IS in the data; every use is stamped
                     # into priors_source. See prepare_visit_fit_inputs.
                     priors_override=manifest.get("priors_override"),
+                    resolution=resolution,
                 )
                 preps[det] = prep
                 pass1[det] = fit_white_lightcurve(
@@ -382,7 +489,12 @@ def run_patchwork_target(
             for det, prep in preps.items():
                 npz = np.load(Path(pass1[det]["output_dir"])
                               / "white_lightcurve_residuals.npz")
+                original_index = np.asarray(npz["index"], dtype=int)
+                residual_full = _expand_indexed_values(
+                    npz["residual"], original_index, prep["lc"]["time"].size
+                )
                 series[det] = {"time": npz["time"], "residual": npz["residual"],
+                               "residual_full": residual_full,
                                "oot_mask": npz["oot_mask"]}
                 reports[det] = detect_lightcurve_anomalies(
                     npz["time"], npz["residual"], oot_mask=npz["oot_mask"],
@@ -459,7 +571,7 @@ def run_patchwork_target(
                 # width is FITTED, not taken from the flagged span's
                 # centre (see step_events_for_regressors).
                 scan_steps = step_events_for_regressors(
-                    merged, det, residual=series.get(det, {}).get("residual"))
+                    merged, det, residual=series.get(det, {}).get("residual_full"))
                 regressors = prep["regressors"]
                 regressor_names = list(prep["regressor_names"])
                 spot_cols, spot_meta = spot_crossing_regressors(
@@ -491,6 +603,10 @@ def run_patchwork_target(
                                     f"width {e.get('width_ints', 0):.0f} ints)"
                                     for e in scan_steps))
                 n_masked = int((~keep).sum())
+                fit_tilt_report = dict(prep["tilt_report"] or {})
+                fit_tilt_report["events"] = (
+                    list(fit_tilt_report.get("events") or []) + scan_steps
+                )
                 log(f"[{slug}] fitting {vname} {det} white light "
                     f"(pass 2, {n_masked} integration(s) masked)...")
                 white = fit_white_lightcurve(
@@ -502,9 +618,9 @@ def run_patchwork_target(
                     ld=prep["ld"],
                     keep_mask=keep,
                     anomaly_scan=scan_payload,
-                    tilt_report=prep["tilt_report"],
-                    n_spot_masked=int(n_masked - prep["n_tilt_masked"]),
-                    n_tilt_masked=prep["n_tilt_masked"],
+                    tilt_report=fit_tilt_report,
+                    n_spot_masked=0,
+                    n_tilt_masked=n_masked,
                 )
                 log(f"[{slug}] fitting {vname} {det} spectroscopic channels...")
                 spec = fit_transmission_spectrum(
@@ -532,6 +648,7 @@ def run_patchwork_target(
                     "rednoise_pass1": pass1[det].get("rednoise"),
                     "depth_check": white.get("depth_check"),
                     "n_channels": spec["n_bins"],
+                    "ld_fixed_per_channel": spec["ld_fixed_per_channel"],
                     "median_depth_err_ppm": spec["median_depth_err_ppm"],
                     "median_channel_rms_ppm": spec["median_rms_ppm"],
                     "spectrum_csv": spec["spectrum_csv"],
@@ -621,7 +738,7 @@ def run_patchwork_target(
                 figure_title(planet, program=program,
                              suffix=f"{n_vis} visit"
                                     f"{'s' if n_vis != 1 else ''} combined, "
-                                    f"R = {DEFAULT_RESOLUTION}"))
+                                    f"R = {resolution:g}"))
 
     # -- contamination (Stage 6.5) ------------------------------------
     # Unocculted spots and faculae never appear in the lightcurve, so
@@ -704,8 +821,7 @@ def run_patchwork_target(
                 summary["contamination"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     summary_path = root / "patchwork_summary.json"
-    with summary_path.open("w") as fh:
-        json.dump(summary, fh, indent=2)
+    _write_json_atomic(summary_path, summary)
     summary["summary_path"] = str(summary_path)
     log(f"[{slug}] done. Summary: {summary_path}")
     return summary

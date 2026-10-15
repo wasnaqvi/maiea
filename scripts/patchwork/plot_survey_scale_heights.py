@@ -1,34 +1,17 @@
 #!/usr/bin/env python
-"""Survey comparison in SCALE HEIGHTS, and the mean-molecular-weight trend.
+"""Compare spectra in reference scale heights with visit-level quality flags.
 
-Overplotting a dozen transmission spectra in ppm is not a comparison, it
-is a hairball: the same 200 ppm is a fraction of a scale height for
-GJ 1214 b and ten scale heights for TOI-836 b, so the eye cannot tell a
-flat spectrum from a featured one. Across this survey the depth change
-per scale height spans 20-275 ppm, a factor of 14, which is exactly the
-dynamic range that makes a shared ppm axis meaningless.
+The reference assumes mu=2.3; it is not a measured composition. Different
+atmospheres, aerosols, and pressure boundaries can suppress different numbers
+of scale heights. Panels use adaptive limits so large features are not clipped.
 
-The fix is the normalization comparative surveys have used since
-D. K. Sing et al. (2016, Nature 529, 59), who placed ten hot Jupiters on
-a common axis as an altitude difference in units of the equilibrium
-scale height (dZ/H_eq) rather than in absorption depth:
+Worst-visit beta and fit-version flags remain diagnostics, not calibrated
+acceptance rules. Optional beta scaling is a sensitivity test, not the default.
+The historical RMS-to-molecular-weight calculation is uncalibrated and is
+exported only with --legacy-heuristic-mu; do not use it for atmospheric claims.
 
-    H     = k T_eq / (mu g)          atmospheric scale height
-    delta = 2 R_p H / R_*^2          depth change per scale height
-    A_H   = (D(lambda) - <D>) / delta
-
-A_H is the observable a survey should compare. It also carries the
-composition constraint directly: feature amplitude scales as 1/mu, so a
-spectrum flat to A_H < X, where a solar-composition atmosphere would
-show A_ref, implies mu > mu_H2 * A_ref / X -- a heavier atmosphere, or
-an aerosol deck muting it. Both readings matter and neither is
-available from a ppm axis.
-
-Writes small multiples (one panel per planet, shared axis, ordered by
-equilibrium temperature) plus the mu-constraint trend figure.
-
-    python scripts/patchwork/plot_survey_scale_heights.py ~/Patchwork_Data \
-        -o ~/Desktop
+    python scripts/patchwork/plot_survey_scale_heights.py ~/Patchwork_Data \\
+        -o ~/Desktop/patchwork_plots
 """
 
 from __future__ import annotations
@@ -55,13 +38,21 @@ MU_H2HE = 2.3          # solar-composition H2/He
 # continuum in cloud-free sub-Neptune models; 2 is the conservative end
 # and is what the mu limit below is quoted against.
 A_REF_SCALE_HEIGHTS = 2.0
+# Hold population claims when time-correlated noise or unexplained spectral
+# structure is large enough that the modulation limit is systematics-dominated.
+QUALITY_BETA_MAX = 3.0
+QUALITY_CHI2_MAX = 3.0
+STEM_TAG = ""   # set from --tag; keeps R=50 and R=100 outputs distinct
 
 
 def planet_params(names: list[str]) -> dict[str, dict]:
     from aster_toolkit.data_acquisition.mast import archive_tap_query
 
+    aliases = {"TOI-836 c": "TOI-836.01"}
+    query_names = sorted(set(names) | {aliases[n] for n in names if n in aliases})
+    canonical_names = {value: key for key, value in aliases.items()}
     rows = archive_tap_query(
-        ["pl_name in (" + ",".join(f"'{n}'" for n in names) + ")"],
+        ["pl_name in (" + ",".join("'" + n.replace("'", "''") + "'" for n in query_names) + ")"],
         columns=["pl_name", "pl_rade", "pl_bmasse", "pl_eqt", "st_rad",
                  "pl_dens", "st_teff"],
     )
@@ -74,9 +65,15 @@ def planet_params(names: list[str]) -> dict[str, dict]:
             rs = float(r["st_rad"]) * R_SUN
         except (TypeError, ValueError, KeyError):
             continue
+        if not all(np.isfinite(v) and v > 0 for v in (rp, mp, teq, rs)):
+            continue
         g = G_SI * mp / rp**2
         h = K_B * teq / (MU_H2HE * AMU * g)
-        out[r["pl_name"]] = {
+        name = canonical_names.get(r["pl_name"], r["pl_name"])
+        if name in out and r["pl_name"] != name:
+            continue
+        out[name] = {
+            "archive_name": r["pl_name"],
             "rp_m": rp, "mp_kg": mp, "teq": teq, "rs_m": rs,
             "g": g, "H_km": h / 1e3,
             # ppm of transit depth per scale height
@@ -87,22 +84,59 @@ def planet_params(names: list[str]) -> dict[str, dict]:
     return out
 
 
-def load_survey(root: Path) -> dict[str, dict[str, np.ndarray]]:
+def _detector_diagnostics(root: Path, slug: str, detector: str) -> dict:
+    import json
+
+    betas, impact_parameters, versions = [], [], set()
+    pattern = root / slug / "fits" / "*" / detector.lower() / "white_fit_summary.json"
+    for path in glob.glob(str(pattern)):
+        try:
+            with Path(path).open() as handle:
+                summary = json.load(handle)
+                beta = (summary.get("rednoise") or {}).get("beta_median")
+            if beta is not None and np.isfinite(float(beta)):
+                betas.append(max(1.0, float(beta)))
+            impact = (summary.get("b_p1") or {}).get("median")
+            if impact is not None and np.isfinite(float(impact)):
+                impact_parameters.append(float(impact))
+            if summary.get("fit_version"):
+                versions.add(str(summary["fit_version"]))
+        except (OSError, ValueError, TypeError):
+            continue
+    return {
+        "rednoise_beta": float(np.median(betas)) if betas else 1.0,
+        "rednoise_beta_worst_visit": max(betas) if betas else np.nan,
+        "diagnostics_missing": not bool(betas),
+        "impact_parameter": (float(np.median(impact_parameters))
+                             if impact_parameters else np.nan),
+        "fit_versions": sorted(versions),
+    }
+
+
+def load_survey(root: Path, suffix: str = "", *,
+                inflate_rednoise: bool = False) -> dict[str, dict[str, np.ndarray]]:
     from aster_toolkit.data_reduction.juliet import read_spectrum_csv
 
     out: dict[str, dict[str, np.ndarray]] = {}
-    for f in sorted(glob.glob(str(root / "*" / "combined" /
-                                  "combined_*_transmission_spectrum.csv"))):
+    pattern = f"combined_*_transmission_spectrum{suffix}.csv"
+    for f in sorted(glob.glob(str(root / "*" / "combined" / pattern))):
         slug = Path(f).parts[-3]
         det = "NRS2" if "nrs2" in os.path.basename(f).lower() else "NRS1"
         s = read_spectrum_csv(f)
+        diagnostics = _detector_diagnostics(root, slug, det)
+        if inflate_rednoise:
+            s["depth_err_ppm"] = (
+                np.asarray(s["depth_err_ppm"], dtype=float)
+                * diagnostics["rednoise_beta"]
+            )
+        s.update(diagnostics)
         out.setdefault(slug, {})[det] = s
     return out
 
 
 def pretty(slug: str) -> str:
     """Directory slug -> archive planet name."""
-    special = {"TOI_836_01": "TOI-836.01", "L_98_59_d": "L 98-59 d",
+    special = {"TOI_836_01": "TOI-836 c", "L_98_59_d": "L 98-59 d",
                "K2_18_b": "K2-18 b"}
     if slug in special:
         return special[slug]
@@ -112,36 +146,97 @@ def pretty(slug: str) -> str:
     return f"{'-'.join(p[:-1])} {p[-1]}"
 
 
-def amplitude_in_H(s: dict[str, np.ndarray], delta_ppm: float) -> dict:
-    """Spectral amplitude and its 2-sigma limit, in scale heights."""
-    w = np.concatenate([s[d]["wave"] for d in s])
-    d = np.concatenate([s[d]["depth_ppm"] for d in s])
-    e = np.concatenate([s[d]["depth_err_ppm"] for d in s])
+def _profile_intrinsic_scatter(depth: np.ndarray, error: np.ndarray,
+                               is_nrs2: np.ndarray) -> dict:
+    """Profile a wavelength-independent intrinsic RMS above quoted errors."""
+    design = np.ones((depth.size, 1 + int(is_nrs2.any() and (~is_nrs2).any())))
+    if design.shape[1] == 2:
+        design[:, 1] = is_nrs2.astype(float)
+
+    def evaluate(scatter: float):
+        variance = error**2 + float(scatter)**2
+        weighted_design = design / np.sqrt(variance)[:, None]
+        weighted_depth = depth / np.sqrt(variance)
+        coeff, *_ = np.linalg.lstsq(weighted_design, weighted_depth, rcond=None)
+        residual = depth - design @ coeff
+        loglike = -0.5 * np.sum(np.log(2.0 * np.pi * variance)
+                                + residual**2 / variance)
+        return float(loglike), coeff, residual
+
+    scale = max(float(np.nanstd(depth)), float(np.nanmedian(error)), 1.0)
+    grid = np.concatenate(([0.0], np.geomspace(scale * 1e-4, scale * 20.0, 3000)))
+    loglikes = np.asarray([evaluate(value)[0] for value in grid])
+    best_index = int(np.nanargmax(loglikes))
+    best = float(grid[best_index])
+    threshold = float(loglikes[best_index] - 2.0)
+    beyond = np.flatnonzero(loglikes[best_index:] <= threshold)
+    if beyond.size:
+        upper_index = best_index + int(beyond[0])
+        if upper_index == 0:
+            upper = float(grid[0])
+        else:
+            x0, x1 = grid[upper_index - 1:upper_index + 1]
+            y0, y1 = loglikes[upper_index - 1:upper_index + 1]
+            fraction = (threshold - y0) / (y1 - y0) if y1 != y0 else 1.0
+            upper = float(x0 + np.clip(fraction, 0.0, 1.0) * (x1 - x0))
+    else:
+        upper = float(grid[-1])
+    loglike0, coeff0, residual0 = evaluate(0.0)
+    dof = max(1, depth.size - design.shape[1])
+    chi2_red = float(np.sum((residual0 / error)**2) / dof)
+    return {
+        "scatter_ppm": best,
+        "scatter_2sig_ppm": upper,
+        "residual_ppm": residual0,
+        "mean_ppm": float(coeff0[0]),
+        "detector_offset_ppm": (float(coeff0[1]) if coeff0.size > 1 else 0.0),
+        "chi2_red": chi2_red,
+        "delta_loglike": float(loglikes[best_index] - loglike0),
+    }
+
+
+def amplitude_in_H(s: dict[str, dict[str, np.ndarray]], delta_ppm: float) -> dict:
+    """Profiled spectral modulation and its 2-sigma limit, in scale heights."""
+    detectors = [det for det in ("NRS1", "NRS2") if det in s]
+    w = np.concatenate([s[det]["wave"] for det in detectors])
+    d = np.concatenate([s[det]["depth_ppm"] for det in detectors])
+    e = np.concatenate([s[det]["depth_err_ppm"] for det in detectors])
+    labels = np.concatenate([
+        np.full(s[det]["wave"].size, det, dtype="U4") for det in detectors
+    ])
+    finite = np.isfinite(w) & np.isfinite(d) & np.isfinite(e) & (e > 0)
+    w, d, e, labels = w[finite], d[finite], e[finite], labels[finite]
     o = np.argsort(w)
-    w, d, e = w[o], d[o], e[o]
-    mean = np.sum(d / e**2) / np.sum(1 / e**2)
-    resid = d - mean
-    # Excess scatter beyond the error bars -- the part of the spread that
-    # is not photon noise. Negative excess means consistent with flat.
-    var_obs = float(np.mean(resid**2))
-    var_err = float(np.mean(e**2))
-    excess = var_obs - var_err
-    amp = np.sqrt(max(excess, 0.0)) / delta_ppm
-    # 2-sigma upper limit on a real amplitude. The limit is the measured
-    # excess PLUS the precision with which that excess can be measured,
-    # never less than the precision alone. Without that floor a target
-    # whose quoted errors exceed its actual scatter drives the excess
-    # strongly negative, the limit collapses to zero, and the mu limit
-    # below divides by it -- which is how TOI-776 b and TOI-561 b came
-    # out at "mu > 4600000" instead of "not constrained". A spectrum
-    # cannot bound an amplitude more tightly than it can measure one.
-    n = w.size
-    sig_var = var_obs * np.sqrt(2.0 / max(n - 1, 1))
-    amp_hi = np.sqrt(max(excess, 0.0) + 2 * sig_var) / delta_ppm
-    return {"wave": w, "resid_H": resid / delta_ppm, "err_H": e / delta_ppm,
-            "mean_ppm": float(mean), "amp_H": float(amp),
-            "amp_H_2sig": float(amp_hi), "n": int(n),
-            "excess_ppm": float(np.sqrt(max(excess, 0.0)))}
+    w, d, e, labels = w[o], d[o], e[o], labels[o]
+    profile = _profile_intrinsic_scatter(d, e, labels == "NRS2")
+    beta = max(float(s[det].get("rednoise_beta_worst_visit",
+                               s[det].get("rednoise_beta", 1.0))) for det in detectors)
+    grazing_old_fit = any(
+        float(s[det].get("impact_parameter", np.nan)) > 0.8
+        and (not s[det].get("fit_versions") or any(
+            tuple(int(x) for x in version.split("-")[0].split(".")) < (1, 5)
+            for version in s[det].get("fit_versions", [])))
+        for det in detectors
+    )
+    quality_flags = []
+    if any(s[det].get("diagnostics_missing", False) for det in detectors):
+        quality_flags.append("missing-diagnostics")
+    if beta > QUALITY_BETA_MAX:
+        quality_flags.append("beta>3")
+    if profile["chi2_red"] > QUALITY_CHI2_MAX:
+        quality_flags.append("structured")
+    if grazing_old_fit:
+        quality_flags.append("grazing-v1.4")
+    return {"wave": w, "detector": labels,
+            "resid_H": profile["residual_ppm"] / delta_ppm,
+            "err_H": e / delta_ppm,
+            "mean_ppm": profile["mean_ppm"],
+            "detector_offset_ppm": profile["detector_offset_ppm"],
+            "chi2_red": profile["chi2_red"],
+            "amp_H": profile["scatter_ppm"] / delta_ppm,
+            "amp_H_2sig": profile["scatter_2sig_ppm"] / delta_ppm,
+            "rednoise_beta": beta, "quality_flags": quality_flags,
+            "n": int(w.size), "excess_ppm": profile["scatter_ppm"]}
 
 
 def plot_panels(data, params, out_dir: Path) -> str:
@@ -156,14 +251,14 @@ def plot_panels(data, params, out_dir: Path) -> str:
     ncol, nrow = 3, int(np.ceil(n / 3))
     with plt.rc_context(_PLOT_STYLE):
         fig, axes = plt.subplots(nrow, ncol, figsize=(4.1 * ncol, 2.5 * nrow),
-                                 sharex=True, sharey=True, squeeze=False)
+                                 sharex=True, sharey=False, squeeze=False)
         for ax, (slug, s) in zip(axes.ravel(), items):
             p = params[slug]
             m = amplitude_in_H(s, p["delta_ppm"])
             for det, colour in (("NRS1", DATA_COLOR), ("NRS2", NRS2_COLOR)):
                 if det not in s:
                     continue
-                sel = np.isin(m["wave"], s[det]["wave"])
+                sel = m["detector"] == det
                 ax.errorbar(m["wave"][sel], m["resid_H"][sel],
                             yerr=m["err_H"][sel], fmt=".", ms=4, lw=0.9,
                             color=colour, alpha=0.85)
@@ -171,12 +266,17 @@ def plot_panels(data, params, out_dir: Path) -> str:
             ax.axvspan(3.72, 3.82, color=GAP_COLOR, alpha=0.35, lw=0)
             ax.set_title(f"{pretty(slug)}   $T_{{\\rm eq}}$ {p['teq']:.0f} K",
                          fontsize=10.5, loc="left")
-            ax.text(0.03, 0.06,
-                    f"{p['delta_ppm']:.0f} ppm/H   $A_H$ < {m['amp_H_2sig']:.1f}",
+            ax.text(0.03, 0.03,
+                    f"{p['delta_ppm']:.0f} ppm/H   $A_H$ < {m['amp_H_2sig']:.1f}"
+                    f"   $\\chi^2_\\nu$ {m['chi2_red']:.1f}",
                     transform=ax.transAxes, fontsize=8.5, color=MEAN_COLOR)
+            if m["quality_flags"]:
+                ax.text(0.03, 0.14, ", ".join(m["quality_flags"]),
+                        transform=ax.transAxes, fontsize=8.0, color="#A33A32",
+                        ha="left")
+            ax.margins(y=0.25)
         for ax in axes.ravel()[n:]:
             ax.set_visible(False)
-        axes[-1, 0].set_ylim(-4.5, 4.5)
         for ax in axes[-1]:
             ax.set_xlabel(r"Wavelength  [$\mu$m]")
         for row in axes:
@@ -185,7 +285,7 @@ def plot_panels(data, params, out_dir: Path) -> str:
                      "scale height  (H$_2$/He, $\\mu$ = 2.3)", y=1.0)
         fig.tight_layout()
         out_dir.mkdir(parents=True, exist_ok=True)
-        return _savefig(fig, out_dir, "patchwork_scale_heights")
+        return _savefig(fig, out_dir, "patchwork_scale_heights" + STEM_TAG)
 
 
 def plot_absolute(data, params, out_dir: Path) -> str:
@@ -234,30 +334,7 @@ def plot_absolute(data, params, out_dir: Path) -> str:
                      "absolute depth", y=1.0)
         fig.tight_layout()
         out_dir.mkdir(parents=True, exist_ok=True)
-        return _savefig(fig, out_dir, "patchwork_absolute_depths")
-
-
-def metallicity_from_mu(mu: float) -> float:
-    """Rough metallicity (x solar) implied by a mean molecular weight.
-
-    Solar composition by number is ~0.855 H2 / 0.145 He, giving mu = 2.30.
-    Enriching the metals by Z_rel raises the number fraction x of heavy
-    species (taken as water-like, mu_Z ~ 18) roughly linearly, so
-    mu ~ (1-x) 2.30 + x 18 with x ~ 5e-4 Z_rel.
-
-    Deliberately crude -- a real number needs a self-consistent chemistry
-    grid -- but it puts a mu limit on the axis the sub-Neptune literature
-    argues over. For scale it gives ~3 at 100x solar, which is where
-    Benneke et al. place K2-18 b, TOI-270 d and GJ 3470 b, and ~10 at
-    1000x. Note the Solar System values those are compared against come
-    from CH4/H while exoplanet values come mostly from H2O/H, so the
-    comparison carries a systematic the plot cannot show.
-    """
-    mu = float(mu)
-    if mu <= MU_H2HE:
-        return 1.0
-    x = (mu - MU_H2HE) / (18.0 - MU_H2HE)
-    return float(min(x / 5e-4, 1e5))
+        return _savefig(fig, out_dir, "patchwork_absolute_depths" + STEM_TAG)
 
 
 def mu_limit(amp_H_2sig: float) -> float | None:
@@ -270,7 +347,6 @@ def mu_limit(amp_H_2sig: float) -> float | None:
       which is unphysical. It means the spectrum scatters MORE than a
       clear solar atmosphere would, i.e. a detection or (far more often
       here) excess noise. Either way it is not a composition limit.
-      TOI-1231 b lands here at A_H 5.50 with beta 3.42.
     * A_H at zero returns infinity. Reported as no constraint rather
       than as a spectacular one.
     """
@@ -293,19 +369,17 @@ def plot_trend(data, params, out_dir: Path) -> str:
         p = params[slug]
         m = amplitude_in_H(s, p["delta_ppm"])
         mu_min = mu_limit(m["amp_H_2sig"])
-        if mu_min is None:          # scatter exceeds a clear solar atmosphere
-            continue                 # -> no composition constraint to plot
+        if mu_min is None or m["quality_flags"]:
+            continue
         rows.append((pretty(slug), p, m, mu_min))
     rows.sort(key=lambda r: r[1]["teq"])
 
     with plt.rc_context(_PLOT_STYLE):
         fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-        # Planet mass first: the mass-metallicity relation is the axis
-        # the sub-Neptune literature actually argues over, following the
-        # Solar System's CH4 enrichment trend. Benneke et al. place
-        # K2-18 b, TOI-270 d and GJ 3470 b near 100x solar; whether that
-        # continues, cliffs or plateaus below Neptune mass is the open
-        # question a uniform survey is built to answer.
+        # Planet mass first: whether atmospheric modulation changes across
+        # the radius-valley population is the comparative question. Do not
+        # add a secondary metallicity axis: mu does not map uniquely to
+        # abundance without a self-consistent chemistry model.
         for ax, key, xlabel in (
                 (axes[0], "mp_me", r"Planet mass  [$M_\oplus$]"),
                 (axes[1], "teq", r"Equilibrium temperature  [K]"),
@@ -315,7 +389,7 @@ def plot_trend(data, params, out_dir: Path) -> str:
                 if not np.isfinite(x):
                     continue
                 # Arrow: the limit is one-sided.
-                ax.errorbar(x, mu, yerr=[[mu * 0.45], [0]], fmt="v", ms=8,
+                ax.errorbar(x, mu, yerr=mu * 0.45, lolims=True, fmt="^", ms=8,
                             lw=1.2, color=DATA_COLOR, alpha=0.9)
                 ax.annotate(name, (x, mu), textcoords="offset points",
                             xytext=(6, 4), fontsize=8, color=MEAN_COLOR)
@@ -329,59 +403,74 @@ def plot_trend(data, params, out_dir: Path) -> str:
             ax.set_xlabel(xlabel)
             if key == "mp_me":
                 ax.set_xscale("log")
-                # Published sub-Neptune metallicities for context. These
-                # are retrieved values, not flatness limits, so they are
-                # marked distinctly -- a limit and a measurement are not
-                # the same claim.
-                for nm, mass, zrel in (("K2-18 b", 8.92, 100.0),
-                                       ("TOI-270 d", 4.78, 100.0),
-                                       ("GJ 3470 b", 13.9, 100.0)):
-                    mu_lit = MU_H2HE + zrel * 5e-4 * (18.0 - MU_H2HE)
-                    ax.plot(mass, mu_lit, "o", ms=7, mfc="none", mew=1.6,
-                            color=MODEL_COLOR, zorder=5)
-                    ax.annotate(nm, (mass, mu_lit), textcoords="offset points",
-                                xytext=(6, -12), fontsize=8, color=MODEL_COLOR)
-        axes[0].set_ylabel(r"lower limit on $\mu$  [amu]   (2$\sigma$)")
-        sec = axes[-1].secondary_yaxis(
-            "right", functions=(lambda m: np.clip(
-                (np.asarray(m) - MU_H2HE) / (18.0 - MU_H2HE) / 5e-4, 1, 1e5),
-                lambda z: MU_H2HE + np.asarray(z) * 5e-4 * (18.0 - MU_H2HE)))
-        sec.set_ylabel(r"approx. metallicity  [$\times$ solar]")
-        fig.suptitle("Patchwork — mean molecular weight limits from spectral flatness "
-                     "(or aerosol muting); open circles are published retrievals",
+        axes[0].set_ylabel(r"heuristic lower floor on $\mu$  [amu]   (2$\sigma$)")
+        fig.suptitle("Patchwork — heuristic mean-molecular-weight floors from "
+                     "profiled spectral modulation (or aerosol muting); "
+                     "quality-flagged targets withheld",
                      y=0.99)
         fig.tight_layout()
         out_dir.mkdir(parents=True, exist_ok=True)
-        return _savefig(fig, out_dir, "patchwork_mmw_trend")
+        return _savefig(fig, out_dir, "patchwork_mmw_trend" + STEM_TAG)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", help="Directory of per-target Patchwork outputs.")
     ap.add_argument("-o", "--out-dir", default=".")
+    ap.add_argument("--suffix", default="",
+                    help="Spectrum file suffix, e.g. _R50 for the rebinned set.")
+    ap.add_argument("--tag", default="",
+                    help="Appended to output filenames, e.g. _R50.")
+    ap.add_argument("--inflate-beta", action="store_true",
+                    help="Conservative sensitivity test: multiply channel errors by beta.")
+    ap.add_argument("--legacy-heuristic-mu", action="store_true",
+                    help="Opt in to an uncalibrated historical mu diagnostic, not a composition constraint.")
     args = ap.parse_args()
+    TAG = args.tag or args.suffix
 
     root = Path(os.path.expanduser(args.root))
     out = Path(os.path.expanduser(args.out_dir))
-    data = load_survey(root)
+    global STEM_TAG
+    STEM_TAG = TAG
+    data = load_survey(root, args.suffix,
+                       inflate_rednoise=args.inflate_beta)
     params = planet_params([pretty(s) for s in data])
     params = {s: params[pretty(s)] for s in list(data) if pretty(s) in params}
+    import json
+    from datetime import datetime, timezone
+    missing = sorted(set(data) - set(params))
+    out.mkdir(parents=True, exist_ok=True)
+    (out / ("scale_height_parameters" + STEM_TAG + ".json")).write_text(json.dumps({
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "NASA Exoplanet Archive pscomppars; queried by planet name and known alias",
+        "mu_reference": MU_H2HE, "parameters": params,
+        "omitted_from_scale_heights": missing,
+        "status": "reference normalization; parameter uncertainties not propagated"}, indent=2)+"\n")
+    print("\n" + plot_absolute(data, params, out))
+    if missing:
+        print("WARNING: no finite positive archive parameters for " + ", ".join(missing)
+              + "; retained in absolute-depth atlas, omitted from scale heights.")
     data = {s: v for s, v in data.items() if s in params}
     if not data:
         print("No spectra with archive parameters found."); return 1
 
     print(f"{'planet':13s} {'Teq':>5s} {'g':>6s} {'H':>6s} {'ppm/H':>7s} "
-          f"{'A_H':>6s} {'A_H<2s':>7s} {'mu >':>7s}")
+          f"{'beta':>5s} {'off':>7s} {'chi2':>6s} {'A_H':>6s} "
+          f"{'A_H<2s':>7s} {'mu~>':>7s}  quality")
     for slug in sorted(data, key=lambda s: params[s]["teq"]):
         p, m = params[slug], amplitude_in_H(data[slug], params[slug]["delta_ppm"])
-        mu = mu_limit(m["amp_H_2sig"])
+        mu = (mu_limit(m["amp_H_2sig"])
+              if args.legacy_heuristic_mu and not m["quality_flags"] else None)
         mu_s = f"{mu:7.1f}" if mu is not None else "      -"
         print(f"{pretty(slug):13s} {p['teq']:5.0f} {p['g']:6.1f} "
-              f"{p['H_km']:6.0f} {p['delta_ppm']:7.1f} {m['amp_H']:6.2f} "
-              f"{m['amp_H_2sig']:7.2f} {mu_s}")
-    print("\n" + plot_absolute(data, params, out))
+              f"{p['H_km']:6.0f} {p['delta_ppm']:7.1f} {m['rednoise_beta']:5.2f} "
+              f"{m['detector_offset_ppm']:7.0f} {m['chi2_red']:6.2f} "
+              f"{m['amp_H']:6.2f} {m['amp_H_2sig']:7.2f} {mu_s}  "
+              f"{','.join(m['quality_flags']) or 'ok'}")
     print(plot_panels(data, params, out))
-    print(plot_trend(data, params, out))
+    if args.legacy_heuristic_mu:
+        print("WARNING: heuristic mu floors are uncalibrated and not publication constraints.")
+        print(plot_trend(data, params, out))
     return 0
 
 

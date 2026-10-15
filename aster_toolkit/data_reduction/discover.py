@@ -421,7 +421,7 @@ def build_manifests(
 
     for v in visits:
         override = overrides.get(v["visit_prefix"]) or overrides.get(v["target"] or "")
-        if override:
+        if override and (not resolve or v["ra"] is None or v["dec"] is None):
             v["planet_name"] = override
             v["planet_source"] = "override"
             continue
@@ -449,11 +449,14 @@ def build_manifests(
         v["planet_matches"] = res["matches"]
         v["untestable_planets"] = res.get("untestable", [])
         v["resolution_note"] = query_error or res["note"]
-        if res["confident"]:
+        if override:
+            v["planet_name"] = override
+            v["planet_source"] = "override"
+        elif res["confident"]:
             v["planet_name"] = res["matches"][0]["pl_name"]
             v["planet_source"] = "transit-window"
         elif res["matches"]:
-            v["planet_name"] = res["matches"][0]["pl_name"]
+            v["planet_name"] = None
             v["planet_source"] = "ambiguous"
         else:
             v["planet_name"] = None
@@ -500,6 +503,9 @@ def build_manifests(
                     "visit_prefix": v["visit_prefix"],
                     "sci_tag": v["sci_tag"],
                     "program": f"GO {int(v['program'])}",
+                    **({"transit_candidates": [m["pl_name"]
+                                                for m in v.get("planet_matches", [])]}
+                       if len(v.get("planet_matches", [])) > 1 else {}),
                 }
                 for v in sorted(vs, key=lambda v: v["visit_prefix"])
             },
@@ -510,7 +516,10 @@ def build_manifests(
                 "visits": [
                     {"visit_prefix": v["visit_prefix"], "date_obs": v["date_obs"],
                      "nints": v["nints"], "complete": v["complete"],
-                     "duplicate_download": v["duplicate_download"]}
+                     "duplicate_download": v["duplicate_download"],
+                     "planet_source": v.get("planet_source"),
+                     "planet_matches": v.get("planet_matches", []),
+                     "resolution_note": v.get("resolution_note", "")}
                     for v in vs
                 ],
             },
@@ -540,6 +549,8 @@ def write_manifests(result: dict[str, Any],
                 {"visit_prefix": v["visit_prefix"], "target": v["target"],
                  "date_obs": v["date_obs"], "ra": v["ra"], "dec": v["dec"],
                  "host_planets": v.get("host_planets", []),
+                 "planet_source": v.get("planet_source", "unresolved"),
+                 "planet_matches": v.get("planet_matches", []),
                  "note": v.get("resolution_note", "")}
                 for v in result["unresolved"]
             ],
