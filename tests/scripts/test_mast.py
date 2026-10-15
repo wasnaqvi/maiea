@@ -454,6 +454,20 @@ class MastWrapperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "incomplete result set"):
                 self.mast.search_all_jwst_observations(pagesize=2)
 
+    def test_search_all_accepts_a_duplicated_row_in_a_complete_result(self):
+        """MAST can return one obsid twice and count both copies in its total
+        (live 2026-10-15: NIRISS timeseries, 306 rows / 305 unique, obsid
+        337745841 repeated verbatim). Every row arrived, so this is not a
+        pagination loss and must not raise."""
+        r = lambda i: {"obsid": str(i)}
+        responses = [
+            {"data": [r(1), r(2), r(2)], "paging": {"rowsFiltered": 3}},
+            {"data": [r(1), r(2), r(2)], "paging": {"rowsFiltered": 3}},  # retry
+        ]
+        with patch.object(self.mast, "_mast_query", side_effect=responses):
+            rows, _ = self.mast.search_all_jwst_observations(pagesize=50000)
+        self.assertEqual([row["obsid"] for row in rows], ["1", "2"])
+
     def test_search_all_no_retry_when_totals_match(self):
         responses = [
             {"data": [{"obsid": "1"}, {"obsid": "2"}],

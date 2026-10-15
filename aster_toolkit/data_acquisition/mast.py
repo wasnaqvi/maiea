@@ -550,7 +550,12 @@ def search_all_jwst_observations(
         if retry_total is not None:
             expected_total = retry_total
         all_rows = _collect([retry_rows])
-        if expected_total is not None and len(all_rows) < expected_total:
+        # Judge completeness by rows RECEIVED, not unique rows: MAST can
+        # return one obsid twice and count both copies in its total (live
+        # 2026-10-15: NIRISS timeseries, 306 rows / 305 unique, obsid
+        # 337745841 repeated verbatim). A full-length single page with fewer
+        # unique rows is duplication; nothing is missing.
+        if expected_total is not None and len(retry_rows) < expected_total:
             raise RuntimeError(
                 f"MAST pagination returned an incomplete result set: server "
                 f"reports {expected_total} observations, received "
