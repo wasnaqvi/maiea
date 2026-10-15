@@ -194,7 +194,7 @@ def test_deliver_sends_once_when_mast_says_public(tmp_path, monkeypatch):
     sent = []
     log = alert.deliver_due_subscriptions(path, now=NOW, send=lambda *m: sent.append(m))
     assert len(sent) == 1 and sent[0][0] == "me@example.org"
-    assert "HIP 9618 b: JWST data is public today" in sent[0][1]
+    assert "HIP 9618 b: JWST data is public - GO 8004" in sent[0][1]
     assert 'DownloadMastJwstProducts(obsids="376915403"' in sent[0][2]
     assert log and log[0].startswith("emailed me@example.org")
     assert alert.load_subscriptions(path)[0]["status"] == "sent"
@@ -337,7 +337,7 @@ def test_notifier_thread_delivers_and_stops(tmp_path, monkeypatch):
         while not any("emailed" in line for line in logs) and time.time() < deadline:
             time.sleep(0.05)
         stop.set()
-        assert "HIP 9618 b: JWST data is public today" in smtp.messages[0]["Subject"]
+        assert "HIP 9618 b: JWST data is public - GO 8004" in smtp.messages[0]["Subject"]
         assert any("emailed me@example.org" in line for line in logs)
         assert alert.load_subscriptions(path)[0]["status"] == "sent"
     finally:

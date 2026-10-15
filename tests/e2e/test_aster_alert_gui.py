@@ -138,7 +138,7 @@ def test_nl_email_me_on_release_day_is_delivered_by_the_gui(stack):
         assert smtp.received.wait(60), "\n".join(gui.log[-30:])
         msg = smtp.messages[-1]
         assert msg["To"] == "astro@example.org"
-        assert msg["Subject"].startswith("[ASTER Alert] HIP 9618 b, HIP 9618 c: JWST data is public today")
+        assert msg["Subject"] == "[ASTER Alert] HIP 9618 b, HIP 9618 c: JWST data is public - GO 8004"
         assert 'DownloadMastJwstProducts(obsids="202"' in msg.get_content()
 
         deadline = time.time() + 10

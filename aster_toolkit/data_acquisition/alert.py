@@ -853,7 +853,9 @@ def remove_subscriptions(path: Path, *, subscription_id: str | None = None,
 def _release_email(sub: dict[str, Any]) -> tuple[str, str]:
     who = ", ".join(sub.get("planets") or []) or sub.get("target") or "your target"
     star = " (NIRSpec G395H, Patchwork-ready)" if sub.get("patchwork_ready") else ""
-    subject = f"{who}: JWST data is public today — GO {sub.get('proposal_id')}"
+    # ASCII only: a non-ASCII subject is RFC 2047-encoded, and folding the
+    # encoded words left a double space in some clients.
+    subject = f"{who}: JWST data is public - GO {sub.get('proposal_id')}"
     body = "\n".join([
         f"JWST time-series data for {who} became public on {sub.get('release_date')}.",
         "",
