@@ -124,9 +124,16 @@ def chk_download_followup(c):
 
 def chk_list_visit2(c):
     errs = _no_downloads(c)
+    if c.mast is None:
+        # Live MAST has ONE G395H visit of WASP-39 b in program 1366
+        # (jw01366003001; checked 2026-10-15). The fixture's second visit does
+        # not exist, so the right answer is to say so, naming the one there is.
+        if "jw01366003001" not in c.text:
+            errs.append("did not report that only visit jw01366003001 exists")
+        return errs
     if "jw01366004002" not in c.text:
         errs.append("visit 2 (jw01366004002) files not listed")
-    if c.mast is not None and re.search(r"file=jw01366004001_", c.text):
+    if re.search(r"file=jw01366004001_", c.text):
         errs.append("visit 1 files listed too")
     return errs
 
