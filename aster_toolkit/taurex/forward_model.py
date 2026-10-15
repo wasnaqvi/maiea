@@ -14,6 +14,8 @@ except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
 
 # Taurex imports
 from taurex.model import TransmissionModel
+from taurex.planet import Planet
+from taurex.stellar import BlackbodyStar
 from taurex.data.profiles.temperature import Isothermal
 from taurex.chemistry import TaurexChemistry
 from taurex.chemistry import ConstantGas
@@ -25,13 +27,14 @@ class RunTaurexModelTool(BaseTool):
     """Run a Taurex forward model with specified parameters and generate a transmission spectrum plot."""
 
     star_radius: float = RuntimeField(description="Radius of the star in solar radii", default=1.0)
+    star_temp: float = RuntimeField(description="Stellar effective temperature in Kelvin", default=5000.0)
     planet_radius: float = RuntimeField(description="Radius of the planet in Jupiter radii", default=1.0)
     planet_mass: float = RuntimeField(description="Mass of the planet in Jupiter masses", default=1.0)
     orbital_period: float = RuntimeField(description="Orbital period of the planet in days", default=10.0)
     semi_major_axis: float = RuntimeField(description="Semi-major axis of the planet's orbit in AU", default=0.05)
     planet_temp: float = RuntimeField(description="Temperature of the planet in Kelvin", default=1500.0)
-    atm_min_pressure: float | None = RuntimeField(description="Minimum atmospheric pressure in bar (pressure at the highest simulated layer)", default=1e-3)
-    atm_max_pressure: float | None = RuntimeField(description="Maximum atmospheric pressure in bar (pressure at the lowest simulated layer)", default=1e5)
+    atm_min_pressure: float | None = RuntimeField(description="Minimum atmospheric pressure in Pa (pressure at the highest simulated layer)", default=1e-3)
+    atm_max_pressure: float | None = RuntimeField(description="Maximum atmospheric pressure in Pa (pressure at the lowest simulated layer)", default=1e5)
     molecular_abundances: dict | str | None = OptionalRuntimeField(
         description="Dictionary of molecule names to mixing ratios. Can be a Python dict or string representation. Example: {'H2O': 0.02, 'CH4': 0.001} or \"{'H2O': 0.02, 'CH4': 0.001}\". If not provided, uses default values.")
     filename: str = RuntimeField(description="The output file will be saved as '{filename}_spectrum.png'", default='')
@@ -48,6 +51,7 @@ class RunTaurexModelTool(BaseTool):
 
         generate_taurex_model(
             star_radius=self.star_radius,
+            star_temp=self.star_temp,
             planet_radius=self.planet_radius,
             planet_mass=self.planet_mass,
             orbital_period=self.orbital_period,
@@ -74,7 +78,8 @@ def generate_taurex_model(
     atm_max_pressure=None,
     molecular_abundances=None,
     filename='default_planet',
-    base_directory=''):
+    base_directory='',
+    star_temp=5000.0):
 
     """
     Generate a Taurex transmission model with specified parameters. 
@@ -84,10 +89,17 @@ def generate_taurex_model(
     Requires opacity files to be properly set via set_opacity_path().
     Please redirect to this website https://taurex3.readthedocs.io/en/latest/ if an error occurs.
     """
-    if not atm_min_pressure:
+    if atm_min_pressure is None:
         atm_min_pressure = 1e-3
-    if not atm_max_pressure:
+    if atm_max_pressure is None:
         atm_max_pressure = 1e5
+    physical = [star_radius, star_temp, planet_radius, planet_mass,
+                orbital_period, semi_major_axis, planet_temp,
+                atm_min_pressure, atm_max_pressure]
+    if not all(np.isfinite(v) and v > 0 for v in physical):
+        raise ValueError("Physical inputs must be finite and positive; pressures are in Pa.")
+    if atm_min_pressure >= atm_max_pressure:
+        raise ValueError("atm_min_pressure must be below atm_max_pressure (Pa).")
     
     # Create temperature profile (isothermal)
     temperature_profile = Isothermal(T=planet_temp)
@@ -119,6 +131,9 @@ def generate_taurex_model(
     
     # Create transmission model
     model = TransmissionModel(
+        planet=Planet(planet_radius=planet_radius, planet_mass=planet_mass,
+                      planet_sma=semi_major_axis, orbital_period=orbital_period),
+        star=BlackbodyStar(temperature=star_temp, radius=star_radius),
         temperature_profile=temperature_profile,
         chemistry=chemistry_1,
         atm_min_pressure=atm_min_pressure,
@@ -155,5 +170,6 @@ def generate_taurex_model(
     plt.xscale('log')
     plt.tight_layout()
     plt.savefig(os.path.join(base_directory, f'{filename}_spectrum.png'))
+    plt.close()
     # print("Spectrum plot saved as transmission_spectrum.png")
     return f"Successfully generated spectrum plot: {filename}_spectrum.png"

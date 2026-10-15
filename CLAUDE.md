@@ -126,7 +126,8 @@ TauREx requires opacity cross-sections and CIA (collision-induced absorption) fi
 Key parameters:
 - Physical: `planet_radius` (RJup), `planet_mass` (MJup), `star_radius` (Rsun)
 - Orbital: `orbital_period` (days), `semi_major_axis` (AU)
-- Atmospheric: `planet_temp` (K), `atm_min_pressure`/`atm_max_pressure` (bar)
+- Atmospheric: `planet_temp` (K), `atm_min_pressure`/`atm_max_pressure` (Pa, like the rest of TauREx)
+- Star: `star_temp` (K, blackbody; default 5000)
 - Chemistry: `molecular_abundances` (optional dict, e.g., `{'H2O': 0.02, 'CH4': 0.001}`)
 - Output: `filename` (saves as `{filename}_spectrum.png`)
 
