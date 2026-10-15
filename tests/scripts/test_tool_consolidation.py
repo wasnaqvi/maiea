@@ -39,9 +39,9 @@ def _construct(Tool, **kwargs):
 
 # ---------------- registry ----------------
 
-def test_exports_are_the_25_consolidated_tools():
-    assert len(aster_toolkit.__all__) == 25
-    assert len(set(aster_toolkit.__all__)) == 25
+def test_exports_are_the_26_consolidated_tools():
+    assert len(aster_toolkit.__all__) == 26
+    assert len(set(aster_toolkit.__all__)) == 26
     assert not RETIRED & set(aster_toolkit.__all__)
     for name in RETIRED:
         with pytest.raises(AttributeError):
@@ -310,6 +310,7 @@ EXPECTED_REQUIRED = {
     "CrossmatchJwstToPlanets": [],
     "AggregateJwstObservations": ["group_by", "rows_path"],
     "GetJwstProgramInfo": ["proposal_ids"],
+    "AsterAlert": [],
     "DiscoverPatchworkVisits": ["raw_root"],
     "VerifyPatchworkEnvironment": [],
     "ReduceNirspecG395hTso": ["input_dir"],

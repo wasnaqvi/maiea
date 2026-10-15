@@ -30,7 +30,7 @@ def require_groq_credentials():
 
 
 def get_llm_provider():
-    # Default to 'openai': tool-routing accuracy across ASTER's 25 tools is
+    # Default to 'openai': tool-routing accuracy across ASTER's 26 tools is
     # poor on small local models (llama3.2 routinely picks the wrong tool and
     # invents arguments). '.env' can still override to 'ollama' or 'groq'.
     return os.getenv('ASTER_LLM_PROVIDER', 'openai').lower()
@@ -145,6 +145,7 @@ from aster_toolkit import (
     CrossmatchJwstToPlanets,
     AggregateJwstObservations,
     GetJwstProgramInfo,
+    AsterAlert,
     DiscoverPatchworkVisits,
     VerifyPatchworkEnvironment,
     ReduceNirspecG395hTso,
@@ -203,6 +204,9 @@ tools = [
     AggregateJwstObservations(base_directory=base_directory),
     GetJwstProgramInfo(base_directory=base_directory),
 
+    # ASTER Alert: release dates, recent releases, release-day emails
+    AsterAlert(base_directory=base_directory),
+
     # Patchwork data reduction / fitting tools
     DiscoverPatchworkVisits(base_directory=base_directory),
     VerifyPatchworkEnvironment(base_directory=base_directory),
@@ -223,7 +227,7 @@ tools = [
 if llm_provider == 'openai':
     tools.insert(5, WebSearchTool())
 
-# Tool profiles. All 33 schemas (25 ASTER + 8 orchestral built-ins; 34
+# Tool profiles. All 34 schemas (26 ASTER + 8 orchestral built-ins; 35
 # with WebSearch on openai) are sent on EVERY request; the Patchwork
 # tools have long docstrings, so the full set costs ~11k tokens before the
 # conversation starts -- enough to exhaust a 30k TPM tier in one turn.
@@ -300,6 +304,11 @@ def main():
 
     if llm_provider == 'groq':
         app_server.state.non_streaming_models.add(agent.llm.model)
+
+    # ASTER's GUI additions (the ASTER Alert card, its reminder bell and the
+    # release-day email notifier); see aster_toolkit/gui.py.
+    from aster_toolkit.gui import install as install_aster_gui
+    install_aster_gui(app_server, base_directory=base_directory)
 
     app_server.run_server(agent, host='localhost', port=8000)
 

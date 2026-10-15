@@ -2,6 +2,8 @@
 
     POST /api/v0/invoke              Mashup: Name.Lookup, Caom.Filtered(.Position), Caom.Products
     GET  /api/v0.1/Download/file     ?uri=mast:JWST/product/<file>  (Range-aware)
+    GET  /TAP/sync                   the NASA Exoplanet Archive's TAP endpoint, as CSV
+                                     (ASTER reaches it through ASTER_ARCHIVE_TAP_URL)
 
 Serves the shared fixture in tests/scripts/fake_mast_archive.py. Discrete
 filters are EXACT-match, like the real service (that is what the instrument
@@ -25,7 +27,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from fake_mast_archive import obs_rows, products_for, resolve, sep_deg  # noqa: E402
+from fake_mast_archive import obs_rows, products_for, resolve, sep_deg, tap_rows  # noqa: E402
 
 _UNCAL_RE = re.compile(
     r"^(?P<prefix>jw\d{11})_\d{5}_\d{5}(?:-seg(?P<seg>\d{3}))?_(?P<det>[a-z0-9]+)_"
@@ -80,6 +82,21 @@ def mashup(request: dict) -> dict:
     return {"status": "ERROR", "msg": f"fake MAST: unsupported service {svc!r}"}
 
 
+def tap_csv(adql: str) -> str:
+    import csv
+    m = re.search(r"SELECT\s+(?:DISTINCT\s+)?(?:TOP\s+\d+\s+)?(.*?)\s+FROM", adql, re.I | re.S)
+    cols = [c.strip() for c in (m[1] if m else "*").split(",")]
+    rows = tap_rows(adql)
+    if cols == ["*"]:
+        cols = list(rows[0]) if rows else ["pl_name"]
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({c: r.get(c, "") for c in cols})
+    return buf.getvalue()
+
+
 class FakeMast(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -123,6 +140,10 @@ class _Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/health":
             return self._send(200, b"ok", "text/plain")
+        if url.path == "/TAP/sync":
+            adql = parse_qs(url.query).get("query", [""])[0]
+            self.server.record({"kind": "tap", "adql": adql})
+            return self._send(200, tap_csv(adql).encode(), "text/csv")
         if url.path != "/api/v0.1/Download/file":
             return self._send(404, b"not found", "text/plain")
         uri = parse_qs(url.query).get("uri", [""])[0]

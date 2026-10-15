@@ -4,9 +4,25 @@ Used by test_exotedrf_parity.py (in-process, HTTP layer patched) and by the
 GUI end-to-end test (served over real HTTP by tests/e2e/fake_mast_server.py).
 """
 import math
+import re
+import time
 
 WASP39 = (217.32667, -3.44450)
 OTHER = (10.0, 20.0)
+HD12572 = (30.9050061, 21.2813274)     # HIP 9618 b and c; MAST names it "HD-12572b"
+
+
+def now_mjd() -> float:
+    return time.time() / 86400.0 + 40587.0
+
+
+# Release dates (MJD). Everything ERS 1366 went public in 2022. GO 8004 o003
+# was released 36 days ago; o004 is locked until LOCKED_RELEASE_MJD, which a
+# test may move to a few seconds from now to watch the release-day email go
+# out. Access is computed per request, like MAST: PUBLIC once released.
+OLD_RELEASE_MJD = 59800.0
+RECENT_RELEASE_MJD = now_mjd() - 36
+LOCKED_RELEASE_MJD = now_mjd() + 89
 
 OBS = [
     # obsid, obs_id, instrument, filters, program, coords, visit prefixes
@@ -22,7 +38,25 @@ OBS = [
      "NIRSPEC/SLIT", "F290LP;G395H", "2783", WASP39, ["jw02783001001"]),
     ("106", "jw01366-o099_t009_nirspec_f290lp-g395h-s1600a1-sub2048",
      "NIRSPEC/SLIT", "F290LP;G395H", "1366", OTHER, ["jw01366099001"]),
+    ("201", "jw08004-o003_t002_nirspec_f290lp-g395h-s1600a1-sub2048",
+     "NIRSPEC/SLIT", "F290LP;G395H", "8004", HD12572, ["jw08004003001"]),
+    ("202", "jw08004-o004_t002_nirspec_f290lp-g395h-s1600a1-sub2048",
+     "NIRSPEC/SLIT", "F290LP;G395H", "8004", HD12572, ["jw08004004001"]),
 ]
+
+# For the fake Exoplanet Archive (TAP) the e2e GUI test points ASTER at.
+PLANETS = [
+    {"pl_name": "WASP-39 b", "hostname": "WASP-39", "ra": WASP39[0], "dec": WASP39[1],
+     "pl_rade": 14.34, "pl_eqt": 1166, "tran_flag": 1},
+    {"pl_name": "HIP 9618 b", "hostname": "HIP 9618", "ra": HD12572[0], "dec": HD12572[1],
+     "pl_rade": 3.83, "pl_eqt": 641, "tran_flag": 1},
+    {"pl_name": "HIP 9618 c", "hostname": "HIP 9618", "ra": HD12572[0], "dec": HD12572[1],
+     "pl_rade": 3.43, "pl_eqt": 470, "tran_flag": 1},
+]
+
+
+def _release(obsid: str) -> float:
+    return {"201": RECENT_RELEASE_MJD, "202": LOCKED_RELEASE_MJD}.get(obsid, OLD_RELEASE_MJD)
 
 
 def obs_rows():
@@ -30,7 +64,11 @@ def obs_rows():
         {"obsid": o, "obs_id": oid, "instrument_name": inst, "filters": flt,
          "proposal_id": prog, "s_ra": c[0], "s_dec": c[1],
          "obs_collection": "JWST", "dataproduct_type": "timeseries",
-         "calib_level": 3, "target_name": "WASP-39" if c == WASP39 else "OTHER"}
+         "calib_level": 3,
+         "target_name": {WASP39: "WASP-39", HD12572: "HD-12572b"}.get(c, "OTHER"),
+         "proposal_pi": "Batalha, Natasha" if prog == "8004" else "Batalha, Natalie",
+         "t_min": _release(o) - 365, "t_obs_release": _release(o),
+         "dataRights": "PUBLIC" if _release(o) <= now_mjd() else "EXCLUSIVE_ACCESS"}
         for o, oid, inst, flt, prog, c, _ in OBS
     ]
 
@@ -84,4 +122,31 @@ def resolve(name):
     key = name.replace(" ", "").upper()
     if key.startswith("WASP-39"):
         return WASP39
+    if key in ("HD-12572B", "HD12572B", "HD12572", "HIP9618B", "HIP9618C", "HIP9618"):
+        return HD12572
     raise ValueError(name)
+
+
+_BETWEEN_RE = re.compile(r"\b(\w+)\s+between\s+(-?[\d.]+)\s+and\s+(-?[\d.]+)", re.I)
+_CMP_RE = re.compile(r"\b(pl_rade|pl_eqt|tran_flag)\s*(>=|<=|=|>|<)\s*(-?[\d.]+)", re.I)
+_IN_RE = re.compile(r"\bpl_name\s+IN\s*\(([^)]*)\)", re.I)
+_EQ_RE = re.compile(r"\b(pl_name|hostname)\s*=\s*'([^']*)'", re.I)
+
+
+def tap_rows(adql: str) -> list[dict]:
+    """Planets matching the handful of ADQL shapes ASTER sends: RA/Dec boxes,
+    numeric bounds, pl_name IN (...), and pl_name/hostname = '...'."""
+    rows = list(PLANETS)
+    for col, lo, hi in _BETWEEN_RE.findall(adql):
+        rows = [r for r in rows if float(lo) <= float(r[col.lower()]) <= float(hi)]
+    ops = {">=": float.__ge__, "<=": float.__le__, "=": float.__eq__,
+           ">": float.__gt__, "<": float.__lt__}
+    for col, op, val in _CMP_RE.findall(adql):
+        rows = [r for r in rows if ops[op](float(r[col.lower()]), float(val))]
+    if m := _IN_RE.search(adql):
+        names = set(re.findall(r"'([^']*)'", m[1]))
+        rows = [r for r in rows if r["pl_name"] in names]
+    eqs = _EQ_RE.findall(adql)
+    if eqs:
+        rows = [r for r in rows if any(r[c.lower()] == v for c, v in eqs)]
+    return rows

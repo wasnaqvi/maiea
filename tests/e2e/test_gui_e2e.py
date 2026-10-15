@@ -192,8 +192,10 @@ def test_real_model_eval_grader_detects_misrouting():
     out = proc.stdout
     assert proc.returncode == 1, out + proc.stderr
     for name in ("search: program-level", "search: grating, informal",
-                 "download: follow-up 'that one'", "download: program-only"):
+                 "download: follow-up 'that one'", "download: program-only",
+                 "alert: when does a target go public", "alert: what is going public soon",
+                 "alert: email on release day"):
         assert f"PASS  [1] {name}" in out, out
     assert "FAIL  [1] list: one visit" in out and "visit 1 files listed too" in out
     assert "FAIL  [1] routing: parameters are not MAST" in out
-    assert "4/6 scenario runs passed" in out
+    assert "7/9 scenario runs passed" in out

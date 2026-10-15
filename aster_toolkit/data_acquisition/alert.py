@@ -41,10 +41,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import smtplib
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -145,32 +148,42 @@ def fetch_snapshot(
         obs_keep_keys=tuple(ALERT_COLUMNS),
     )
 
-    tag = (config.tag_grating or "").upper()
     snapshot: dict[str, dict[str, Any]] = {}
     for row in pairs:
-        release = _as_float(row.get("t_obs_release"))
-        rights = str(row.get("dataRights") or "").upper() or "UNKNOWN"
-        public = rights == "PUBLIC" or (release is not None and release <= t_now)
         key = f"{row.get('pl_name')}|{row.get('obsid')}"
-        snapshot[key] = {
-            "pl_name": row.get("pl_name"),
-            "obsid": str(row.get("obsid")),
-            "obs_id": row.get("obs_id"),
-            "proposal_id": str(row.get("proposal_id") or ""),
-            "proposal_pi": row.get("proposal_pi"),
-            "instrument_name": row.get("instrument_name"),
-            "filters": row.get("filters"),
-            "t_min": _as_float(row.get("t_min")),
-            "t_obs_release": release,
-            "release_date": mjd_to_iso(release),
-            "dataRights": rights,
-            "is_public": bool(public),
-            "days_until_public": (
-                None if public or release is None else round(release - t_now, 1)
-            ),
-            "patchwork_ready": bool(tag) and tag in str(row.get("filters") or "").upper(),
-        }
+        snapshot[key] = observation_record(row, t_now, config.tag_grating)
     return snapshot
+
+
+def observation_record(row: dict[str, Any], t_now: float,
+                       tag_grating: str | None = "G395H") -> dict[str, Any]:
+    """One CAOM observation row (optionally joined to a planet) -> the record
+    every ASTER Alert path uses: snapshot, lookup, watchlist, subscriptions."""
+    release = _as_float(row.get("t_obs_release"))
+    rights = str(row.get("dataRights") or "").upper() or "UNKNOWN"
+    public = rights == "PUBLIC" or (release is not None and release <= t_now)
+    tag = (tag_grating or "").upper()
+    return {
+        "pl_name": row.get("pl_name"),
+        "pl_rade": _as_float(row.get("pl_rade")),
+        "pl_eqt": _as_float(row.get("pl_eqt")),
+        "target_name": row.get("target_name"),
+        "obsid": str(row.get("obsid")),
+        "obs_id": row.get("obs_id"),
+        "proposal_id": str(row.get("proposal_id") or ""),
+        "proposal_pi": row.get("proposal_pi"),
+        "instrument_name": row.get("instrument_name"),
+        "filters": row.get("filters"),
+        "t_min": _as_float(row.get("t_min")),
+        "t_obs_release": release,
+        "release_date": mjd_to_iso(release),
+        "dataRights": rights,
+        "is_public": bool(public),
+        "days_until_public": (
+            None if public or release is None else round(release - t_now, 1)
+        ),
+        "patchwork_ready": bool(tag) and tag in str(row.get("filters") or "").upper(),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -384,22 +397,42 @@ def slack_notifier(webhook_url: str) -> Notifier:
     return _send
 
 
-def email_notifier(to_addr: str) -> Notifier:
-    """SMTP via env: ASTER_ALERT_SMTP_HOST/PORT/USER/PASSWORD/FROM."""
-    def _send(subject: str, body: str) -> None:
-        host = os.environ["ASTER_ALERT_SMTP_HOST"]
-        port = int(os.environ.get("ASTER_ALERT_SMTP_PORT", "587"))
-        user = os.environ.get("ASTER_ALERT_SMTP_USER")
-        msg = EmailMessage()
-        msg["Subject"] = f"[ASTER Alert] {subject}"
-        msg["From"] = os.environ.get("ASTER_ALERT_SMTP_FROM", user or "aster-alert")
-        msg["To"] = to_addr
-        msg.set_content(body)
-        with smtplib.SMTP(host, port, timeout=30) as smtp:
+def smtp_configured() -> bool:
+    return bool(os.environ.get("ASTER_ALERT_SMTP_HOST"))
+
+
+def send_email(to_addr: str, subject: str, body: str) -> None:
+    """Send one message over SMTP configured by environment variables:
+
+    ASTER_ALERT_SMTP_HOST (required), _PORT (587), _USER, _PASSWORD, _FROM,
+    and _TLS: ``starttls`` (default), ``ssl`` (default when the port is 465)
+    or ``none`` (a local relay only — the password would cross in clear).
+    """
+    host = os.environ.get("ASTER_ALERT_SMTP_HOST")
+    if not host:
+        raise RuntimeError("Email is not configured: set ASTER_ALERT_SMTP_HOST "
+                           "(and _PORT/_USER/_PASSWORD/_FROM) in .env.")
+    port = int(os.environ.get("ASTER_ALERT_SMTP_PORT", "587"))
+    tls = os.environ.get("ASTER_ALERT_SMTP_TLS", "ssl" if port == 465 else "starttls").lower()
+    user = os.environ.get("ASTER_ALERT_SMTP_USER")
+    msg = EmailMessage()
+    msg["Subject"] = f"[ASTER Alert] {subject}"
+    msg["From"] = os.environ.get("ASTER_ALERT_SMTP_FROM") or user or "aster-alert@localhost"
+    msg["To"] = to_addr
+    msg.set_content(body)
+    smtp_cls = smtplib.SMTP_SSL if tls == "ssl" else smtplib.SMTP
+    with smtp_cls(host, port, timeout=30) as smtp:
+        if tls == "starttls":
             smtp.starttls()
-            if user:
-                smtp.login(user, os.environ["ASTER_ALERT_SMTP_PASSWORD"])
-            smtp.send_message(msg)
+        if user:
+            smtp.login(user, os.environ.get("ASTER_ALERT_SMTP_PASSWORD", ""))
+        smtp.send_message(msg)
+
+
+def email_notifier(to_addr: str) -> Notifier:
+    """SMTP via env; see ``send_email``."""
+    def _send(subject: str, body: str) -> None:
+        send_email(to_addr, subject, body)
     return _send
 
 
@@ -453,6 +486,676 @@ def list_upcoming(config: AlertConfig, session: requests.Session | None = None) 
     return render_digest(events, config) or "Nothing on the watchlist is proprietary."
 
 
+# --------------------------------------------------------------------------
+# one target: "when is HD-12572b going public?"
+# --------------------------------------------------------------------------
+_PLANET_SUFFIX_RE = re.compile(r"^(.*?\d)[\s_-]*([b-i])$", re.IGNORECASE)
+
+
+def _name_variants(name: str) -> list[str]:
+    """'HD-12572b' -> ['HD-12572b', 'HD-12572 b', 'HD 12572 b', 'HD-12572',
+    'HD 12572']. MAST's resolver knows some spellings and not others (it
+    resolves 'HD-12572b' and 'HD 12572' but not 'HD-12572'), so try several."""
+    base = " ".join(str(name or "").split())
+    out = [base]
+    m = _PLANET_SUFFIX_RE.match(base)
+    if m:
+        host = m[1].rstrip(" -_")
+        letter = m[2].lower()
+        out += [f"{host} {letter}", f"{host.replace('-', ' ')} {letter}",
+                host, host.replace("-", " ")]
+    else:
+        out.append(base.replace("-", " "))
+    return list(dict.fromkeys(v for v in out if v))
+
+
+def resolve_target(name: str, *, session: requests.Session | None = None
+                   ) -> tuple[float, float, str]:
+    """(ra, dec, the spelling that resolved). MAST's name resolver first,
+    then the Exoplanet Archive by planet or host name."""
+    variants = _name_variants(name)
+    if not variants:
+        raise ValueError("A target name is required.")
+    for v in variants:
+        try:
+            ra, dec = mast.resolve_target_coordinates(v, session=session)
+            return ra, dec, v
+        except Exception:
+            continue
+    for v in variants:
+        quoted = v.replace("'", "''")
+        try:
+            rows = mast.archive_tap_query(
+                [f"pl_name = '{quoted}' OR hostname = '{quoted}'"],
+                columns=["pl_name", "ra", "dec"], session=session)
+        except Exception:
+            continue
+        for row in rows:
+            ra, dec = _as_float(row.get("ra")), _as_float(row.get("dec"))
+            if ra is not None and dec is not None:
+                return ra, dec, v
+    raise ValueError(f"Could not resolve {name!r} to sky coordinates "
+                     f"(tried {', '.join(repr(v) for v in variants)}).")
+
+
+def planets_near(ra: float, dec: float, radius_deg: float = 0.02, *,
+                 session: requests.Session | None = None) -> list[dict[str, Any]]:
+    """Exoplanet Archive planets within a small RA/Dec box (the archive's TAP
+    service refuses CONTAINS/CIRCLE with HTTP 403). Never fatal."""
+    dra = radius_deg / max(math.cos(math.radians(dec)), 1e-6)
+    conds = [f"ra between {ra - dra:.6f} and {ra + dra:.6f}",
+             f"dec between {dec - radius_deg:.6f} and {dec + radius_deg:.6f}"]
+    try:
+        return mast.archive_tap_query(conds, columns=PLANET_COLUMNS, session=session)
+    except Exception:
+        return []
+
+
+def lookup_target(name: str, *, radius_deg: float = 0.02, tag_grating: str = "G395H",
+                  session: requests.Session | None = None,
+                  t_now: float | None = None) -> dict[str, Any]:
+    """Every executed JWST time-series observation at a target, public or not."""
+    t_now = now_mjd() if t_now is None else t_now
+    ra, dec, resolved_as = resolve_target(name, session=session)
+    rows = mast.search_jwst_observations(
+        None, ra=ra, dec=dec, radius_deg=radius_deg,
+        dataproduct_types=["timeseries"], calib_levels=[3],
+        columns=ALERT_COLUMNS, session=session,
+    )
+    planets = planets_near(ra, dec, radius_deg, session=session)
+    seen: set[str] = set()
+    observations = []
+    for row in rows:
+        rec = observation_record(row, t_now, tag_grating)
+        if rec["obsid"] in seen:
+            continue
+        seen.add(rec["obsid"])
+        observations.append(rec)
+    observations.sort(key=lambda r: (r["t_obs_release"] or 9e9, r["obs_id"] or ""))
+    return {"target": name, "resolved_as": resolved_as, "ra": ra, "dec": dec,
+            "planets": planets, "observations": observations, "t_now": t_now}
+
+
+def fetch_observations_by_obsid(obsids: Iterable[str], *, t_now: float | None = None,
+                                session: requests.Session | None = None
+                                ) -> dict[str, dict[str, Any]]:
+    """Current CAOM record (release date, access) for specific obsids."""
+    t_now = now_mjd() if t_now is None else t_now
+    ids = list(dict.fromkeys(str(o) for o in obsids if str(o).strip()))
+    out: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(ids), 100):
+        request = {
+            "service": "Mast.Caom.Filtered", "format": "json",
+            "pagesize": 500, "page": 1,
+            "params": {"columns": ",".join(ALERT_COLUMNS),
+                       "filters": [{"paramName": "obsid", "values": ids[i:i + 100]}]},
+        }
+        for row in mast._extract_rows(mast._mast_query(request, session=session)):
+            out[str(row.get("obsid"))] = observation_record(row, t_now)
+    return out
+
+
+def _program_infos(pids: Iterable[str], cache_path: str | os.PathLike[str] | None
+                   ) -> dict[str, dict[str, Any]]:
+    infos: dict[str, dict[str, Any]] = {}
+    for pid in dict.fromkeys(p for p in pids if p and str(p).isdigit()):
+        try:
+            infos[pid] = mast.get_jwst_program_info(pid, cache_path=cache_path)
+        except Exception:  # network / page layout: report without it
+            continue
+    return infos
+
+
+def _days_phrase(days: float) -> str:
+    d = int(round(days))
+    return "today" if d <= 0 else "tomorrow" if d == 1 else f"in {d} days"
+
+
+def _obs_line(r: dict[str, Any], infos: dict[str, dict[str, Any]]) -> str:
+    star = "★ " if r.get("patchwork_ready") else ""
+    if r["is_public"]:
+        when = f"PUBLIC since {r['release_date']}"
+    elif r["t_obs_release"] is None:
+        when = "LOCKED, release date unknown"
+    else:
+        when = f"LOCKED until {r['release_date']} ({_days_phrase(r['days_until_public'])})"
+    info = infos.get(r.get("proposal_id") or "", {})
+    pi = info.get("pi") or r.get("proposal_pi") or "?"
+    observed = f" · observed {mjd_to_iso(r['t_min'])}" if r.get("t_min") else ""
+    return (f"  {star}{when} · GO {r.get('proposal_id') or '?'} (PI {pi}) · "
+            f"{r.get('instrument_name')} {r.get('filters') or ''}{observed} · "
+            f"obsid {r['obsid']} · {r.get('obs_id')}")
+
+
+def _programs_footer(records: list[dict[str, Any]],
+                     infos: dict[str, dict[str, Any]]) -> list[str]:
+    """Each program's title once, rather than on every observation line."""
+    pids = list(dict.fromkeys(r.get("proposal_id") for r in records
+                              if infos.get(r.get("proposal_id") or "", {}).get("title")))
+    if not pids:
+        return []
+    return ["", "Programs:"] + [
+        f"  GO {pid} (Cycle {infos[pid].get('cycle') or '?'}): {infos[pid]['title']}"
+        for pid in pids]
+
+
+def _planet_label(p: dict[str, Any]) -> str:
+    bits = []
+    rade, eqt = _as_float(p.get("pl_rade")), _as_float(p.get("pl_eqt"))
+    if rade is not None:
+        bits.append(f"{rade:.2f} R⊕")
+    if eqt is not None:
+        bits.append(f"{eqt:.0f} K")
+    return f"{p.get('pl_name')}" + (f" ({', '.join(bits)})" if bits else "")
+
+
+def render_lookup(result: dict[str, Any], cache_path: str | None = None) -> str:
+    obs = result["observations"]
+    target = result["target"]
+    locked = [r for r in obs if not r["is_public"]]
+    if locked:
+        nxt = locked[0]
+        head = (f"ASTER Alert · {target}: next release {nxt['release_date']} "
+                f"({_days_phrase(nxt['days_until_public'] or 0)}); "
+                f"{len(locked)} of {len(obs)} JWST time-series observations still locked")
+    elif obs:
+        last = max((r for r in obs if r["t_obs_release"] is not None),
+                   key=lambda r: r["t_obs_release"], default=obs[-1])
+        head = (f"ASTER Alert · {target}: all {len(obs)} JWST time-series observations "
+                f"are already public (latest released {last['release_date']})")
+    else:
+        head = (f"ASTER Alert · {target}: no executed JWST time-series observations "
+                "in MAST")
+    lines = [head, ""]
+    lines.append(f"Resolved '{result['resolved_as']}' to RA {result['ra']:.5f}, "
+                 f"Dec {result['dec']:+.5f}.")
+    if result["planets"]:
+        lines.append("Planets at this position (NASA Exoplanet Archive): "
+                     + ", ".join(_planet_label(p) for p in result["planets"]))
+    infos = _program_infos((r.get("proposal_id") for r in obs), cache_path)
+    if obs:
+        lines += ["", "JWST time-series observations, by release date:"]
+        lines += [_obs_line(r, infos) for r in obs]
+        lines += _programs_footer(obs, infos)
+    else:
+        lines.append("Approved visits that have not been executed yet are not in "
+                     "MAST, so ASTER Alert cannot date them.")
+    lines.append("")
+    if locked:
+        lines.append(f'Email on release day: AsterAlert(action="subscribe", '
+                     f'target="{target}", email="you@example.com")')
+    public = [r for r in obs if r["is_public"]]
+    if public:
+        lines.append(f'Fetch the latest public visit: DownloadMastJwstProducts('
+                     f'obsids="{public[-1]["obsid"]}", raw_only=True, list_only=True)')
+    if any(r.get("patchwork_ready") for r in obs):
+        lines.append("★ = NIRSpec G395H (Patchwork-ready)")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# a population: "what sub-Neptunes went / are going public recently?"
+# --------------------------------------------------------------------------
+def watchlist_report(config: AlertConfig, *, days_back: float = 60, days_ahead: float = 120,
+                     session: requests.Session | None = None,
+                     t_now: float | None = None) -> dict[str, Any]:
+    t_now = now_mjd() if t_now is None else t_now
+    snap = fetch_snapshot(config, session=session, reference_mjd=t_now)
+    by_planet: dict[str, list[dict[str, Any]]] = {}
+    for r in snap.values():
+        by_planet.setdefault(r["pl_name"], []).append(r)
+
+    def released_before(planet: str, mjd: float) -> bool:
+        return any(o["is_public"] and o["t_obs_release"] is not None
+                   and o["t_obs_release"] < mjd for o in by_planet[planet])
+
+    released, upcoming, later = [], [], []
+    for r in snap.values():
+        rel = r["t_obs_release"]
+        if rel is None:
+            continue
+        if r["is_public"] and t_now - days_back <= rel <= t_now:
+            r["first_public_data"] = not released_before(r["pl_name"], t_now - days_back)
+            released.append(r)
+        elif not r["is_public"] and rel <= t_now + days_ahead:
+            r["first_public_data"] = not any(o["is_public"] for o in by_planet[r["pl_name"]])
+            upcoming.append(r)
+        elif not r["is_public"]:
+            later.append(r)
+    released.sort(key=lambda r: (-r["t_obs_release"], r["pl_name"]))
+    upcoming.sort(key=lambda r: (r["t_obs_release"], r["pl_name"]))
+    return {"released": released, "upcoming": upcoming, "later": later,
+            "days_back": days_back, "days_ahead": days_ahead, "t_now": t_now,
+            "watching": (", ".join(config.planets) if config.planets
+                         else f"the '{config.population_preset}' population"),
+            "n_watched": len(snap)}
+
+
+def _grouped(records: list[dict[str, Any]], infos: dict[str, dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    order: list[str] = []
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        if r["pl_name"] not in groups:
+            order.append(r["pl_name"])
+        groups.setdefault(r["pl_name"], []).append(r)
+    for planet in order:
+        rs = groups[planet]
+        first = " ✦ first public JWST time-series data" if rs[0].get("first_public_data") else ""
+        lines.append(f"- {_planet_label(rs[0])}{first}")
+        lines += ["  " + _obs_line(r, infos) for r in rs]
+    return lines
+
+
+def render_watchlist(report: dict[str, Any], cache_path: str | None = None) -> str:
+    rel, up, later = report["released"], report["upcoming"], report["later"]
+    n_rel_p = len({r["pl_name"] for r in rel})
+    n_up_p = len({r["pl_name"] for r in up})
+    head = (f"ASTER Alert · {n_up_p} planet(s) go public in the next "
+            f"{report['days_ahead']:g} days; {n_rel_p} went public in the last "
+            f"{report['days_back']:g} days")
+    infos = _program_infos((r.get("proposal_id") for r in rel + up), cache_path)
+    lines = [head, "", f"Watching {report['watching']} "
+             f"({report['n_watched']} planet-observation pairs in MAST).", ""]
+    lines.append(f"## Going public in the next {report['days_ahead']:g} days ({len(up)})")
+    lines += _grouped(up, infos) or ["- none"]
+    lines += ["", f"## Went public in the last {report['days_back']:g} days ({len(rel)})"]
+    lines += _grouped(rel, infos) or ["- none"]
+    lines += _programs_footer(up + rel, infos)
+    if later:
+        last = max(r["t_obs_release"] for r in later)
+        lines += ["", f"Later: {len(later)} more locked observation(s), the last on "
+                      f"{mjd_to_iso(last)} (raise days_ahead to list them)."]
+    lines += ["", "★ = NIRSpec G395H (Patchwork-ready) · ✦ = the planet's first public "
+                  "JWST time-series data",
+              "Only executed visits are in MAST; approved-but-unobserved visits are not."]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# email on release day
+# --------------------------------------------------------------------------
+SUBSCRIPTIONS_RELPATH = "mast/alert/subscriptions.json"
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SUBS_LOCK = threading.RLock()   # tool calls and the GUI notifier thread
+
+
+def subscriptions_path(base_directory: str | os.PathLike[str] | None) -> Path:
+    return Path(base_directory or ".") / SUBSCRIPTIONS_RELPATH
+
+
+def load_subscriptions(path: Path) -> list[dict[str, Any]]:
+    if not Path(path).exists():
+        return []
+    with Path(path).open() as fh:
+        return list(json.load(fh).get("subscriptions", []))
+
+
+def save_subscriptions(path: Path, subs: list[dict[str, Any]]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w") as fh:
+        json.dump({"version": 1, "subscriptions": subs}, fh, indent=1)
+    tmp.replace(path)
+
+
+def add_subscriptions(path: Path, *, email: str, target: str, planets: list[str],
+                      records: list[dict[str, Any]],
+                      infos: dict[str, dict[str, Any]] | None = None
+                      ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Subscribe ``email`` to each record's release. Returns (added, already)."""
+    infos = infos or {}
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _SUBS_LOCK:
+        subs = load_subscriptions(path)
+        by_id = {s["id"]: s for s in subs}
+        added, already = [], []
+        for r in records:
+            sid = f"{r['obsid']}:{email.lower()}"
+            if sid in by_id and by_id[sid].get("status") == "pending":
+                already.append(by_id[sid])
+                continue
+            info = infos.get(r.get("proposal_id") or "", {})
+            sub = {
+                "id": sid, "email": email, "target": target, "planets": planets,
+                "obsid": r["obsid"], "obs_id": r.get("obs_id"),
+                "proposal_id": r.get("proposal_id"),
+                "pi": info.get("pi") or r.get("proposal_pi"),
+                "program_title": info.get("title"),
+                "instrument_name": r.get("instrument_name"), "filters": r.get("filters"),
+                "patchwork_ready": r.get("patchwork_ready", False),
+                "t_obs_release": r.get("t_obs_release"),
+                "release_date": r.get("release_date"),
+                "status": "pending", "created_utc": stamp,
+            }
+            subs = [s for s in subs if s["id"] != sid] + [sub]
+            added.append(sub)
+        save_subscriptions(path, subs)
+    return added, already
+
+
+def remove_subscriptions(path: Path, *, subscription_id: str | None = None,
+                         target: str | None = None) -> list[dict[str, Any]]:
+    with _SUBS_LOCK:
+        subs = load_subscriptions(path)
+
+        def hit(s: dict[str, Any]) -> bool:
+            if subscription_id:
+                return s["id"] == subscription_id
+            return bool(target) and str(s.get("target", "")).lower() == target.lower()
+
+        removed = [s for s in subs if hit(s)]
+        save_subscriptions(path, [s for s in subs if not hit(s)])
+    return removed
+
+
+def _release_email(sub: dict[str, Any]) -> tuple[str, str]:
+    who = ", ".join(sub.get("planets") or []) or sub.get("target") or "your target"
+    star = " (NIRSpec G395H, Patchwork-ready)" if sub.get("patchwork_ready") else ""
+    subject = f"{who}: JWST data is public today — GO {sub.get('proposal_id')}"
+    body = "\n".join([
+        f"JWST time-series data for {who} became public on {sub.get('release_date')}.",
+        "",
+        f"Target you asked about: {sub.get('target')}",
+        f"Program: GO {sub.get('proposal_id')} (PI {sub.get('pi') or '?'})"
+        + (f" — {sub['program_title']}" if sub.get("program_title") else ""),
+        f"Instrument: {sub.get('instrument_name')} {sub.get('filters') or ''}{star}",
+        f"Observation: {sub.get('obs_id')} (MAST obsid {sub.get('obsid')})",
+        "",
+        "To fetch it, ask ASTER, or run in the ASTER GUI:",
+        f'  DownloadMastJwstProducts(obsids="{sub.get("obsid")}", raw_only=True, list_only=True)',
+        "",
+        "— ASTER Alert. You subscribed in the ASTER GUI; reply to nobody, "
+        f'unsubscribe there with AsterAlert(action="unsubscribe", subscription_id="{sub["id"]}").',
+    ])
+    return subject, body
+
+
+def deliver_due_subscriptions(path: Path, *, now: float | None = None,
+                              send: Callable[[str, str, str], None] | None = None,
+                              session: requests.Session | None = None) -> list[str]:
+    """Email every pending subscription whose observation MAST now reports
+    public, and follow release dates that moved. Returns log lines.
+
+    Every pending observation is re-read from MAST on each pass (one request
+    per 100 obsids), so a date moved EARLIER is caught too, not only one
+    that slipped. A failed send stays pending and is retried next pass.
+    """
+    now = now_mjd() if now is None else now
+    send = send or send_email
+    log: list[str] = []
+    with _SUBS_LOCK:
+        subs = load_subscriptions(path)
+        pending = [s for s in subs if s.get("status") == "pending"]
+        if not pending:
+            return log
+        try:
+            current = fetch_observations_by_obsid([s["obsid"] for s in pending],
+                                                  t_now=now, session=session)
+        except Exception as exc:
+            return [f"MAST unreachable ({exc}); will retry."]
+        changed = False
+        for s in pending:
+            rec = current.get(str(s["obsid"]))
+            if rec is None:
+                continue
+            if not rec["is_public"]:
+                new_rel = rec["t_obs_release"]
+                if new_rel is not None and (s.get("t_obs_release") is None
+                                            or abs(new_rel - s["t_obs_release"]) > 0.5):
+                    log.append(f"{s['obs_id']}: release moved {s.get('release_date')} "
+                               f"-> {rec['release_date']}")
+                    s["rescheduled_from"] = s.get("release_date")
+                    s["t_obs_release"], s["release_date"] = new_rel, rec["release_date"]
+                    changed = True
+                continue
+            if rec["t_obs_release"] is not None:
+                s["t_obs_release"], s["release_date"] = rec["t_obs_release"], rec["release_date"]
+            subject, body = _release_email(s)
+            try:
+                send(s["email"], subject, body)
+            except Exception as exc:
+                s["last_error"] = str(exc)
+                log.append(f"{s['obs_id']}: email to {s['email']} failed ({exc}); will retry.")
+                changed = True
+                continue
+            s["status"] = "sent"
+            s["sent_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            s.pop("last_error", None)
+            log.append(f"emailed {s['email']}: {subject}")
+            changed = True
+        if changed:
+            save_subscriptions(path, subs)
+    return log
+
+
+def start_subscription_notifier(base_directory: str | os.PathLike[str], *,
+                                interval_seconds: float = 3600.0,
+                                log: Callable[[str], None] = print) -> threading.Event:
+    """Background thread that delivers release-day emails while the process
+    (the ASTER GUI) runs. Checks at start-up, so anything that went public
+    while the GUI was closed goes out on the next launch. Set the returned
+    Event to stop it."""
+    stop = threading.Event()
+    path = subscriptions_path(base_directory)
+
+    def loop() -> None:
+        while not stop.is_set():
+            try:
+                for line in deliver_due_subscriptions(path):
+                    log(f"[aster-alert] {line}")
+            except Exception as exc:  # never let the thread die
+                log(f"[aster-alert] notifier error: {exc}")
+            stop.wait(interval_seconds)
+
+    threading.Thread(target=loop, name="aster-alert-notifier", daemon=True).start()
+    return stop
+
+
+# --------------------------------------------------------------------------
+# the agent tool
+# --------------------------------------------------------------------------
+_ACTIONS = ("lookup", "watchlist", "check", "subscribe", "unsubscribe",
+            "subscriptions", "test_email")
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value)) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        raise ValueError(f"Expected a number of days, got {value!r}.") from None
+
+
+class AsterAlert(mast.BaseTool):
+    """
+    ASTER Alert: when does a planet's JWST data go public, what was just
+    released, and email me on release day.
+
+    USE WHEN the user says "ASTER Alert", asks when a target's JWST data
+    becomes public, what was released recently or is about to be, or wants
+    an email when it unlocks. MAST lists every EXECUTED observation with its
+    release date, proprietary ones included.
+
+    action (default: lookup if `target` is given, else watchlist):
+      lookup        every JWST time-series observation of `target` (any name
+                    MAST resolves: 'HD-12572b', 'HIP 9618 b', 'TOI-1801'),
+                    public or locked, with release dates and programs.
+      watchlist     a population (sub-Neptune preset, or `planets`): what
+                    went public in the last `days_back` days and what goes
+                    public in the next `days_ahead`.
+      check         what changed since the previous check (NEW / SOON /
+                    PUBLIC / DATE_CHANGED).
+      subscribe     email `email` on the day each locked observation of
+                    `target` (or one `obsid`) goes public.
+      unsubscribe   by `subscription_id`, or every subscription for `target`.
+      subscriptions list email subscriptions.
+      test_email    send a test email to check the SMTP settings.
+
+    Cannot see approved visits that have not been executed (not in MAST).
+    Planet parameters: QueryExoplanetArchive. Files: DownloadMastJwstProducts.
+    """
+
+    action: str | None = mast.OptionalRuntimeField(
+        description="lookup | watchlist | check | subscribe | unsubscribe | "
+                    "subscriptions | test_email.")
+    target: str | None = mast.OptionalRuntimeField(
+        description="Planet or host star, any MAST-resolvable name, e.g. "
+                    "'HD-12572b', 'HIP 9618 b', 'TOI-1801 b'.")
+    planets: list | str | None = mast.OptionalRuntimeField(
+        description="watchlist/check: Exoplanet Archive pl_names to watch "
+                    "instead of the preset population.")
+    preset: str | None = mast.OptionalRuntimeField(
+        description="watchlist/check population preset (default 'subneptune').")
+    days_back: int | str | None = mast.OptionalRuntimeField(
+        description="watchlist: releases in the last N days (default 60).")
+    days_ahead: int | str | None = mast.OptionalRuntimeField(
+        description="watchlist: releases in the next N days (default 120).")
+    email: str | None = mast.OptionalRuntimeField(
+        description="subscribe/test_email address (default ASTER_ALERT_EMAIL_TO).")
+    obsid: str | None = mast.OptionalRuntimeField(
+        description="subscribe: a single MAST obsid instead of all of target's.")
+    subscription_id: str | None = mast.OptionalRuntimeField(
+        description="unsubscribe: an id from action='subscriptions'.")
+    base_directory: str = mast.StateField()
+
+    # ------------------------------------------------------------------
+    def _base(self) -> Path:
+        return Path(self.base_directory or ".")
+
+    def _cache(self) -> str:
+        return str(self._base() / mast.JWST_PROGRAM_INFO_CACHE)
+
+    def _config(self) -> AlertConfig:
+        planets = [p.strip() for p in (mast._as_list(self.planets) or []) if str(p).strip()]
+        return AlertConfig(population_preset=(mast._clean_str(self.preset) or "subneptune"),
+                           planets=planets, program_cache_path=self._cache())
+
+    def _email(self) -> str:
+        email = mast._clean_str(self.email) or os.environ.get("ASTER_ALERT_EMAIL_TO", "")
+        if not email:
+            raise ValueError("Which email address? Pass email='you@example.com' "
+                             "(or set ASTER_ALERT_EMAIL_TO in .env).")
+        if not _EMAIL_RE.match(email):
+            raise ValueError(f"{email!r} does not look like an email address.")
+        return email
+
+    def _run(self) -> str:
+        target = mast._clean_str(self.target)
+        action = (mast._clean_str(self.action) or ("lookup" if target else "watchlist")).lower()
+        if action not in _ACTIONS:
+            raise ValueError(f"Unknown action {action!r}; use one of {', '.join(_ACTIONS)}.")
+        return getattr(self, f"_do_{action}")(target)
+
+    def _do_lookup(self, target: str | None) -> str:
+        if not target:
+            raise ValueError("lookup needs a target, e.g. target='HD-12572b'.")
+        return render_lookup(lookup_target(target), self._cache())
+
+    def _do_watchlist(self, target: str | None) -> str:
+        report = watchlist_report(self._config(),
+                                  days_back=_as_int(self.days_back, 60),
+                                  days_ahead=_as_int(self.days_ahead, 120))
+        return render_watchlist(report, self._cache())
+
+    def _do_check(self, target: str | None) -> str:
+        captured: dict[str, str] = {}
+
+        def capture(subject: str, body: str) -> None:
+            captured.update(subject=subject, body=body)
+
+        state = self._base() / "mast/alert/state.json"
+        first = not state.exists()
+        events = run_alert(self._config(), state_path=state, notifiers=[
+            capture, file_notifier(self._base() / "mast/alert/digests")])
+        if first:
+            locked = sum(e.kind == "UPCOMING" for e in events)
+            return (f"ASTER Alert · first check: recorded the watchlist; {locked} "
+                    "observation(s) still locked. Later checks report what changed.\n\n"
+                    + captured.get("body", ""))
+        if not events:
+            return "ASTER Alert · no changes since the last check."
+        return f"ASTER Alert · {short_summary(events)}\n\n{captured.get('body', '')}"
+
+    def _do_subscribe(self, target: str | None) -> str:
+        email = self._email()
+        obsid = mast._clean_str(self.obsid)
+        if not target and not obsid:
+            raise ValueError("subscribe needs a target (or an obsid).")
+        if target:
+            result = lookup_target(target)
+            planets = [p["pl_name"] for p in result["planets"]]
+            records = [r for r in result["observations"]
+                       if not r["is_public"] and (not obsid or r["obsid"] == obsid)]
+            n_all = len(result["observations"])
+        else:
+            records = [r for r in fetch_observations_by_obsid([obsid]).values()
+                       if not r["is_public"]]
+            planets, target, n_all = [], f"obsid {obsid}", 1
+        if not records:
+            return (f"ASTER Alert · nothing to subscribe to: all {n_all} JWST time-series "
+                    f"observation(s) of {target} are already public (or none exist). "
+                    "Look them up with action='lookup'.")
+        infos = _program_infos((r.get("proposal_id") for r in records), self._cache())
+        added, already = add_subscriptions(
+            subscriptions_path(self._base()), email=email, target=target,
+            planets=planets, records=records, infos=infos)
+        subs = sorted(added + already, key=lambda s: s.get("t_obs_release") or 9e9)
+        head = (f"ASTER Alert · subscribed {email}: {len(subs)} release(s) for {target}, "
+                f"the first on {subs[0]['release_date']}")
+        lines = [head, ""]
+        for s in subs:
+            mark = "" if s in added else " (already subscribed)"
+            lines.append(f"  - {s['release_date']} · GO {s['proposal_id']} · "
+                         f"{s['instrument_name']} {s.get('filters') or ''} · {s['obs_id']}{mark}")
+        lines += ["", "Emails go out from the ASTER GUI's background notifier, which "
+                      "checks MAST every hour while the GUI runs (and at start-up, so a "
+                      "release while it was closed is emailed on the next launch). If a "
+                      "release date moves, the email follows it."]
+        if not smtp_configured():
+            lines += ["", "WARNING: email is not configured yet, so nothing can be sent. "
+                          "Set ASTER_ALERT_SMTP_HOST, _PORT, _USER, _PASSWORD and _FROM in "
+                          ".env and restart the GUI; then try action='test_email'."]
+        return "\n".join(lines)
+
+    def _do_unsubscribe(self, target: str | None) -> str:
+        sid = mast._clean_str(self.subscription_id)
+        if not sid and not target:
+            raise ValueError("unsubscribe needs a subscription_id or a target.")
+        removed = remove_subscriptions(subscriptions_path(self._base()),
+                                       subscription_id=sid, target=target)
+        if not removed:
+            return "ASTER Alert · no matching subscription."
+        return (f"ASTER Alert · removed {len(removed)} subscription(s)\n\n"
+                + "\n".join(f"  - {s['id']} ({s['target']}, {s['release_date']})"
+                            for s in removed))
+
+    def _do_subscriptions(self, target: str | None) -> str:
+        subs = load_subscriptions(subscriptions_path(self._base()))
+        pending = [s for s in subs if s.get("status") == "pending"]
+        sent = [s for s in subs if s.get("status") == "sent"]
+        if not subs:
+            return "ASTER Alert · no email subscriptions yet."
+        lines = [f"ASTER Alert · {len(pending)} email(s) waiting, {len(sent)} sent", ""]
+        for s in sorted(pending, key=lambda s: s.get("t_obs_release") or 9e9):
+            err = f" · last error: {s['last_error']}" if s.get("last_error") else ""
+            lines.append(f"  - waiting: {s['release_date']} · {s['target']} · GO "
+                         f"{s['proposal_id']} · {s['email']} · id {s['id']}{err}")
+        for s in sent:
+            lines.append(f"  - sent {s.get('sent_utc', '')[:10]}: {s['target']} · "
+                         f"GO {s['proposal_id']} · {s['email']}")
+        if not smtp_configured():
+            lines += ["", "WARNING: email is not configured (ASTER_ALERT_SMTP_HOST unset)."]
+        return "\n".join(lines)
+
+    def _do_test_email(self, target: str | None) -> str:
+        email = self._email()
+        send_email(email, "test email",
+                   "This is a test from ASTER Alert. Release-day emails will look "
+                   "like this one's sender and subject prefix.")
+        return f"ASTER Alert · test email sent to {email}"
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="aster-alert", description=__doc__.split("\n\n")[0])
     p.add_argument("--base-dir", default=".", help="ASTER base directory.")
@@ -470,6 +1173,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--upcoming", action="store_true",
                    help="Print everything still proprietary and exit (no state).")
     p.add_argument("--dry-run", action="store_true", help="Do not write state.")
+    p.add_argument("--deliver", action="store_true",
+                   help="Send due release-day emails for GUI subscriptions and exit "
+                        "(for cron, when the GUI is not running).")
     p.add_argument("--no-program-info", action="store_true")
     p.add_argument("--macos", action="store_true", help="macOS notification banner.")
     p.add_argument("--slack-webhook", default=os.environ.get("ASTER_ALERT_SLACK_WEBHOOK"))
@@ -493,6 +1199,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.upcoming:
         print(list_upcoming(config))
+        return 0
+    if args.deliver:
+        path = subscriptions_path(base / "workspace")
+        for line in deliver_due_subscriptions(path):
+            print(f"[aster-alert] {line}")
         return 0
 
     notifiers: list[Notifier] = [] if args.quiet else [console_notifier]

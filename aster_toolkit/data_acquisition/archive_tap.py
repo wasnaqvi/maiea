@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
 from typing import Any, Iterable
 
 import requests
 
-TAP_SYNC_URL = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
+# ASTER_ARCHIVE_TAP_URL exists for end-to-end tests (tests/e2e) that point
+# the real GUI at a local fake archive, like ASTER_MAST_BASE_URL; leave it
+# unset in normal use.
+TAP_SYNC_URL = os.environ.get(
+    "ASTER_ARCHIVE_TAP_URL", "https://exoplanetarchive.ipac.caltech.edu/TAP/sync")
 DEFAULT_TIMEOUT = 120.0
 
 # On a bad query the archive answers with a VOTable instead of CSV, carrying

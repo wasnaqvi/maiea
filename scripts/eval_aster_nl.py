@@ -24,6 +24,7 @@ OPENAI_API_KEY, optional ASTER_LLM_MODEL, or ASTER_LLM_PROVIDER=groq ...).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -34,6 +35,8 @@ from typing import Callable
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tests" / "e2e"))
+sys.path.insert(0, str(REPO / "tests" / "scripts"))
+sys.path.insert(0, str(REPO))
 
 import aster_gui  # noqa: E402
 
@@ -146,6 +149,38 @@ def chk_archive_not_mast(c):
     return errs
 
 
+def _alert_called(c):
+    return [] if "asteralert" in c.calls else [f"AsterAlert not called (calls: {c.calls})"]
+
+
+def chk_alert_when_public(c):
+    errs = _alert_called(c) + _no_downloads(c)
+    if c.mast is not None:
+        import fake_mast_archive as fx
+        from aster_toolkit.data_acquisition.alert import mjd_to_iso
+        if mjd_to_iso(fx.LOCKED_RELEASE_MJD) not in c.text:
+            errs.append("the locked visit's release date was not reported")
+    elif not re.search(r"20\d\d-\d\d-\d\d", c.text):
+        errs.append("no release date in the answer")
+    return errs
+
+
+def chk_alert_watchlist(c):
+    errs = _alert_called(c) + _no_downloads(c)
+    if c.mast is not None and "HIP 9618" not in c.text:
+        errs.append("HIP 9618 (locked GO 8004 visit) not mentioned")
+    return errs
+
+
+def chk_alert_subscribe(c):
+    errs = _alert_called(c)
+    path = c.gui.workspace / "mast" / "alert" / "subscriptions.json"
+    subs = json.loads(path.read_text())["subscriptions"] if path.exists() else []
+    if not any(s["email"] == "astro@example.org" and s["status"] == "pending" for s in subs):
+        errs.append("no pending subscription for astro@example.org was saved")
+    return errs
+
+
 SCENARIOS = [
     Scenario("search: program-level",
              ["What JWST data exists for WASP-39b from the ERS program 1366?"],
@@ -167,6 +202,15 @@ SCENARIOS = [
     Scenario("routing: parameters are not MAST",
              ["What's the equilibrium temperature of WASP-39 b?"],
              chk_archive_not_mast, live_ok=True),
+    Scenario("alert: when does a target go public",
+             ["When is HD-12572b going public?"],
+             chk_alert_when_public, live_ok=True),
+    Scenario("alert: what is going public soon",
+             ["Which sub-Neptunes are about to have their JWST data released?"],
+             chk_alert_watchlist, live_ok=True),
+    Scenario("alert: email on release day",
+             ["Email me at astro@example.org when HD-12572b's JWST data goes public."],
+             chk_alert_subscribe, live_ok=True),
 ]
 
 
@@ -181,8 +225,12 @@ def run(args) -> int:
         import fake_mast_server
         mast = fake_mast_server.start()
         env["ASTER_MAST_BASE_URL"] = mast.url
+        env["ASTER_ARCHIVE_TAP_URL"] = mast.url + "/TAP/sync"
     else:
         env.pop("ASTER_MAST_BASE_URL", None)
+        env.pop("ASTER_ARCHIVE_TAP_URL", None)
+    # Never let an eval run send a real release-day email.
+    env["ASTER_ALERT_CHECK_SECONDS"] = "0"
     if args.model:
         env["ASTER_LLM_MODEL"] = args.model
 

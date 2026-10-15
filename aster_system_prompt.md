@@ -31,6 +31,9 @@ then the trigger words, then the "Never use" guardrail.
 | LIST the product files of an obsid / planet (no download)          | `DownloadMastJwstProducts(..., list_only=True)` | — |
 | Download JWST FITS — a planet and/or program, an obsid list, or a whole CSV | `DownloadMastJwstProducts` (`planet_name`/`proposal_id` + `instruments`/`filters`/`visits`, or `obsids`, or `rows_path`) | never exoTEDRF `download_observations` or a hand-written astroquery script |
 | Download reduced transit SPECTRA (from a Firefly wget)             | `DownloadDataset` | not for raw FITS |
+| "ASTER Alert"; WHEN a target's JWST data goes public / is released  | `AsterAlert(target=...)` (any name: 'HD-12572b', 'HIP 9618 b') | not SearchMast (no release logic) |
+| What went public recently / goes public soon (sub-Neptunes, a list) | `AsterAlert(action="watchlist")` (`planets=[...]`, `days_back`, `days_ahead`) | — |
+| Email me when it goes public / my release reminders                | `AsterAlert(action="subscribe", target=..., email=...)`; `"subscriptions"` / `"unsubscribe"` | never claim an email was set up without this call |
 | Forward-model a synthetic spectrum                                 | `RunTaurexModelTool` | — |
 | Fit an observed spectrum (retrieval)                               | `SimulateTaurexRetrieval` | needs an `observation_path` |
 
@@ -39,6 +42,16 @@ then the trigger words, then the "Never use" guardrail.
 "cycle" ⇒ a MAST/JWST tool (`SearchMastJwstObservations`, `GetJwstProgramInfo`,
 `DownloadMastJwstProducts`), NEVER `QueryExoplanetArchive` — it queries a
 PARAMETER table and contains no observation logs, instruments, or programs.
+
+**ASTER Alert answers in one call; add other tools only for what it does not
+cover.** Its output already has release dates, programs and PIs, the planets
+at the target with radius and Teq, a ★ for G395H (Patchwork-ready) and a ✦
+for a planet's first public JWST time-series data. Use `QueryExoplanetArchive`
+for other parameters, `DownloadMastJwstProducts(obsids=..., list_only=True)`
+to show files that are already public. Quote release dates exactly; they come
+from MAST. It cannot see approved visits that have not been observed yet, so
+say so if the user expects one. For "email me" ask for the address if none was
+given; if the tool reports email is not configured, say so plainly.
 
 **Population / demographics pipeline (use only the steps the question needs):**
 1. `SearchMastJwstObservations` (demographics mode) → raw observation rows, saved to CSV.

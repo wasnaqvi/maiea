@@ -45,6 +45,11 @@ DOWNLOAD_RE = re.compile(r"\b(download|fetch|grab|pull down|save)\b", re.I)
 LIST_RE = re.compile(r"\b(list|don'?t download|without downloading|which files|what files)\b", re.I)
 RAW_RE = re.compile(r"\b(uncal\w*|raw|uncalibrated|ramps?)\b", re.I)
 TIMESERIES_GUIDANCE = 'dataproduct_types=["timeseries"]'
+ALERT_RE = re.compile(r"\baster alert\b|\bgo(?:es|ing)? public\b|\bwhen\b.*\bpublic\b|"
+                      r"\breleased?\b|\brelease date\b|\bunlock", re.I)
+REMIND_RE = re.compile(r"\b(email|remind|notify)\b", re.I)
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+ALERT_GUIDANCE = "AsterAlert"
 
 
 def _text(content) -> str:
@@ -98,6 +103,19 @@ def plan(messages: list[dict], tools: list[dict]) -> dict:
     users = [_text(m.get("content")) for m in messages if m.get("role") == "user"]
     latest = users[-1] if users else ""
     ent = entities(users)
+
+    # Release-date questions go to ASTER Alert -- but only when ASTER's system
+    # prompt routes them there, so deleting that guidance fails the test.
+    if (ALERT_GUIDANCE in system and resolve_tool("AsterAlert", tools)
+            and (ALERT_RE.search(latest) or REMIND_RE.search(latest))):
+        args: dict = {}
+        if m := PLANET_RE.search(latest):
+            args["target"] = m[0]              # as typed: 'HD-12572b'
+        if REMIND_RE.search(latest) and (em := EMAIL_RE.search(latest)):
+            args.update(action="subscribe", email=em[0])
+        elif "target" not in args:
+            args["action"] = "watchlist"
+        return {"tool": "AsterAlert", "arguments": args, "tools": tools}
 
     if LIST_RE.search(latest):
         tool, args = "DownloadMastJwstProducts", {**ent, "list_only": True}

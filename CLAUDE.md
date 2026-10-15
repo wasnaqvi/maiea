@@ -60,6 +60,8 @@ python run_aster.py
 
 This starts a web server on `localhost:8000` with an agent that has access to TauREx modeling tools.
 
+**ASTER's GUI additions** (`aster_toolkit/gui.py`, installed by `run_aster.py`; the orchestral package itself is never modified): orchestral's page is re-served with `aster_toolkit/gui_static/aster_alert.{js,css}` injected first in `<head>`, so the script can wrap `WebSocket` before app.js connects. It only reads messages: an `asteralert(...)` tool panel whose response says `working...` shows the ASTER Alert card (telescope mascot sweeping), and the tool's first output line (`ASTER Alert · ...`) becomes the card's headline when it finishes. Keep that headline convention in every AsterAlert output. Also added: `GET /api/aster-alert/subscriptions` (the card's reminder bell) and the release-day email notifier thread (`ASTER_ALERT_CHECK_SECONDS`, default 3600; 0 disables). Preview the card from the browser console with `AsterAlertFX.demo()`.
+
 ## Architecture
 
 ### Agent System
@@ -81,9 +83,9 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 **Data Acquisition** (`aster_toolkit/data_acquisition/`):
 - `exoarchive.py` - `QueryExoplanetArchive` (one planet's parameters via `planet_name`, or a planet list via ADQL `conditions`) and `DownloadDataset` (reduced Firefly spectra)
 - `mast.py` - `SearchMastJwstObservations` (cone or population search; population mode writes its full rows CSV), `DownloadMastJwstProducts` (list or download product files for a query — `planet_name` and/or `proposal_id`, narrowed by `instruments`, grating `filters` and `visits` (exoTEDRF `visit_nos`, numbered over sorted visit prefixes) — or `obsids`, or a `rows_path` CSV; `list_only=True` to preview; supersedes exoTEDRF's `download_observations`, which is not imported because exoTEDRF lives in its own pinned env), `CrossmatchJwstToPlanets`, `AggregateJwstObservations` (groups a rows CSV; never queries MAST), `GetJwstProgramInfo`; plus `archive_tap_query()` (used by the reduction tools for ephemerides)
-- `alert.py` - **ASTER Alert**, a standalone CLI, deliberately *not* an agent tool: diffs MAST's CAOM time-series rows for a planet population (default the transiting `subneptune` preset; `--planets` for a list) against the previous run's `workspace/mast/alert/state.json` and raises NEW / SOON (30/7/1 days before `t_obs_release`) / PUBLIC / DATE_CHANGED alerts to console, a markdown digest, macOS (`--macos`), Slack (`ASTER_ALERT_SLACK_WEBHOOK`) or SMTP (`ASTER_ALERT_SMTP_*`). First run records state silently. `python -m aster_toolkit.data_acquisition.alert --upcoming` lists what is still proprietary; `.github/workflows/aster-alert.yml` runs it daily. Only *executed* observations are in CAOM — planned visits are not covered.
+- `alert.py` - **ASTER Alert**. The `AsterAlert` tool (actions `lookup` — when does `target` go public, any MAST-resolvable name such as `HD-12572b`; `watchlist` — released in the last `days_back` / going public in the next `days_ahead` for the sub-Neptune preset or `planets`, ✦ marking a planet's first public JWST time-series data; `check`; `subscribe` / `unsubscribe` / `subscriptions` / `test_email` for release-day emails). Subscriptions live in `workspace/mast/alert/subscriptions.json`; the GUI's notifier re-reads every pending obsid from MAST each pass, emails once MAST reports it public, and follows moved release dates. SMTP comes from `ASTER_ALERT_SMTP_HOST/_PORT/_USER/_PASSWORD/_FROM` and `_TLS` (`starttls` default, `ssl` on port 465, `none` for a local relay); `ASTER_ALERT_EMAIL_TO` is the default address. The same module is also a standalone CLI: it diffs MAST's CAOM time-series rows for a planet population (default the transiting `subneptune` preset; `--planets` for a list) against the previous run's `workspace/mast/alert/state.json` and raises NEW / SOON (30/7/1 days before `t_obs_release`) / PUBLIC / DATE_CHANGED alerts to console, a markdown digest, macOS (`--macos`), Slack (`ASTER_ALERT_SLACK_WEBHOOK`) or SMTP (`ASTER_ALERT_SMTP_*`). First run records state silently. `python -m aster_toolkit.data_acquisition.alert --upcoming` lists what is still proprietary; `.github/workflows/aster-alert.yml` runs it daily; `--deliver` sends due release-day emails from cron when the GUI is not running. Only *executed* observations are in CAOM — planned visits are not covered. The archive's TAP service refuses `CONTAINS(POINT, CIRCLE)` with HTTP 403, so positional planet lookups use an RA/Dec box (`planets_near`). `ASTER_ARCHIVE_TAP_URL` is a test-only override, like `ASTER_MAST_BASE_URL`.
 
-ASTER exposes 25 tools with one tool per task — when adding a capability, extend the tool that owns the task (a mode or flag) rather than adding an overlapping tool. `tests/scripts/test_tool_consolidation.py` pins the registry.
+ASTER exposes 26 tools with one tool per task — when adding a capability, extend the tool that owns the task (a mode or flag) rather than adding an overlapping tool. `tests/scripts/test_tool_consolidation.py` pins the registry.
 
 **Data Reduction** (`aster_toolkit/data_reduction/`) — the Patchwork pipeline:
 - `discover.py` - `DiscoverPatchworkVisits`: index a raw tree, identify planets, write manifests
@@ -540,7 +542,7 @@ breakage in the local pytest plugins.
 Three layers, cheapest first:
 
 1. **Unit / contract** — `pytest tests/scripts` (no network). Includes
-   `test_tool_consolidation.py` (the 25-tool registry, per-call argument
+   `test_tool_consolidation.py` (the 26-tool registry, per-call argument
    reset) and `test_exotedrf_parity.py` (DownloadMastJwstProducts vs the real
    exoTEDRF `download_observations`; set `ASTER_EXOTEDRF_REPO` to your
    exoTEDRF checkout or the parity half is skipped).
@@ -552,7 +554,12 @@ Three layers, cheapest first:
    model is a deterministic stand-in (`tests/e2e/fake_openai_server.py`,
    reached through `OPENAI_BASE_URL`) that also rejects any call not
    matching the schemas ASTER sends; MAST is `tests/e2e/fake_mast_server.py`
-   (reached through `ASTER_MAST_BASE_URL`, unset in normal use).
+   (reached through `ASTER_MAST_BASE_URL`, unset in normal use; it also
+   serves the Exoplanet Archive's `/TAP/sync` via `ASTER_ARCHIVE_TAP_URL`).
+   `test_aster_alert_gui.py` covers ASTER Alert in the GUI: the injected
+   card, "when is HD-12572b going public", the sub-Neptune watchlist, and a
+   subscription whose release is moved a few seconds ahead so the GUI's own
+   notifier emails a local fake SMTP server (`tests/scripts/fake_smtp.py`).
 3. **Real-model routing** — `python scripts/eval_aster_nl.py` with your
    provider credentials in `.env`. Same GUI path, your actual model, graded
    on outcomes. Fake MAST by default; `--live-mast` runs the search/list
