@@ -795,10 +795,18 @@ def get_observation_products(
     extensions: list[str] | tuple[str, ...] | str | None = FITS_EXTENSIONS,
     skip_proprietary: bool = True,
     product_dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
+    drop_auxiliary_exposures: bool = True,
     session: requests.Session | None = None,
     timeout: float = 60.0,
 ) -> list[dict[str, Any]]:
-    """Return downloadable MAST products for one observation id."""
+    """Return downloadable MAST products for one observation id.
+
+    ``drop_auxiliary_exposures`` (default) drops exposures taken through a
+    different optical element than the observation itself — in practice
+    target acquisition, e.g. NIRSpec ``F110W;MIRROR`` exposures listed under
+    a ``F290LP;G395H`` time-series observation. See
+    ``_observation_level_filters``.
+    """
     request = {
         "service": "Mast.Caom.Products",
         "params": {"obsid": str(obsid)},
@@ -813,7 +821,42 @@ def get_observation_products(
         extensions=extensions,
         skip_proprietary=skip_proprietary,
         product_dataproduct_types=product_dataproduct_types,
+        exposure_filters=(_observation_level_filters(products)
+                          if drop_auxiliary_exposures else None),
     )
+
+
+# Observation-level (stage 3) data products: jw01366-o003_t001_..., also
+# association/candidate forms (-a3001, -c1000) and source ids (_s00001_).
+# Per-exposure names (jw01366003001_04101_...) never match, and neither do
+# the association files (jw01366-o003_20261011t215903_image2_00001_asn.json),
+# which MAST lists for the TA exposures too, with the TA's filters.
+_OBSERVATION_LEVEL_NAME_RE = re.compile(r"^jw\d{5}-[a-z]\d{3,}_[ts]\d{3,}_", re.IGNORECASE)
+
+
+def _observation_level_filters(products: list[dict[str, Any]]) -> str | None:
+    """The observation's own optical elements, read off its stage-3 products.
+
+    MAST lists a time-series observation's target-acquisition exposures in
+    its product list with ``dataproduct_type='timeseries'`` — the SAME type
+    as the science segments (verified live 2026-10-15, ERS 1366 obsid
+    233644122: ``_02101_`` TA uncals 60-72 kB, ``F110W;MIRROR``; ``_04101_``
+    science 1.4 GB, ``F290LP;G395H``). So the type cannot separate them, and
+    exoTEDRF's ``download_observations`` (which filters on exactly that)
+    downloads the TA files too. Each product row does carry its own
+    ``filters``, and the observation-level products carry the
+    observation's. Returns None — no filtering — when there are no
+    observation-level products or they disagree, so an unprocessed
+    observation keeps every exposure rather than losing its science.
+    """
+    values = {
+        str(p.get("filters") or "").strip().upper()
+        for p in products
+        if _OBSERVATION_LEVEL_NAME_RE.match(str(p.get("productFilename") or ""))
+        and str(p.get("productType") or "").upper() != "INFO"
+        and str(p.get("filters") or "").strip()
+    }
+    return values.pop() if len(values) == 1 else None
 
 
 def filter_products(
@@ -825,16 +868,20 @@ def filter_products(
     extensions: list[str] | tuple[str, ...] | str | None = FITS_EXTENSIONS,
     skip_proprietary: bool = True,
     product_dataproduct_types: list[str] | tuple[str, ...] | str | None = None,
+    exposure_filters: str | None = None,
 ) -> list[dict[str, Any]]:
     """Filter MAST products by science type, JWST subgroup, raw status, file
     extension, and proprietary-access status.
 
+    ``exposure_filters`` (e.g. 'F290LP;G395H') drops products whose own
+    ``filters`` lack any of its tokens — the target-acquisition exposures
+    of a time-series observation. Products without the field pass.
+
     ``product_dataproduct_types`` filters on each PRODUCT's own
     ``dataproduct_type`` (e.g. ['timeseries']). A JWST time-series
-    observation's product list also carries its target-acquisition
-    exposures, typed 'image'; exoTEDRF's ``download_observations`` drops
-    them this way, and so must we, or a TA uncal lands in the same visit
-    directory as the science segments. Products without the field pass.
+    observation's product list carries everything typed 'timeseries' —
+    including its target-acquisition exposures, so this does NOT remove TA
+    (``exposure_filters`` does). Products without the field pass.
 
     ``skip_proprietary=True`` (default) drops products whose ``dataRights``
     is not ``PUBLIC`` — typically ``EXCLUSIVE_ACCESS`` files that would
@@ -875,6 +922,10 @@ def filter_products(
 
         product_dptype = str(product.get("dataproduct_type") or "").lower()
         if dptype_values and product_dptype and product_dptype not in dptype_values:
+            continue
+
+        if (exposure_filters and product.get("filters")
+                and not _filters_match(product.get("filters"), [exposure_filters])):
             continue
 
         selected.append(product)
@@ -3392,9 +3443,9 @@ class DownloadMastJwstProducts(BaseTool):
                                  instruments=["NIRSPEC/SLIT"], filters=["G395H"],
                                  dataproduct_types=["timeseries"], raw_only=True)
       with files under mast/WASP-39_b/<obs_id>/ instead of ./DMS_uncal.
-      ``dataproduct_types=["timeseries"]`` is the part that keeps the
-      target-acquisition uncals (typed 'image', stored in the same
-      observation) out of the science directory — always pass it for TSOs.
+      Target-acquisition exposures (MAST types them 'timeseries' too) are
+      dropped in every mode: any exposure whose own filters differ from the
+      observation's (e.g. F110W;MIRROR under F290LP;G395H) is left out.
 
     More examples
     -------------
@@ -3455,8 +3506,8 @@ class DownloadMastJwstProducts(BaseTool):
     dataproduct_types: list | str | None = OptionalRuntimeField(
         description=(
             "Dataproduct filter, e.g. ['timeseries']. Narrows the query AND each "
-            "product's own type (drops target-acquisition 'image' exposures); "
-            "the product-level part applies in every mode."
+            "product's own type; the product-level part applies in every mode. "
+            "Target-acquisition exposures are dropped automatically regardless."
         ),
     )
     filters: list | str | None = OptionalRuntimeField(
@@ -3566,8 +3617,8 @@ class DownloadMastJwstProducts(BaseTool):
         )
         label = _clean_str(self.label)
         # Applied to each PRODUCT's dataproduct_type as well as to the
-        # observation query, so a timeseries request never pulls the
-        # target-acquisition 'image' exposures stored in the same observation.
+        # observation query. (Target acquisition is removed separately, by
+        # get_observation_products: MAST types it 'timeseries' as well.)
         dptypes = [d for d in (_as_list(self.dataproduct_types) or []) if _clean_str(d)] or None
 
         def listing(groups):

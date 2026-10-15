@@ -225,6 +225,56 @@ class MastWrapperTests(unittest.TestCase):
 
         self.assertEqual(selected, products)
 
+    # Row shapes copied from live MAST (ERS 1366 obsid 233644122, 2026-10-15):
+    # target acquisition is typed 'timeseries' like the science; only its
+    # own filters differ.
+    @staticmethod
+    def _live_shaped_products(with_stage3=True):
+        def row(name, filters, sub="UNCAL"):
+            return {"productType": "SCIENCE", "productSubGroupDescription": sub,
+                    "productFilename": name, "dataURI": f"mast:JWST/product/{name}",
+                    "dataRights": "PUBLIC", "dataproduct_type": "timeseries",
+                    "filters": filters}
+        rows = [
+            # association files are observation-prefixed but carry the TA's
+            # filters for the TA association; they must not set the filter
+            dict(row("jw01366-o003_20261011t215903_image2_00001_asn.json",
+                     "F110W;MIRROR", sub="ASN"), productType="INFO"),
+            dict(row("jw01366-o003_20261011t215903_tso3_00001_asn.json",
+                     "F290LP;G395H", sub="ASN"), productType="INFO"),
+            row("jw01366003001_02101_00001-seg001_nrs1_uncal.fits", "F110W;MIRROR"),
+            row("jw01366003001_04101_00001-seg001_nrs1_uncal.fits", "F290LP;G395H"),
+            row("jw01366003001_04101_00001-seg001_nrs2_uncal.fits", "F290LP;G395H"),
+        ]
+        if with_stage3:
+            rows.append(row("jw01366-o003_t001_nirspec_f290lp-g395h-s1600a1-sub2048_x1dints.fits",
+                            "F290LP;G395H", sub="X1DINTS"))
+        return rows
+
+    def test_get_observation_products_drops_target_acquisition(self):
+        payload = {"status": "COMPLETE", "data": self._live_shaped_products()}
+        with patch.object(self.mast, "_mast_query", return_value=payload):
+            names = [p["productFilename"] for p in self.mast.get_observation_products(
+                "233644122", raw_only=True, product_dataproduct_types=["timeseries"])]
+        self.assertEqual(names, ["jw01366003001_04101_00001-seg001_nrs1_uncal.fits",
+                                 "jw01366003001_04101_00001-seg001_nrs2_uncal.fits"])
+
+    def test_target_acquisition_kept_when_observation_filters_unknown(self):
+        # No stage-3 product to read the observation's filters from (not yet
+        # processed): keep every exposure rather than risk losing science.
+        payload = {"status": "COMPLETE",
+                   "data": self._live_shaped_products(with_stage3=False)}
+        with patch.object(self.mast, "_mast_query", return_value=payload):
+            products = self.mast.get_observation_products("233644122", raw_only=True)
+        self.assertEqual(len(products), 3)   # the three uncals; ASN rows are not FITS
+
+    def test_target_acquisition_kept_when_explicitly_requested(self):
+        payload = {"status": "COMPLETE", "data": self._live_shaped_products()}
+        with patch.object(self.mast, "_mast_query", return_value=payload):
+            products = self.mast.get_observation_products(
+                "233644122", raw_only=True, drop_auxiliary_exposures=False)
+        self.assertTrue(any("_02101_" in p["productFilename"] for p in products))
+
     def test_resolve_target_coordinates_parses_payload(self):
         payload = {
             "resolvedCoordinate": [

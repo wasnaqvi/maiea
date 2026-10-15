@@ -106,7 +106,7 @@ def chk_download_followup(c):
     if not files:
         errs.append("nothing downloaded")
     if any("_02101_" in f for f in files):
-        errs.append("target-acquisition uncals downloaded (missing dataproduct_types=timeseries)")
+        errs.append("target-acquisition uncals downloaded (auxiliary-exposure filter in get_observation_products failed)")
     stray = [f for f in files if not f.startswith(G395H_PREFIXES)]
     if stray:
         errs.append(f"downloaded files outside the G395H observation: {stray[:4]}")

@@ -35,8 +35,16 @@ def obs_rows():
     ]
 
 
+# Each product row carries its OWN filters. Science exposures and the
+# observation-level products share the observation's; target acquisition is
+# taken through other optics. NIRSpec's F110W;MIRROR is the live value (ERS
+# 1366 obsid 233644122, 2026-10-15); the NIRISS/NIRCam ones are illustrative.
+TA_FILTERS = {"NIRSPEC": "F110W;MIRROR", "NIRISS": "F480M", "NIRCAM": "F335M"}
+
+
 def products_for(obsid):
-    _, oid, inst, *_r, prefixes = next(x for x in OBS if x[0] == obsid)
+    _, oid, inst, flt, *_r, prefixes = next(x for x in OBS if x[0] == obsid)
+    ta_filters = TA_FILTERS[inst.split("/")[0]]
     dets = ("nis",) if "NIRISS" in inst else ("nrcalong",) if "NIRCAM" in inst else ("nrs1", "nrs2")
     out = []
     for p in prefixes:
@@ -48,17 +56,21 @@ def products_for(obsid):
                                 "dataURI": f"mast:JWST/product/{name}",
                                 "productSubGroupDescription": sub,
                                 "productType": "SCIENCE", "dataRights": "PUBLIC",
-                                "dataproduct_type": "timeseries", "size": 1})
-        # target acquisition exposure in the same visit
+                                "dataproduct_type": "timeseries", "filters": flt,
+                                "size": 1})
+        # Target acquisition in the same visit. MAST types it 'timeseries'
+        # like the science (verified live) — only its filters differ.
         ta = f"{p}_02101_00001_{dets[0]}_uncal.fits"
         out.append({"obsID": obsid, "productFilename": ta,
                     "dataURI": f"mast:JWST/product/{ta}",
                     "productSubGroupDescription": "UNCAL", "productType": "SCIENCE",
-                    "dataRights": "PUBLIC", "dataproduct_type": "image", "size": 1})
+                    "dataRights": "PUBLIC", "dataproduct_type": "timeseries",
+                    "filters": ta_filters, "size": 1})
     x1d = f"{oid}_x1dints.fits"
     out.append({"obsID": obsid, "productFilename": x1d, "dataURI": f"mast:JWST/product/{x1d}",
                 "productSubGroupDescription": "X1DINTS", "productType": "SCIENCE",
-                "dataRights": "PUBLIC", "dataproduct_type": "timeseries", "size": 1})
+                "dataRights": "PUBLIC", "dataproduct_type": "timeseries",
+                "filters": flt, "size": 1})
     return out
 
 

@@ -13,6 +13,12 @@ ERS 1366 / WASP-39 b with decoys and target-acquisition exposures):
   importable ``exotedrf``, or ``ASTER_EXOTEDRF_SRC`` pointing at
   ``extra_functions.py``); skipped otherwise.
 
+One deliberate divergence: exoTEDRF selects products by
+``dataproduct_type='timeseries'``, and live MAST types target-acquisition
+exposures 'timeseries' too (verified 2026-10-15), so exoTEDRF downloads the
+TA uncals into DMS_uncal. ASTER drops them (their own filters differ from
+the observation's). Parity is therefore "same files, minus exoTEDRF's TA".
+
 Assumption baked into the fake astroquery (unverifiable offline): a bare
 grating such as ``filters="G395H"`` matches the joined CAOM value
 "F290LP;G395H", i.e. exoTEDRF works as its docstring says. ASTER matches
@@ -276,12 +282,13 @@ def test_query_sent_to_mast_is_exact_and_normalized():
 
 
 def test_target_acquisition_dropped_in_every_mode():
-    for kw in (dict(obsids=["102"]), dict(proposal_id="1366", filters="G395H")):
-        files, _, _ = run_aster(dataproduct_types=["timeseries"], raw_only=True, **kw)
-        assert files and not any("_02101_" in f for f in files), kw
-    # ...and kept when the caller does not restrict the product type
-    files, _, _ = run_aster(obsids=["102"], raw_only=True)
-    assert any("_02101_" in f for f in files)
+    # With or without a dataproduct filter: MAST types TA 'timeseries' too,
+    # so only the per-product filters can tell it apart.
+    for kw in (dict(obsids=["102"]), dict(proposal_id="1366", filters="G395H"),
+               dict(proposal_id="1366")):
+        for extra in (dict(dataproduct_types=["timeseries"]), {}):
+            files, _, _ = run_aster(raw_only=True, **kw, **extra)
+            assert files and not any("_02101_" in f for f in files), (kw, extra)
 
 
 def test_list_only_matches_download_selection():
@@ -299,6 +306,10 @@ def test_parity_with_real_exotedrf(name, etd_kw, aster_kw):
     pytest.importorskip("scipy")
     reference = run_exotedrf(**etd_kw)
     files, _, _ = run_aster(**aster_kw)
+    # exoTEDRF really does pull the TA uncals (see module docstring)...
+    assert any("_02101_" in f for f in reference)
+    # ...and apart from those, both select exactly the same files.
+    reference = [f for f in reference if "_02101_" not in f]
     assert files == reference, (
         f"only exoTEDRF: {sorted(set(reference) - set(files))}; "
         f"only ASTER: {sorted(set(files) - set(reference))}")

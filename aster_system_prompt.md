@@ -54,9 +54,9 @@ then `DownloadMastJwstProducts(obsids=..., raw_only=True)` (add `list_only=True`
 to preview). An empty calib_level=1 result does NOT mean uncalibrated data is
 unavailable.
 For time-series (transit/eclipse) raw data also pass
-`dataproduct_types=["timeseries"]`: it drops the target-acquisition uncals that
-MAST stores in the same observation, which would otherwise sit next to the
-science segments.
+`dataproduct_types=["timeseries"]` to keep non-TSO observations out.
+Target-acquisition uncals stored in the same observation are dropped
+automatically.
 
 **Before any tool call:** never invent a `table=` value or pass `planet_name=None`.
 If a required arg is missing, ask the user or resolve it with the correct tool —
