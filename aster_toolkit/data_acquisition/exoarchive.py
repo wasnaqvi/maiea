@@ -1,7 +1,5 @@
 import os
 import json
-import io
-import csv
 import requests
 import numpy as np
 import pandas as pd
@@ -33,6 +31,11 @@ except ModuleNotFoundError:
 
     def OptionalRuntimeField(description=None, **kwargs):  # type: ignore[misc]
         return None
+
+
+# After the block above, which puts the repo on sys.path when this file is
+# loaded by path.
+from aster_toolkit.data_acquisition.archive_tap import query_archive
 
 
 def process_wgets_file(base_directory, wgets_file_path: str, data_path: str) -> None:
@@ -193,8 +196,8 @@ def process_downloads(base_directory, data_path: str, output_dir: str) -> None:
                 json.dump(metadata, f, indent=4)
 
 
-# NASA Exoplanet Archive TAP service URL
-TAP_SYNC_URL = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
+# The archive TAP request itself (ADQL, timeout, error handling) lives in
+# archive_tap.py; these two keep their historical return shapes.
 
 
 def get_exoplanet_params_tap(planet_name: str, columns: list | str, table: str = "pscomppars") -> dict | None:
@@ -202,46 +205,21 @@ def get_exoplanet_params_tap(planet_name: str, columns: list | str, table: str =
     Query NASA Exoplanet Archive TAP service for one or multiple parameters.
 
     Parameters:
-    - planet_name: Name of the exoplanet (e.g., "Kepler-10 b")
+    - planet_name: Name of the exoplanet (e.g., "Kepler-10 b"), already
+      ADQL-escaped (single quotes doubled) by the caller
     - columns: List of parameter columns to retrieve or single column name string
     - table: TAP table name, "pscomppars" (default) for composite parameters or "ps" for all parameters
 
     Returns:
     - Dictionary with requested parameters or None if planet not found
     """
-    # Convert single string to list
     if isinstance(columns, str):
         columns = [columns]
-
-    # Build ADQL SELECT clause
-    select_clause = ", ".join(columns)
-
-    # Build query
-    adql = (
-        f"SELECT {select_clause} "
-        f"FROM {table} "
-        f"WHERE pl_name = '{planet_name}'"
-    )
-
-    # Call TAP sync
-    params = {
-        "query": adql,
-        "format": "csv"
-    }
-
-    response = requests.get(TAP_SYNC_URL, params=params)
-    response.raise_for_status()
-
-    # Parse CSV in memory
-    csv_file = io.StringIO(response.text)
-    reader = csv.DictReader(csv_file)
-
-    row = next(reader, None)
-    if row is None:
+    rows = query_archive(columns, f"pl_name = '{planet_name}'", table=table)
+    if not rows:
         return None
+    return {col: rows[0][col] for col in columns}
 
-    # Return results as a dictionary
-    return {col: row[col] for col in columns}
 
 def find_exoplanets_by_condition(conditions: list[str] | str, return_columns: list[str] | str, table: str = "pscomppars", distinct: bool = True, limit: int | None = None,) -> list[dict]:
     """
@@ -259,47 +237,12 @@ def find_exoplanets_by_condition(conditions: list[str] | str, return_columns: li
     Returns:
     - List of dictionaries containing the requested columns for each matching row
     """
-    # Make sure conditions is a list
-    if isinstance(conditions, str):
-        conditions = [conditions]
-
-    where_clause = " AND ".join(f"({c})" for c in conditions)
-
-    select_keyword = "SELECT DISTINCT" if distinct else "SELECT"
-    top_clause = f"TOP {limit} " if limit is not None else ""
     if isinstance(return_columns, str):
         return_columns = [return_columns]
-    
-    select_clause = ", ".join(return_columns)
-
-    adql = (
-        f"{select_keyword} {top_clause}{select_clause} "
-        f"FROM {table} "
-        f"WHERE {where_clause}"
+    rows = query_archive(
+        return_columns, conditions, table=table, distinct=distinct, limit=limit,
     )
-
-    # Send request
-    params = {
-        "query": adql,
-        "format": "csv"
-    }
-
-    response = requests.get(TAP_SYNC_URL, params=params)
-    response.raise_for_status()
-
-    # Parse CSV response
-    csv_file = io.StringIO(response.text)
-    reader = csv.DictReader(csv_file)
-
-    # this: row = next(reader, None) only grab the first matching planet, does not work here
-
-    # Return ALL requested columns per row
-    results = []
-    for row in reader:
-        results.append({col: row.get(col) for col in return_columns})
-
-    return results
-
+    return [{col: row.get(col) for col in return_columns} for row in rows]
 
 _ARCHIVE_TABLES = ("pscomppars", "ps")
 

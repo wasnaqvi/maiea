@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import hashlib
-import io
 import json
 import math
 import os
@@ -39,12 +38,16 @@ except ModuleNotFoundError:
         return None
 
 
+# After the block above, which puts the repo on sys.path when this file is
+# loaded by path (tests/scripts/test_mast.py).
+from aster_toolkit.data_acquisition import archive_tap as _archive_tap
+
+
 # ASTER_MAST_BASE_URL exists for end-to-end tests (tests/e2e) that point the
 # real agent at a local fake MAST; leave it unset in normal use.
 MAST_BASE_URL = os.environ.get("ASTER_MAST_BASE_URL", "https://mast.stsci.edu").rstrip("/")
 MAST_INVOKE_URL = f"{MAST_BASE_URL}/api/v0/invoke"
 MAST_DOWNLOAD_URL = f"{MAST_BASE_URL}/api/v0.1/Download/file"
-EXOARCHIVE_TAP_SYNC_URL = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
 
 # Authoritative per-proposal program metadata (Cycle, title, PI, status).
 # MAST CAOM does NOT expose the observing cycle, and cycle is NOT derivable
@@ -2340,32 +2343,21 @@ def archive_tap_query(
     timeout: float = 120.0,
 ) -> list[dict[str, Any]]:
     """
-    Minimal NASA Exoplanet Archive TAP query.
+    NASA Exoplanet Archive TAP query; every matching row as a dict.
 
-    Used by ``CrossmatchJwstToPlanets`` so mast.py stays standalone (no
-    coupling to exoarchive.py / orchestral imports). For richer archive
-    queries use ``QueryExoplanetArchive`` in exoarchive.py.
+    A thin wrapper over ``archive_tap.query_archive``, which owns the ADQL,
+    the request, timeouts and error handling for every archive caller
+    (Patchwork discovery/fits, ASTER Alert, ``CrossmatchJwstToPlanets``,
+    ``QueryExoplanetArchive``). ``limit`` of 0 or None means no limit.
     """
-    if isinstance(conditions, str):
-        conditions = [conditions]
-
-    selected_columns = _as_list(columns) or list(DEFAULT_ARCHIVE_COLUMNS)
-    where_clause = " AND ".join(f"({c})" for c in conditions)
-    top_clause = f"TOP {int(limit)} " if limit else ""
-    adql = (
-        f"SELECT {top_clause}{', '.join(selected_columns)} "
-        f"FROM {table} "
-        f"WHERE {where_clause}"
-    )
-
-    client = session or requests
-    response = client.get(
-        EXOARCHIVE_TAP_SYNC_URL,
-        params={"query": adql, "format": "csv"},
+    return _archive_tap.query_archive(
+        _as_list(columns) or list(DEFAULT_ARCHIVE_COLUMNS),
+        conditions,
+        table=table,
+        limit=int(limit) if limit else None,
+        session=session,
         timeout=timeout,
     )
-    response.raise_for_status()
-    return list(csv.DictReader(io.StringIO(response.text)))
 
 
 def crossmatch_observations_to_planets(
