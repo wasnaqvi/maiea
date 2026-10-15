@@ -397,8 +397,25 @@ def slack_notifier(webhook_url: str) -> Notifier:
     return _send
 
 
+def _smtp_tls() -> str:
+    port = int(os.environ.get("ASTER_ALERT_SMTP_PORT") or "587")
+    return (os.environ.get("ASTER_ALERT_SMTP_TLS") or ("ssl" if port == 465 else "starttls")).lower()
+
+
+def smtp_missing() -> list[str]:
+    """Settings still needed before an email can be sent ([] = ready). A
+    plain local relay (TLS 'none') needs only the host; anything else, such
+    as Gmail, also needs a login."""
+    def unset(name: str) -> bool:
+        return not os.environ.get(name, "").strip()
+    missing = [n for n in ("ASTER_ALERT_SMTP_HOST",) if unset(n)]
+    if _smtp_tls() != "none":
+        missing += [n for n in ("ASTER_ALERT_SMTP_USER", "ASTER_ALERT_SMTP_PASSWORD") if unset(n)]
+    return missing
+
+
 def smtp_configured() -> bool:
-    return bool(os.environ.get("ASTER_ALERT_SMTP_HOST"))
+    return not smtp_missing()
 
 
 def send_email(to_addr: str, subject: str, body: str) -> None:
@@ -408,13 +425,14 @@ def send_email(to_addr: str, subject: str, body: str) -> None:
     and _TLS: ``starttls`` (default), ``ssl`` (default when the port is 465)
     or ``none`` (a local relay only — the password would cross in clear).
     """
-    host = os.environ.get("ASTER_ALERT_SMTP_HOST")
-    if not host:
-        raise RuntimeError("Email is not configured: set ASTER_ALERT_SMTP_HOST "
-                           "(and _PORT/_USER/_PASSWORD/_FROM) in .env.")
-    port = int(os.environ.get("ASTER_ALERT_SMTP_PORT", "587"))
-    tls = os.environ.get("ASTER_ALERT_SMTP_TLS", "ssl" if port == 465 else "starttls").lower()
-    user = os.environ.get("ASTER_ALERT_SMTP_USER")
+    missing = smtp_missing()
+    if missing:
+        raise RuntimeError(f"Email is not configured: set {', '.join(missing)} in .env "
+                           "and restart the ASTER GUI.")
+    host = os.environ["ASTER_ALERT_SMTP_HOST"].strip()
+    port = int(os.environ.get("ASTER_ALERT_SMTP_PORT") or "587")
+    tls = _smtp_tls()
+    user = os.environ.get("ASTER_ALERT_SMTP_USER", "").strip() or None
     msg = EmailMessage()
     msg["Subject"] = f"[ASTER Alert] {subject}"
     msg["From"] = os.environ.get("ASTER_ALERT_SMTP_FROM") or user or "aster-alert@localhost"
@@ -1116,8 +1134,8 @@ class AsterAlert(mast.BaseTool):
                       "release date moves, the email follows it."]
         if not smtp_configured():
             lines += ["", "WARNING: email is not configured yet, so nothing can be sent. "
-                          "Set ASTER_ALERT_SMTP_HOST, _PORT, _USER, _PASSWORD and _FROM in "
-                          ".env and restart the GUI; then try action='test_email'."]
+                          f"Set {', '.join(smtp_missing())} in .env and restart the GUI; "
+                          "then try action='test_email'."]
         return "\n".join(lines)
 
     def _do_unsubscribe(self, target: str | None) -> str:
@@ -1147,7 +1165,7 @@ class AsterAlert(mast.BaseTool):
             lines.append(f"  - sent {s.get('sent_utc', '')[:10]}: {s['target']} · "
                          f"GO {s['proposal_id']} · {s['email']}")
         if not smtp_configured():
-            lines += ["", "WARNING: email is not configured (ASTER_ALERT_SMTP_HOST unset)."]
+            lines += ["", f"WARNING: email is not configured ({', '.join(smtp_missing())} unset)."]
         return "\n".join(lines)
 
     def _do_test_email(self, target: str | None) -> str:
@@ -1189,6 +1207,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     base = Path(args.base_dir).expanduser()
+    try:  # same settings the GUI reads (run_aster.py loads .env too)
+        from dotenv import load_dotenv
+        load_dotenv(base / ".env")
+    except ImportError:  # e.g. the GitHub workflow, which uses secrets instead
+        pass
     config = AlertConfig(
         population_preset=args.preset,
         planets=[s.strip() for s in args.planets.split(",") if s.strip()],

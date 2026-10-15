@@ -342,3 +342,21 @@ def test_notifier_thread_delivers_and_stops(tmp_path, monkeypatch):
         assert alert.load_subscriptions(path)[0]["status"] == "sent"
     finally:
         smtp.shutdown()
+
+
+def test_host_without_login_is_not_configured(monkeypatch, fake_mast, tmp_path):
+    """A Gmail host with the login left blank (as .env ships) must not claim
+    email works: the warning names exactly what is still missing."""
+    for k, v in {"ASTER_ALERT_SMTP_HOST": "smtp.gmail.com", "ASTER_ALERT_SMTP_PORT": "587",
+                 "ASTER_ALERT_SMTP_USER": "", "ASTER_ALERT_SMTP_PASSWORD": ""}.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("ASTER_ALERT_SMTP_TLS", raising=False)
+    assert alert.smtp_missing() == ["ASTER_ALERT_SMTP_USER", "ASTER_ALERT_SMTP_PASSWORD"]
+    assert not alert.smtp_configured()
+    with pytest.raises(RuntimeError, match="ASTER_ALERT_SMTP_USER, ASTER_ALERT_SMTP_PASSWORD"):
+        alert.send_email("me@example.org", "x", "y")
+    out = alert.AsterAlert(base_directory=str(tmp_path)).execute(
+        action="subscribe", target="HD-12572b", email="me@example.org")
+    assert "Set ASTER_ALERT_SMTP_USER, ASTER_ALERT_SMTP_PASSWORD in .env" in out
+    monkeypatch.setenv("ASTER_ALERT_SMTP_TLS", "none")      # a local relay needs no login
+    assert alert.smtp_configured()
