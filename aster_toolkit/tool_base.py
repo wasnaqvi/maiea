@@ -66,6 +66,36 @@ def _is_blank(value: Any) -> bool:
 
 
 class AsterBaseTool(_OrchestralBaseTool):
+    # ASTER owns the required-field rule rather than inheriting orchestral's,
+    # which changed between releases: 1.4.x treats RuntimeField(default=None)
+    # as OPTIONAL (any default counts), 1.8.0 as REQUIRED. The Mac `exo` env
+    # ships 1.4.0, so without this the same tool had a different schema — and
+    # a None slipping into a str field — depending on the machine. Rule (the
+    # 1.8.0 one): a runtime field is required unless it has a non-None default
+    # or a default_factory (OptionalRuntimeField). Every LLM client and the
+    # MCP adapter read requirements through these three classmethods.
+    @classmethod
+    def _get_required_fields(cls) -> list[str]:
+        fields = cls.model_fields
+        return [
+            name for name in cls._get_runtime_fields()
+            if name in fields
+            and fields[name].default_factory is None
+            and fields[name].default in (None, PydanticUndefined)
+        ]
+
+    @classmethod
+    def get_input_schema(cls) -> dict[str, Any]:
+        schema = super().get_input_schema()
+        schema["required"] = cls._get_required_fields()
+        return schema
+
+    @classmethod
+    def get_tool_spec(cls):
+        spec = super().get_tool_spec()
+        spec.input_schema["required"] = cls._get_required_fields()
+        return spec
+
     def execute(self, stream_callback: Optional[Callable[[str], None]] = None,
                 **kwargs: Any) -> str:
         fields = type(self).model_fields

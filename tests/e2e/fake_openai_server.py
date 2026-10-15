@@ -173,7 +173,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         model = body.get("model", "stand-in")
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        # The *_details blocks are what the real API sends; orchestral 1.4.x
+        # dereferences completion_tokens_details unconditionally.
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2,
+                 "completion_tokens_details": {
+                     "accepted_prediction_tokens": 0, "rejected_prediction_tokens": 0,
+                     "audio_tokens": 0, "reasoning_tokens": 0},
+                 "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0}}
         call = None
         if "tool" in decision:
             call = {"id": f"call_{uuid.uuid4().hex[:10]}", "type": "function",

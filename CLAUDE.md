@@ -81,6 +81,7 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 **Data Acquisition** (`aster_toolkit/data_acquisition/`):
 - `exoarchive.py` - `QueryExoplanetArchive` (one planet's parameters via `planet_name`, or a planet list via ADQL `conditions`) and `DownloadDataset` (reduced Firefly spectra)
 - `mast.py` - `SearchMastJwstObservations` (cone or population search; population mode writes its full rows CSV), `DownloadMastJwstProducts` (list or download product files for a query — `planet_name` and/or `proposal_id`, narrowed by `instruments`, grating `filters` and `visits` (exoTEDRF `visit_nos`, numbered over sorted visit prefixes) — or `obsids`, or a `rows_path` CSV; `list_only=True` to preview; supersedes exoTEDRF's `download_observations`, which is not imported because exoTEDRF lives in its own pinned env), `CrossmatchJwstToPlanets`, `AggregateJwstObservations` (groups a rows CSV; never queries MAST), `GetJwstProgramInfo`; plus `archive_tap_query()` (used by the reduction tools for ephemerides)
+- `alert.py` - **ASTER Alert**, a standalone CLI, deliberately *not* an agent tool: diffs MAST's CAOM time-series rows for a planet population (default the transiting `subneptune` preset; `--planets` for a list) against the previous run's `workspace/mast/alert/state.json` and raises NEW / SOON (30/7/1 days before `t_obs_release`) / PUBLIC / DATE_CHANGED alerts to console, a markdown digest, macOS (`--macos`), Slack (`ASTER_ALERT_SLACK_WEBHOOK`) or SMTP (`ASTER_ALERT_SMTP_*`). First run records state silently. `python -m aster_toolkit.data_acquisition.alert --upcoming` lists what is still proprietary; `.github/workflows/aster-alert.yml` runs it daily. Only *executed* observations are in CAOM — planned visits are not covered.
 
 ASTER exposes 25 tools with one tool per task — when adding a capability, extend the tool that owns the task (a mode or flag) rather than adding an overlapping tool. `tests/scripts/test_tool_consolidation.py` pins the registry.
 
@@ -561,7 +562,7 @@ Writing a tool: import `AsterBaseTool as BaseTool, OptionalRuntimeField,
 RuntimeField, StateField` from `aster_toolkit.tool_base` (copy the import
 block from any tool module). Declare an optional argument with
 `OptionalRuntimeField(description=...)` — NEVER `RuntimeField(default=None)`,
-which orchestral treats as REQUIRED — and a required one with
+which ASTER treats as REQUIRED — and a required one with
 `RuntimeField(description=...)`. `EXPECTED_REQUIRED` in
 `tests/scripts/test_tool_consolidation.py` pins every tool's required list;
 update it deliberately when the API changes. Blank-string arguments for
@@ -573,7 +574,12 @@ tool instances live for the whole session and orchestral builds each call
 from the previous call's values, so omitted optional arguments used to leak
 between calls (now reset per call); and a failing `_run` could raise a
 ValidationError out of `execute()` during rollback (now returns the error
-text to the model). Also note orchestral shows tool names to the model
+text to the model). `AsterBaseTool` also owns the required-field rule
+(`_get_required_fields`, `get_input_schema`, `get_tool_spec`): orchestral
+changed it between releases (1.4.x counts `default=None` as optional, 1.8.0
+as required) and the Mac `exo` env ships 1.4.0, so inheriting it gave the
+same tool a different schema per machine. Tests pass on orchestral 1.4.0,
+1.8.0 and 1.10.1. Also note orchestral shows tool names to the model
 lower-cased with any `Tool` suffix dropped (`downloadmastjwstproducts`).
 
 ## Common Workflows

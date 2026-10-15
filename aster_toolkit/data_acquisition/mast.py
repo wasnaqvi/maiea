@@ -9,7 +9,7 @@ import os
 import re
 import ast
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -2472,7 +2472,7 @@ def _autoname_csv_path(
                       queries land in distinct files even when their slugs
                       collide.
     """
-    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     hint_repr = json.dumps(hint_parts or [], sort_keys=True, default=str)
     digest = hashlib.sha1(hint_repr.encode("utf-8")).hexdigest()[:6]
     slug_source = " ".join(str(p) for p in (hint_parts or []) if p)
