@@ -1,0 +1,39 @@
+# ASTER Alert — daily check for JWST sub-Neptune data going public.
+# Secrets (Settings → Secrets → Actions): ASTER_ALERT_SLACK_WEBHOOK (optional),
+# ASTER_ALERT_EMAIL_TO + ASTER_ALERT_SMTP_* (optional).
+name: aster-alert
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 09:00 Montreal (EDT) daily
+  workflow_dispatch: {}
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install requests
+      # State persists between runs through the Actions cache. Cache keys are
+      # immutable, so save under a fresh key and restore the newest by prefix.
+      - uses: actions/cache/restore@v4
+        with:
+          path: workspace/mast/alert
+          key: aster-alert-${{ github.run_id }}
+          restore-keys: aster-alert-
+      - name: Run ASTER Alert
+        env:
+          ASTER_ALERT_SLACK_WEBHOOK: ${{ secrets.ASTER_ALERT_SLACK_WEBHOOK }}
+          ASTER_ALERT_EMAIL_TO: ${{ secrets.ASTER_ALERT_EMAIL_TO }}
+          ASTER_ALERT_SMTP_HOST: ${{ secrets.ASTER_ALERT_SMTP_HOST }}
+          ASTER_ALERT_SMTP_USER: ${{ secrets.ASTER_ALERT_SMTP_USER }}
+          ASTER_ALERT_SMTP_PASSWORD: ${{ secrets.ASTER_ALERT_SMTP_PASSWORD }}
+        run: python -m aster_toolkit.data_acquisition.alert --preset subneptune
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: workspace/mast/alert
+          key: aster-alert-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with: { name: aster-alert-digests, path: workspace/mast/alert/digests, if-no-files-found: ignore }
