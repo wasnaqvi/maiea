@@ -360,3 +360,20 @@ def test_host_without_login_is_not_configured(monkeypatch, fake_mast, tmp_path):
     assert "Set ASTER_ALERT_SMTP_USER, ASTER_ALERT_SMTP_PASSWORD in .env" in out
     monkeypatch.setenv("ASTER_ALERT_SMTP_TLS", "none")      # a local relay needs no login
     assert alert.smtp_configured()
+
+
+def test_gui_remembers_the_address_the_user_gave(fake_mast, tmp_path, monkeypatch):
+    """'Email me at x' once; later 'email me' (no address) reuses x, ahead of
+    the .env fallback, so the GUI never needs ASTER_ALERT_EMAIL_TO."""
+    monkeypatch.setenv("ASTER_ALERT_EMAIL_TO", "fallback@example.org")
+    tool = alert.AsterAlert(base_directory=str(tmp_path))
+    tool.execute(action="subscribe", target="HD-12572b", email="wasi@mail.example.ca")
+    tool.execute(action="unsubscribe", target="HD-12572b")
+    assert alert.last_subscription_email(alert.subscriptions_path(tmp_path)) is None
+    out = tool.execute(action="subscribe", target="HD-12572b")
+    assert "subscribed fallback@example.org" in out          # nothing to reuse: .env
+    tool.execute(action="unsubscribe", target="HD-12572b")
+    tool.execute(action="subscribe", target="HD-12572b", email="wasi@mail.example.ca")
+    fake_mast["rows"].append(caom("376915999", NOW + 120, "EXCLUSIVE_ACCESS"))
+    out = tool.execute(action="subscribe", target="HD-12572b")
+    assert out.splitlines()[0].startswith("ASTER Alert · subscribed wasi@mail.example.ca")

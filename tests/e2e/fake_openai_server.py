@@ -111,8 +111,10 @@ def plan(messages: list[dict], tools: list[dict]) -> dict:
         args: dict = {}
         if m := PLANET_RE.search(latest):
             args["target"] = m[0]              # as typed: 'HD-12572b'
-        if REMIND_RE.search(latest) and (em := EMAIL_RE.search(latest)):
-            args.update(action="subscribe", email=em[0])
+        if REMIND_RE.search(latest):
+            args["action"] = "subscribe"           # address optional: reused
+            if em := EMAIL_RE.search(latest):
+                args["email"] = em[0]
         elif "target" not in args:
             args["action"] = "watchlist"
         return {"tool": "AsterAlert", "arguments": args, "tools": tools}

@@ -853,6 +853,13 @@ def add_subscriptions(path: Path, *, email: str, target: str, planets: list[str]
     return added, already
 
 
+def last_subscription_email(path: Path) -> str | None:
+    """The address on the most recent subscription, if any."""
+    subs = load_subscriptions(path)
+    latest = max(subs, key=lambda s: s.get("created_utc") or "", default=None)
+    return latest.get("email") if latest else None
+
+
 def remove_subscriptions(path: Path, *, subscription_id: str | None = None,
                          target: str | None = None) -> list[dict[str, Any]]:
     with _SUBS_LOCK:
@@ -1032,7 +1039,8 @@ class AsterAlert(mast.BaseTool):
     days_ahead: int | str | None = mast.OptionalRuntimeField(
         description="watchlist: releases in the next N days (default 120).")
     email: str | None = mast.OptionalRuntimeField(
-        description="subscribe/test_email address (default ASTER_ALERT_EMAIL_TO).")
+        description="subscribe/test_email address, any provider. Omit to reuse the "
+                    "last address the user gave.")
     obsid: str | None = mast.OptionalRuntimeField(
         description="subscribe: a single MAST obsid instead of all of target's.")
     subscription_id: str | None = mast.OptionalRuntimeField(
@@ -1052,10 +1060,15 @@ class AsterAlert(mast.BaseTool):
                            planets=planets, program_cache_path=self._cache())
 
     def _email(self) -> str:
-        email = mast._clean_str(self.email) or os.environ.get("ASTER_ALERT_EMAIL_TO", "")
+        """The address named in this call; else the last one used for a
+        subscription in this workspace (so the GUI asks only once); else
+        ASTER_ALERT_EMAIL_TO from .env."""
+        email = (mast._clean_str(self.email)
+                 or last_subscription_email(subscriptions_path(self._base()))
+                 or os.environ.get("ASTER_ALERT_EMAIL_TO", "").strip())
         if not email:
-            raise ValueError("Which email address? Pass email='you@example.com' "
-                             "(or set ASTER_ALERT_EMAIL_TO in .env).")
+            raise ValueError("Which email address should ASTER Alert use? Ask the user, "
+                             "then call again with email='...'.")
         if not _EMAIL_RE.match(email):
             raise ValueError(f"{email!r} does not look like an email address.")
         return email
