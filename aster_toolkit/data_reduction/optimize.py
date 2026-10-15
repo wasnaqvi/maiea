@@ -58,15 +58,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps the wrapper importable without Orchestral."""
@@ -76,6 +75,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
 
 from .exotedrf import _exotedrf_python, exotedrf_version, DEFAULT_CRDS_CACHE
 from .lightcurves import G395H_WAVE_RANGES
@@ -683,9 +685,9 @@ class OptimizeNirspecG395hReduction(BaseTool):
     name_tag: str = RuntimeField(
         description="Tag for the cost/scatter files, e.g. 'GJ_9827_d_o010_nrs1'."
     )
-    st_teff: float | None = RuntimeField(default=None, description="Stellar Teff [K].")
-    st_logg: float | None = RuntimeField(default=None, description="Stellar log g.")
-    st_met: float | None = RuntimeField(default=None, description="Stellar [Fe/H].")
+    st_teff: float | None = OptionalRuntimeField(description="Stellar Teff [K].")
+    st_logg: float | None = OptionalRuntimeField(description="Stellar log g.")
+    st_met: float | None = OptionalRuntimeField(description="Stellar [Fe/H].")
     planet_letter: str = RuntimeField(default="b", description="Planet letter.")
     base_directory: str = StateField()
 

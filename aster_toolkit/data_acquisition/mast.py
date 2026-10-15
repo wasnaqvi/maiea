@@ -17,35 +17,14 @@ from urllib.parse import quote
 import requests
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
-    from pydantic import Field as _PydanticField
-
-    def OptionalRuntimeField(description=None, **kwargs):
-        """LLM-visible field that is OPTIONAL in the tool schema.
-
-        Orchestral's SchemaGenerator marks a runtime field as required unless it
-        has a non-None default or a default_factory. ``RuntimeField(default=None)``
-        therefore produces a REQUIRED field, and ``BaseTool.execute()`` rejects
-        calls that omit it ("Missing Required Fields"). Since RuntimeField
-        auto-injects ``default=None`` (which pydantic forbids alongside
-        ``default_factory``), we build the pydantic Field directly with the
-        ``runtime: True`` marker and a factory returning None.
-        """
-        kwargs.pop("default", None)
-        return _PydanticField(
-            json_schema_extra={"runtime": True},
-            default_factory=lambda: None,
-            description=description,
-            **kwargs,
-        )
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps plain MAST wrappers importable without Orchestral."""

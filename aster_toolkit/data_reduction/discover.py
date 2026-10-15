@@ -41,15 +41,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps discovery importable without Orchestral."""
@@ -59,6 +58,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
 
 
 # jw{program:5}{observation:3}{visit:3}_{exposure_tag:5}_{exp:5}[-seg{n:3}]_{detector}_uncal.fits
@@ -724,8 +726,7 @@ class DiscoverPatchworkVisits(BaseTool):
     raw_root: str = RuntimeField(
         description="Root of the uncal download tree (walked recursively)."
     )
-    manifest_dir: str | None = RuntimeField(
-        default=None,
+    manifest_dir: str | None = OptionalRuntimeField(
         description="Directory to write per-planet manifests into. "
                     "Omit for a report-only dry run.",
     )
@@ -734,8 +735,7 @@ class DiscoverPatchworkVisits(BaseTool):
         description="Identify planets via the archive + transit-window test. "
                     "Set False when offline.",
     )
-    overrides: str | None = RuntimeField(
-        default=None,
+    overrides: str | None = OptionalRuntimeField(
         description='JSON dict forcing planet names, keyed by visit prefix or '
                     'header target, e.g. {"jw04098010001": "GJ 9827 d"}.',
     )

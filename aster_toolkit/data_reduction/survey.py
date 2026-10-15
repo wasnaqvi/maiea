@@ -46,15 +46,14 @@ from typing import Any
 import numpy as np
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps the driver importable without Orchestral."""
@@ -65,9 +64,11 @@ except ModuleNotFoundError:
     def StateField(default=None, description=None):
         return default
 
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
+
 from .exotedrf import (
     CRDS_CONTEXT,
-    OptionalRuntimeField,
     inspect_uncal_directory,
     run_reduction,
 )

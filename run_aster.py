@@ -107,7 +107,7 @@ def build_llm(provider: str):
                 model=model or 'llama3.2:latest',
                 host=os.getenv('OLLAMA_HOST') or None
             )
-        except Exception as exc:
+        except Exception:
             raise SystemExit(
                 'Could not connect to Ollama. Install/start Ollama, pull a model, '
                 'then run again. Example: ollama pull llama3.2. If Ollama is '

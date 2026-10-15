@@ -7,7 +7,6 @@ VerifyPatchworkEnvironment. Pure-local: no network, no exoTEDRF env.
 """
 import ast
 import json
-import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -291,3 +290,115 @@ def test_failing_call_returns_error_text_instead_of_raising(tmp_path):
     assert out.startswith("Error: Execution Error")
     out = tool.execute(group_by="['x']")             # next call: still sane
     assert "Missing Required Fields" in out and "rows_path" in out
+
+
+# ---------------- schema contract: exactly these arguments are required ----------------
+
+# What the MODEL is told it must supply. orchestral treats
+# RuntimeField(default=None) as required, so an optional argument declared that
+# way silently becomes mandatory (DownloadDataset used to require all three of
+# its alternative inputs, so every normal call failed). Changing this table is
+# a deliberate API change.
+EXPECTED_REQUIRED = {
+    "RunTaurexModelTool": [],
+    "SimulateTaurexRetrieval": ["fit_params", "observation_path"],
+    "PlotCornerPosteriors": ["labels", "retrieval_basename"],
+    "QueryExoplanetArchive": [],
+    "DownloadDataset": [],
+    "SearchMastJwstObservations": [],
+    "DownloadMastJwstProducts": [],
+    "CrossmatchJwstToPlanets": [],
+    "AggregateJwstObservations": ["group_by", "rows_path"],
+    "GetJwstProgramInfo": ["proposal_ids"],
+    "DiscoverPatchworkVisits": ["raw_root"],
+    "VerifyPatchworkEnvironment": [],
+    "ReduceNirspecG395hTso": ["input_dir"],
+    "MakeUncalTestSubset": ["output_path", "uncal_path"],
+    "DetectTiltEvents": ["duration_hr", "period", "spectra_path", "t0_ref"],
+    "FitNirspecG395hWhiteLight": ["output_dir", "planet_name", "spectra_path"],
+    "FitNirspecG395hTransmissionSpectrum": ["output_dir", "planet_name", "spectra_path",
+                                            "white_fit_dir"],
+    "CombineNirspecG395hVisits": ["output_dir", "spectra_by_detector"],
+    "DetectLightCurveAnomalies": ["output_dir", "white_fit_dirs"],
+    "ModelStellarContamination": ["output_dir", "spectrum_csv"],
+    "RunPatchworkTarget": ["manifest_path", "output_root"],
+    "GenerateFirJobs": ["manifest_path", "output_root"],
+    "OptimizeNirspecG395hReduction": ["detector", "input_dir", "name_tag", "output_dir"],
+    "SummarizeG395hOptimization": ["cost_table"],
+}
+
+
+def test_required_arguments_match_the_contract():
+    pytest.importorskip("orchestral")
+    pytest.importorskip("taurex")
+    actual = {n: sorted(getattr(aster_toolkit, n)._get_required_fields())
+              for n in aster_toolkit.__all__ if n != "SetTaurexPaths"}
+    assert actual == EXPECTED_REQUIRED
+
+
+def test_schema_required_list_matches_execute_enforcement():
+    """What the model is SHOWN as required (the JSON schema orchestral sends)
+    must equal what execute() ENFORCES."""
+    pytest.importorskip("orchestral")
+    pytest.importorskip("taurex")
+    from orchestral.llm.openai.tool_adapter import convert_tool_to_openai
+    for name in EXPECTED_REQUIRED:
+        cls = getattr(aster_toolkit, name)
+        tool = cls(base_directory="/tmp") if "base_directory" in cls.model_fields else cls()
+        schema = convert_tool_to_openai(tool.get_tool_spec())["function"]["parameters"]
+        assert sorted(schema.get("required", [])) == EXPECTED_REQUIRED[name], name
+
+
+def test_blank_strings_mean_not_provided(tmp_path):
+    """Models send "" for arguments they mean to skip; for optional arguments
+    that must fall back to the default, not reach the tool as a value."""
+    pytest.importorskip("orchestral")
+    from aster_toolkit.data_acquisition import mast
+    seen = {}
+
+    def fake_listing(groups, **kw):
+        return "LIST"
+
+    tool = mast.DownloadMastJwstProducts(base_directory=str(tmp_path))
+    with patch.object(mast, "_format_product_listing", fake_listing), \
+         patch.object(mast.DownloadMastJwstProducts, "_query_observations",
+                      lambda self, *a: seen.update(label=self.label, filters=self.filters,
+                                                   output_dir=self.output_dir) or []):
+        tool.execute(proposal_id="1366", label="  ", filters="", output_dir="",
+                     list_only=True)
+    assert seen == {"label": None, "filters": None, "output_dir": None}  # all defaults
+
+
+def test_blank_string_falls_back_to_a_non_none_default(tmp_path):
+    pytest.importorskip("orchestral")
+    from aster_toolkit.data_reduction import survey
+    m = tmp_path / "m.json"
+    m.write_text('{"planet_name": "T b", "visits": {"o001": "/r"}}')
+    out = survey.GenerateFirJobs(base_directory=str(tmp_path)).execute(
+        manifest_path=str(m), output_root="/s", job="  ", account="")
+    assert "job=patchwork" in out                       # job "" -> "patchwork"
+    assert "--account=def-ncowan" in next(tmp_path.glob("*.sbatch")).read_text()
+
+
+def test_download_dataset_needs_only_one_of_its_inputs(tmp_path):
+    pytest.importorskip("orchestral")
+    from aster_toolkit.data_acquisition import exoarchive
+    tool = exoarchive.DownloadDataset(base_directory=str(tmp_path))
+    out = tool.execute(wget_url="https://example.invalid/wget.bat")
+    assert "Missing Required Fields" not in out
+
+
+def test_retrieval_reports_parameters_by_name_when_given_as_string(tmp_path):
+    """fit_params usually arrives as "['T', 'H2O']"; the summary used to zip the
+    raw string, pairing best-fit values with '[', "'", 'T', ..."""
+    pytest.importorskip("orchestral")
+    pytest.importorskip("taurex")
+    from aster_toolkit.taurex import retrieval
+    fake = {"best_parameters": [1234.0, -3.5], "best_value": 42.0, "outputs": {}}
+    with patch.object(retrieval, "run_taurex_retrieval", return_value=fake) as run:
+        out = retrieval.SimulateTaurexRetrieval(base_directory=str(tmp_path)).execute(
+            observation_path="obs.dat", fit_params="['T', 'H2O']",
+            free_chem_full_molecules="[['H2O', 0.02]]")
+    assert "  - T: 1234.0" in out and "  - H2O: -3.5" in out
+    assert run.call_args.kwargs["fit_params"] == ["T", "H2O"]
+    assert run.call_args.kwargs["free_chem_full_molecules"] == [["H2O", 0.02]]

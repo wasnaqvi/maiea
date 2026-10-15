@@ -34,15 +34,14 @@ from typing import Any
 import numpy as np
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps plain functions importable without Orchestral."""
@@ -52,6 +51,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
 
 
 # 1.1: final bin edge clipped to the wavelength cut (the last channel's
@@ -1121,8 +1123,7 @@ class DetectTiltEvents(BaseTool):
     period: float = RuntimeField(description="Orbital period in days.")
     t0_ref: float = RuntimeField(description="Reference mid-transit epoch, BJD_TDB.")
     duration_hr: float = RuntimeField(description="Transit duration in hours.")
-    reduction_dir: str | None = RuntimeField(
-        default=None,
+    reduction_dir: str | None = OptionalRuntimeField(
         description="Reduction dir with Stage 2 calints. Strongly "
                     "recommended: without it there are no PSF diagnostics "
                     "and an in-transit tilt cannot be found.",

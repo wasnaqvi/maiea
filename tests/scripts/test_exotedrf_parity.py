@@ -21,8 +21,7 @@ tokens, so it is correct under either representation.
 import pathlib as _pl
 import sys as _sys
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
-from fake_mast_archive import (  # noqa: E402,F401
-    OBS, OTHER, WASP39, obs_rows, products_for, resolve, sep_deg)
+from fake_mast_archive import obs_rows, products_for, resolve, sep_deg  # noqa: E402
 
 import importlib.util
 import os
@@ -122,7 +121,6 @@ class FakeObservations:
 
 
 def load_exotedrf():
-    from astropy.table import Table  # noqa: F401  (needed by _table)
     astroquery = types.ModuleType("astroquery")
     mastmod = types.ModuleType("astroquery.mast")
     mastmod.Observations = FakeObservations

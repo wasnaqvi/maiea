@@ -1,34 +1,23 @@
 import os
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 import matplotlib.pyplot as plt
-from astropy.io import ascii
 import ast
 
-try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-    from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+    from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
     if _exc.name != "aster_toolkit":
         raise
     import sys as _sys, pathlib as _pl
     _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-    from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-from orchestral.tools.base.field_utils import RuntimeField, StateField
+    from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 
 # Taurex imports
-import taurex
-from taurex.cache import GlobalCache, OpacityCache, CIACache
 from taurex.model import TransmissionModel
 from taurex.data.profiles.temperature import Isothermal
-from taurex.planet import Planet
-from taurex.stellar import BlackbodyStar
 from taurex.chemistry import TaurexChemistry
 from taurex.chemistry import ConstantGas
 from taurex.contributions import AbsorptionContribution, RayleighContribution, CIAContribution
-from taurex.data.spectrum.observed import ObservedSpectrum
-from taurex.optimizer.nestle import NestleOptimizer
-from taurex.optimizer.multinest import MultiNestOptimizer
 
 
 
@@ -43,10 +32,8 @@ class RunTaurexModelTool(BaseTool):
     planet_temp: float = RuntimeField(description="Temperature of the planet in Kelvin", default=1500.0)
     atm_min_pressure: float | None = RuntimeField(description="Minimum atmospheric pressure in bar (pressure at the highest simulated layer)", default=1e-3)
     atm_max_pressure: float | None = RuntimeField(description="Maximum atmospheric pressure in bar (pressure at the lowest simulated layer)", default=1e5)
-    molecular_abundances: dict | str | None = RuntimeField(
-        description="Dictionary of molecule names to mixing ratios. Can be a Python dict or string representation. Example: {'H2O': 0.02, 'CH4': 0.001} or \"{'H2O': 0.02, 'CH4': 0.001}\". If not provided, uses default values.",
-        default=None
-    )
+    molecular_abundances: dict | str | None = OptionalRuntimeField(
+        description="Dictionary of molecule names to mixing ratios. Can be a Python dict or string representation. Example: {'H2O': 0.02, 'CH4': 0.001} or \"{'H2O': 0.02, 'CH4': 0.001}\". If not provided, uses default values.")
     filename: str = RuntimeField(description="The output file will be saved as '{filename}_spectrum.png'", default='')
     base_directory: str = StateField()
 

@@ -68,15 +68,14 @@ from .lightcurves import (
 )
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps plain fitting wrappers importable without Orchestral."""
@@ -86,6 +85,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
 
 
 def _import_juliet():
@@ -1578,8 +1580,7 @@ class FitNirspecG395hWhiteLight(BaseTool):
         default="NRS1",
         description="Detector label for this dataset ('NRS1' or 'NRS2').",
     )
-    reduction_dir: str | None = RuntimeField(
-        default=None,
+    reduction_dir: str | None = OptionalRuntimeField(
         description="Reduction dir containing Stage 2 calints — enables "
                     "trace x/y/FWHM decorrelation regressors.",
     )
@@ -1602,19 +1603,18 @@ class FitNirspecG395hWhiteLight(BaseTool):
                     "fit (needs reduction_dir). Disable only for comparison "
                     "fits; the fit version is then stamped '-nopca'.",
     )
-    anomaly_report: str | None = RuntimeField(
-        default=None,
+    anomaly_report: str | None = OptionalRuntimeField(
         description="Path to a Stage 5.5 anomaly_report.json from "
                     "DetectLightCurveAnomalies. Masks the confirmed spot/"
                     "facula crossings it lists. Omit on the first pass (the "
                     "scan needs this fit's residuals); the fit is then "
                     "stamped '-noscan'.",
     )
-    wave_min: float | None = RuntimeField(
-        default=None, description="Optional lower wavelength cut in microns."
+    wave_min: float | None = OptionalRuntimeField(
+        description="Optional lower wavelength cut in microns."
     )
-    wave_max: float | None = RuntimeField(
-        default=None, description="Optional upper wavelength cut in microns."
+    wave_max: float | None = OptionalRuntimeField(
+        description="Optional upper wavelength cut in microns."
     )
     base_directory: str = StateField()
 
@@ -1778,8 +1778,7 @@ class FitNirspecG395hTransmissionSpectrum(BaseTool):
         default="NRS1",
         description="Detector label, must match the white-light fit.",
     )
-    reduction_dir: str | None = RuntimeField(
-        default=None,
+    reduction_dir: str | None = OptionalRuntimeField(
         description="Reduction dir with Stage 2 calints for trace regressors.",
     )
     decorrelate: bool = RuntimeField(
@@ -1796,18 +1795,16 @@ class FitNirspecG395hTransmissionSpectrum(BaseTool):
         default=DEFAULT_RESOLUTION,
         description="Spectral binning resolution R.",
     )
-    n_bins: int | None = RuntimeField(
-        default=None,
+    n_bins: int | None = OptionalRuntimeField(
         description="Optional fixed number of equal-width bins (overrides resolution).",
     )
-    wave_min: float | None = RuntimeField(
-        default=None, description="Optional lower wavelength cut in microns."
+    wave_min: float | None = OptionalRuntimeField(
+        description="Optional lower wavelength cut in microns."
     )
-    wave_max: float | None = RuntimeField(
-        default=None, description="Optional upper wavelength cut in microns."
+    wave_max: float | None = OptionalRuntimeField(
+        description="Optional upper wavelength cut in microns."
     )
-    anomaly_report: str | None = RuntimeField(
-        default=None,
+    anomaly_report: str | None = OptionalRuntimeField(
         description="Stage 5.5 anomaly_report.json. MUST be the same report "
                     "used for the white fit — the orbit and the channel "
                     "depths have to come from the same integrations.",

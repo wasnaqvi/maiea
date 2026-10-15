@@ -2,17 +2,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import corner
 import os
-from pathlib import Path
 
-try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-    from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+    from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
     if _exc.name != "aster_toolkit":
         raise
     import sys as _sys, pathlib as _pl
     _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-    from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-from orchestral.tools.base.field_utils import RuntimeField, StateField
+    from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 
 
 class PlotCornerPosteriors(BaseTool):
@@ -42,24 +40,20 @@ class PlotCornerPosteriors(BaseTool):
     """
 
     # Required parameters
-    retrieval_basename: str | None = RuntimeField(
-        default=None,
-        description="Base name of the retrieval output files (e.g., 'wasp39b_retrieval'). The tool will load {retrieval_basename}_samples.npy and {retrieval_basename}_weights.npy. Path should be relative to base_directory. REQUIRED."
+    retrieval_basename: str = RuntimeField(
+        description="Base name of the retrieval output files (e.g., 'wasp39b_retrieval'). The tool will load {retrieval_basename}_samples.npy and {retrieval_basename}_weights.npy. Path should be relative to base_directory."
     )
 
-    labels: list | str | None = RuntimeField(
-        default=None,
-        description="List of parameter names corresponding to the columns in the samples array. Can be a Python list or string representation. Example: ['planet_radius', 'T', 'H2O', 'CH4', 'CO2'] or \"['planet_radius', 'T', 'H2O']\". REQUIRED - must match fit_params from retrieval."
+    labels: list | str = RuntimeField(
+        description="List of parameter names corresponding to the columns in the samples array. Can be a Python list or string representation. Example: ['planet_radius', 'T', 'H2O', 'CH4', 'CO2'] or \"['planet_radius', 'T', 'H2O']\". Must match fit_params from the retrieval."
     )
 
     # Optional parameters
-    output_path: str = RuntimeField(
-        default=None,
+    output_path: str = OptionalRuntimeField(
         description="Path where the corner plot will be saved (relative to base_directory). If None, saves as '{retrieval_basename}_corner_custom.png' in the same directory as the samples."
     )
 
-    selected_params: list | str | None = RuntimeField(
-        default=None,
+    selected_params: list | str | None = OptionalRuntimeField(
         description="Optional subset of parameter names to plot. Must be a subset of 'labels'. If None, plots all parameters. Example: ['H2O', 'CH4', 'CO2'] to plot only molecular abundances."
     )
 
@@ -209,20 +203,20 @@ class PlotCornerPosteriors(BaseTool):
         n_samples = samples.shape[0]
 
         result = [
-            f"Successfully generated corner plot!",
-            f"",
-            f"Input files:",
+            "Successfully generated corner plot!",
+            "",
+            "Input files:",
             f"  - Samples: {samples_path}",
             f"  - Weights: {weights_path}",
-            f"",
-            f"Plot details:",
+            "",
+            "Plot details:",
             f"  - Number of parameters: {n_params}",
             f"  - Number of samples: {n_samples}",
             f"  - Parameters plotted: {', '.join(plot_labels)}",
             f"  - Quantiles: {quantiles}",
             f"  - Bins: {self.bins}",
             f"  - DPI: {self.dpi}",
-            f"",
+            "",
             f"Output saved to: {output_path}",
         ]
 

@@ -557,6 +557,16 @@ Three layers, cheapest first:
    scenarios against mast.stsci.edu. Use `--repeat N` (routing is stochastic)
    and run it after changing the system prompt or a tool docstring.
 
+Writing a tool: import `AsterBaseTool as BaseTool, OptionalRuntimeField,
+RuntimeField, StateField` from `aster_toolkit.tool_base` (copy the import
+block from any tool module). Declare an optional argument with
+`OptionalRuntimeField(description=...)` — NEVER `RuntimeField(default=None)`,
+which orchestral treats as REQUIRED — and a required one with
+`RuntimeField(description=...)`. `EXPECTED_REQUIRED` in
+`tests/scripts/test_tool_consolidation.py` pins every tool's required list;
+update it deliberately when the API changes. Blank-string arguments for
+optional fields are treated as "not provided" centrally.
+
 Two orchestral behaviours the GUI layer exposed, both handled in
 `aster_toolkit/tool_base.py` (every ASTER tool subclasses `AsterBaseTool`):
 tool instances live for the whole session and orchestral builds each call

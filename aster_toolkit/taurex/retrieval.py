@@ -1,6 +1,6 @@
 import numpy as np
 import taurex
-from taurex.cache import GlobalCache, OpacityCache, CIACache
+from taurex.cache import OpacityCache, CIACache
 from taurex.model import TransmissionModel
 from taurex.data.profiles.temperature import Isothermal
 from taurex.planet import Planet
@@ -17,23 +17,31 @@ import sys
 from contextlib import redirect_stdout
 # import requests
 # from astropy.io import ascii
-import pandas as pd
 # import csv
 # import io
 # import json
-from tqdm import tqdm
 import corner
 import ast
 
-try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-    from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+    from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
     if _exc.name != "aster_toolkit":
         raise
     import sys as _sys, pathlib as _pl
     _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-    from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-from orchestral.tools.base.field_utils import RuntimeField, StateField
+    from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
+
+
+def _parse_literal(value, name):
+    """LLMs pass lists/dicts as strings ("['H2O', 0.02]"); parse those, pass
+    real objects and None through."""
+    if isinstance(value, str):
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Failed to parse {name} string: {value}. Error: {e}")
+    return value
 
 class SimulateTaurexRetrieval(BaseTool):
     """
@@ -61,16 +69,13 @@ class SimulateTaurexRetrieval(BaseTool):
     """
 
     # Required parameters
-    observation_path: str | None = RuntimeField(
-        default=None,
-        description="Path to the observed spectrum file (relative to base_directory). REQUIRED - you must provide this path."
+    observation_path: str = RuntimeField(
+        description="Path to the observed spectrum file (relative to base_directory)."
     )
-    fit_params: list | str | None = RuntimeField(
-        default=None,
-        description="List of parameters to fit during retrieval. Can be a Python list or a string representation of a list. Example: ['planet_radius', 'T', 'H2O', 'CH4', 'CO2', 'CO', 'NH3'] or \"['planet_radius', 'T', 'H2O', 'CH4']\". REQUIRED - you must provide fit parameters."
+    fit_params: list | str = RuntimeField(
+        description="List of parameters to fit during retrieval. Can be a Python list or a string representation of a list. Example: ['planet_radius', 'T', 'H2O', 'CH4', 'CO2', 'CO', 'NH3'] or \"['planet_radius', 'T', 'H2O', 'CH4']\"."
     )
-    bounds: dict | str | None = RuntimeField(
-        default=None,
+    bounds: dict | str | None = OptionalRuntimeField(
         description="Dictionary specifying bounds for each fit parameter with [low, high]. Can be a Python dict or string representation. Example: {'planet_radius': [0.5, 2.0], 'T': [1000, 2000], 'H2O': [1e-9, 1e-2]} or \"{'planet_radius': [0.5, 2.0], 'T': [1000, 2000]}\". If not provided, reasonable defaults will be used based on fit_params."
     )
 
@@ -111,8 +116,7 @@ class SimulateTaurexRetrieval(BaseTool):
         default=100,
         description="Number of atmospheric layers to model. Standard value is 100."
     )
-    free_chem_full_molecules: list | None = RuntimeField(
-        default=None,
+    free_chem_full_molecules: list | str | None = OptionalRuntimeField(
         description="List of molecules with mixing ratios for 'full' mode (e.g., [['H2O', 0.02], ['CH4', 0.001]]). Only used in 'full' retrieval mode. If not specified in 'full' mode, uses default molecules."
     )
     retrieval_mode: str = RuntimeField(
@@ -229,7 +233,8 @@ class SimulateTaurexRetrieval(BaseTool):
             atm_min_pressure=self.atm_min_pressure,
             atm_max_pressure=self.atm_max_pressure,
             nlayers=self.nlayers,
-            free_chem_full_molecules=self.free_chem_full_molecules,
+            free_chem_full_molecules=_parse_literal(
+                self.free_chem_full_molecules, "free_chem_full_molecules"),
             retrieval_mode=self.retrieval_mode,
             output_basename=self.output_basename,
             output_path=self.base_directory,  # Save outputs to base_directory
@@ -237,12 +242,12 @@ class SimulateTaurexRetrieval(BaseTool):
         )
 
         # Format the result as a string for the agent
-        output = f"TauREx Retrieval Complete!\n\n"
-        output += f"Best-fit parameters:\n"
-        for param, value in zip(self.fit_params, result['best_parameters']):
+        output = "TauREx Retrieval Complete!\n\n"
+        output += "Best-fit parameters:\n"
+        for param, value in zip(fit_params, result['best_parameters']):
             output += f"  - {param}: {value}\n"
         output += f"\nLog-likelihood: {result['best_value']}\n\n"
-        output += f"Output files (in workspace):\n"
+        output += "Output files (in workspace):\n"
         for key, path in result['outputs'].items():
             # Show relative path to the agent
             rel_path = os.path.relpath(path, self.base_directory)
@@ -451,7 +456,7 @@ def run_taurex_retrieval(
 
     # Run retrieval with stdout capture
     stream(f"\nStarting {optimizer} retrieval...\n")
-    stream(f"This may take several minutes depending on the number of fit parameters.\n")
+    stream("This may take several minutes depending on the number of fit parameters.\n")
     stream(f"Fitting {len(fit_params)} parameters: {', '.join(fit_params)}\n")
     stream("="*60 + "\n")
 

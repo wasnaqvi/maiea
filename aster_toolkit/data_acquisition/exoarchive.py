@@ -9,24 +9,14 @@ from astropy.io import ascii
 from tqdm import tqdm
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
-    from pydantic import Field as _PydanticField
-
-    def OptionalRuntimeField(description=None, **kwargs):
-        """LLM-visible OPTIONAL field (see mast.py: orchestral treats
-        RuntimeField(default=None) as REQUIRED)."""
-        kwargs.pop("default", None)
-        return _PydanticField(json_schema_extra={"runtime": True},
-                              default_factory=lambda: None,
-                              description=description, **kwargs)
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     # Fallback so the pure query helpers (get_exoplanet_params_tap,
     # find_exoplanets_by_condition) stay importable/testable without the full
@@ -70,9 +60,7 @@ def process_wgets_file(base_directory, wgets_file_path: str, data_path: str) -> 
         planet_name = file_name.split('.')[0]
 
         if planet_name == 'spectra':
-            # do we need this?
-            manifest_url = url
-            continue
+            continue  # the archive's manifest entry, not a planet spectrum
 
         if planet_name not in names_to_urls:
             names_to_urls[planet_name] = [url]
@@ -526,16 +514,13 @@ class DownloadDataset(BaseTool):
     """
 
     # Only ONE of these three should be provided
-    wgets_file_path: str | None = RuntimeField(
-        default=None,
+    wgets_file_path: str | None = OptionalRuntimeField(
         description="Path to existing wgets text file (relative to base_directory). Use if user saved wget commands to a file."
     )
-    wget_text: str | None = RuntimeField(
-        default=None,
+    wget_text: str | None = OptionalRuntimeField(
         description="Raw wget commands as text. Use when user pastes wget commands directly into chat."
     )
-    wget_url: str | None = RuntimeField(
-        default=None,
+    wget_url: str | None = OptionalRuntimeField(
         description="URL to Firefly wget page. Tool will scrape wget commands from this URL automatically."
     )
 

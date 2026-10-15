@@ -41,25 +41,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
-    from pydantic import Field as _PydanticField
-
-    def OptionalRuntimeField(description=None, **kwargs):
-        """LLM-visible OPTIONAL field. orchestral marks RuntimeField(default=None)
-        as REQUIRED; a default_factory is the only way to declare optional-None
-        (same helper as data_acquisition/mast.py)."""
-        kwargs.pop("default", None)
-        return _PydanticField(json_schema_extra={"runtime": True},
-                              default_factory=lambda: None,
-                              description=description, **kwargs)
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps plain reduction wrappers importable without Orchestral."""

@@ -50,15 +50,14 @@ import numpy as np
 from .lightcurves import refine_step_shape
 
 try:
-    try:  # AsterBaseTool resets tool args per call (see tool_base.py)
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
+    try:  # shared base + field helpers; see aster_toolkit/tool_base.py
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
     except ModuleNotFoundError as _exc:  # loaded by file path, outside the package
         if _exc.name != "aster_toolkit":
             raise
         import sys as _sys, pathlib as _pl
         _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[2]))
-        from aster_toolkit.tool_base import AsterBaseTool as BaseTool
-    from orchestral.tools.base.field_utils import RuntimeField, StateField
+        from aster_toolkit.tool_base import (AsterBaseTool as BaseTool, OptionalRuntimeField, RuntimeField, StateField)
 except ModuleNotFoundError:
     class BaseTool:
         """Fallback that keeps plain functions importable without Orchestral."""
@@ -68,6 +67,9 @@ except ModuleNotFoundError:
 
     def StateField(default=None, description=None):
         return default
+
+    def OptionalRuntimeField(description=None, **kwargs):
+        return None
 
 
 # Frozen survey-wide contamination settings. Bump the version if any
@@ -1756,8 +1758,7 @@ class ModelStellarContamination(BaseTool):
     planet_name: str = RuntimeField(
         default="", description="Planet name — used to fetch T_eff from the archive."
     )
-    t_phot: float | None = RuntimeField(
-        default=None,
+    t_phot: float | None = OptionalRuntimeField(
         description="Stellar effective temperature in K. Fetched from the "
                     "archive via planet_name when omitted.",
     )
