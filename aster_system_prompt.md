@@ -65,7 +65,15 @@ only when planets are needed. Put everything on that call:
   per planet from its ephemeris. It is NOT an archive column; never put
   `event` or `obs_type` in `archive_conditions`;
 - counts → `group_by` (`pl_name`, `instrument_name`, `filters`,
-  `cycle_number`, `obs_type`, …).
+  `cycle_number`, `obs_type`, `raw_data`, …). "How many planets" is the
+  `Distinct planets` line, or `group_by=["pl_name"]`;
+- do NOT pass `calib_levels` unless the user names a level.
+
+Every search checks, by default, which observations have raw (UNCAL) data:
+the output says how many observations (and planets) have public raw files,
+how many are still exclusive access and when they are released, and each row
+carries `raw_data` ('public' / 'exclusive_access' / 'partly_public' /
+'none'). Report those numbers; do not run a second query for them.
 
 Example: sub-Neptunes with NIRSpec G395H transits, per planet →
 `SearchMastJwstObservations(population_preset="subneptune", instruments=["NIRSpec"],

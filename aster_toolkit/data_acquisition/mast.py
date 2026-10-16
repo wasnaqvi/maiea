@@ -8,7 +8,7 @@ import os
 import re
 import ast
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -89,6 +89,9 @@ JWST_OBSERVATION_COLUMNS = [
     "proposal_id",
     "proposal_pi",
     "intentType",
+    # When the observation's files go public (MJD) and whether they are.
+    "t_obs_release",
+    "dataRights",
 ]
 
 RAW_PRODUCT_SUBGROUPS = ("UNCAL",)
@@ -941,6 +944,118 @@ def filter_products(
     return selected
 
 
+# One Mast.Caom.Products request lists the products of this many
+# observations (comma-separated obsids; each product names its observation
+# in ``parent_obsid``). Above RAW_CHECK_MAX_OBS the default raw check is
+# skipped rather than turning a broad search into minutes of requests.
+RAW_CHECK_BATCH = 50
+RAW_CHECK_MAX_OBS = 1000
+RAW_ROW_KEYS = frozenset({"raw_data", "raw_files", "raw_public_files", "release_date"})
+
+
+def raw_data_by_obsid(
+    obsids: Any,
+    *,
+    session: requests.Session | None = None,
+    timeout: float = 120.0,
+) -> dict[str, dict[str, int]]:
+    """Raw (UNCAL) science files per observation, and how many are public.
+
+    Counts the files ``DownloadMastJwstProducts(raw_only=True)`` would fetch
+    (science UNCAL FITS, target acquisition dropped), but keeps exclusive-
+    access ones so a proprietary observation reads as "not yet public"
+    rather than "no raw data". One request per RAW_CHECK_BATCH observations.
+    """
+    ids = list(dict.fromkeys(str(o) for o in (obsids or []) if o not in (None, "")))
+    result: dict[str, dict[str, int]] = {}
+    for start in range(0, len(ids), RAW_CHECK_BATCH):
+        chunk = ids[start:start + RAW_CHECK_BATCH]
+        request = {
+            "service": "Mast.Caom.Products",
+            "params": {"obsid": ",".join(chunk)},
+            "format": "json",
+        }
+        products = _extract_rows(_mast_query(request, session=session, timeout=timeout))
+        by_obs: dict[str, list[dict[str, Any]]] = {}
+        for product in products:
+            parent = product.get("parent_obsid")
+            if parent in (None, ""):
+                parent = chunk[0] if len(chunk) == 1 else product.get("obsID")
+            by_obs.setdefault(str(parent), []).append(product)
+        for obsid in chunk:
+            listed = by_obs.get(obsid, [])
+            raw = filter_products(
+                listed, raw_only=True, skip_proprietary=False,
+                exposure_filters=_observation_level_filters(listed),
+            )
+            result[obsid] = {
+                "raw_files": len(raw),
+                "raw_public_files": sum(
+                    1 for p in raw if str(p.get("dataRights") or "").upper() == "PUBLIC"
+                ),
+            }
+    return result
+
+
+def _mjd_to_date(value: Any) -> str | None:
+    try:
+        mjd = float(value)
+    except (TypeError, ValueError):
+        return None
+    if mjd != mjd:  # NaN
+        return None
+    return (datetime(1858, 11, 17) + timedelta(days=mjd)).date().isoformat()
+
+
+def annotate_rows_with_raw_data(rows: list[dict[str, Any]]) -> list[str]:
+    """Add raw_data / raw_files / raw_public_files / release_date in place.
+
+    ``raw_data`` is 'public' (every raw file public), 'exclusive_access'
+    (none yet), 'partly_public', or 'none' (MAST lists no UNCAL science
+    files). Returns summary lines for the tool output.
+    """
+    obsids = list(dict.fromkeys(str(r.get("obsid")) for r in rows
+                                if r.get("obsid") not in (None, "")))
+    if len(obsids) > RAW_CHECK_MAX_OBS:
+        return [f"Raw (UNCAL) data not checked: {len(obsids)} observations is more "
+                f"than {RAW_CHECK_MAX_OBS}. Narrow the search (instruments, filters, "
+                "population_preset, proposal_id) to see which have raw data."]
+    info = raw_data_by_obsid(obsids)
+    for row in rows:
+        counts = info.get(str(row.get("obsid")), {"raw_files": 0, "raw_public_files": 0})
+        total, public = counts["raw_files"], counts["raw_public_files"]
+        row["raw_files"] = total
+        row["raw_public_files"] = public
+        row["raw_data"] = ("none" if total == 0 else "public" if public == total
+                           else "exclusive_access" if public == 0 else "partly_public")
+        row["release_date"] = _mjd_to_date(row.get("t_obs_release"))
+
+    per_obs = {str(r.get("obsid")): r for r in rows if r.get("obsid") not in (None, "")}
+    status: dict[str, int] = {}
+    for row in per_obs.values():
+        status[row["raw_data"]] = status.get(row["raw_data"], 0) + 1
+    public_files = sum(r["raw_public_files"] for r in per_obs.values())
+    lines = [
+        f"Raw (UNCAL) data: {status.get('public', 0)} of {len(per_obs)} observations "
+        f"public ({public_files} raw files); {status.get('partly_public', 0)} partly "
+        f"public; {status.get('exclusive_access', 0)} exclusive access; "
+        f"{status.get('none', 0)} with no UNCAL files listed."
+    ]
+    pending = sorted(
+        {r["release_date"] for r in per_obs.values()
+         if r["raw_data"] in ("exclusive_access", "partly_public") and r["release_date"]}
+    )
+    if pending:
+        lines.append(f"  Exclusive-access release dates: {', '.join(pending[:8])}"
+                     + (" ..." if len(pending) > 8 else ""))
+    planets = {r.get("pl_name") for r in rows if r.get("pl_name")}
+    if planets:
+        with_raw = {r.get("pl_name") for r in rows
+                    if r.get("pl_name") and r["raw_data"] in ("public", "partly_public")}
+        lines.append(f"Distinct planets: {len(planets)}; with public raw data: {len(with_raw)}.")
+    return lines
+
+
 def is_raw_jwst_product(product: dict[str, Any]) -> bool:
     """Return True for JWST uncalibrated/raw products."""
     subgroup = str(product.get("productSubGroupDescription", "")).upper()
@@ -1517,6 +1632,7 @@ def _format_observations_summary(
             f"{i:3}. obsid={obsid} obs_id={obs_id} target={target} "
             f"inst={instrument} type={dptype} filters={filters} "
             f"calib_level={calib} proposal_id={proposal} pi={pi}"
+            + (f" raw={row['raw_data']}" if row.get("raw_data") else "")
         )
     if len(rows) > limit:
         lines.append(f"... ({len(rows) - limit} more truncated)")
@@ -1697,7 +1813,7 @@ OBS_TYPES = ("transit", "eclipse", "phase_curve", "baseline", "unknown")
 PLANET_ROW_KEYS = (frozenset(DEFAULT_ARCHIVE_COLUMNS) - {"ra", "dec"}) | OBS_TYPE_KEYS
 SEARCH_ROW_KEYS = (
     frozenset(JWST_OBSERVATION_COLUMNS) | frozenset(DEFAULT_ARCHIVE_COLUMNS)
-    | OBS_TYPE_KEYS | {"cycle_number"}
+    | OBS_TYPE_KEYS | RAW_ROW_KEYS | {"cycle_number"}
 )
 # Names models reach for that are not columns. 'event' is the one that
 # mattered: the old crossmatch preview printed obs_type as "event=", and a
@@ -1806,12 +1922,24 @@ class SearchMastJwstObservations(BaseTool):
        baseline / unknown, from the planet's ephemeris) and, for populations,
        ``cycle_number``. With ``planet_name`` the planets are that planet (or
        every planet of that host).
-    4. ``obs_types`` keeps rows of those types; ``group_by`` counts them.
+    4. ``obs_types`` keeps rows of those types.
+    5. By default every remaining observation is checked for raw data: its
+       UNCAL science files (what ``DownloadMastJwstProducts(raw_only=True)``
+       fetches), how many are public, and the release date. Rows get
+       ``raw_data`` ('public' / 'exclusive_access' / 'partly_public' /
+       'none'), ``raw_files``, ``raw_public_files``, ``release_date``, and
+       the output says how many observations (and planets) have public raw
+       data. Batched, one MAST request per 50 observations; skipped above
+       1000 observations. ``check_raw=False`` turns it off.
+    6. ``group_by`` counts the rows (``raw_data`` works as a key).
 
     The full rows are always written to CSV in population mode (cone mode
     only with ``output_csv``); that CSV feeds
     ``DownloadMastJwstProducts(rows_path=...)``, or this tool's own
     ``rows_path`` to regroup it without querying MAST again.
+
+    Do not pass ``calib_levels`` unless the user asks for a level: raw data
+    lives under every level, and a level filter only drops observations.
 
     Examples
     --------
@@ -1825,7 +1953,7 @@ class SearchMastJwstObservations(BaseTool):
         SearchMastJwstObservations(planet_name="WASP-39 b", instruments=["NIRSpec"])
     JWST time series per instrument (no planets needed):
         SearchMastJwstObservations(dataproduct_types=["timeseries"],
-                                   calib_levels=[3], group_by=["instrument_name"])
+                                   group_by=["instrument_name"])
     Regroup a CSV an earlier call wrote:
         SearchMastJwstObservations(rows_path="mast/demographics/search_....csv",
                                    group_by=["cycle_number"])
@@ -1917,10 +2045,9 @@ class SearchMastJwstObservations(BaseTool):
     )
     calib_levels: list | str | None = OptionalRuntimeField(
         description=(
-            "Optional MAST calibration levels (observation processing stage; "
-            "JWST science is usually 3). Do NOT use calib_levels=[1] to find raw "
-            "data — UNCAL products live under calib_level 2/3 observations; fetch "
-            "them with raw_only=True on DownloadMastJwstProducts instead."
+            "Leave unset unless the user names a level. It is the observation's "
+            "processing stage, not raw vs calibrated: raw UNCAL files live under "
+            "level 2/3 observations, and the raw check reports them by default."
         ),
     )
     filters: list | str | None = OptionalRuntimeField(
@@ -1959,6 +2086,13 @@ class SearchMastJwstObservations(BaseTool):
         description=(
             "Optional CSV path (relative to the workspace) for the full rows. "
             "Population mode always writes one (auto-named if unset)."
+        ),
+    )
+    check_raw: bool | str = RuntimeField(
+        default=True,
+        description=(
+            "Check each observation for raw (UNCAL) files and whether they are "
+            "public (default True; skipped above 1000 observations)."
         ),
     )
     base_directory: str | None = StateField(default=None)
@@ -2053,6 +2187,9 @@ class SearchMastJwstObservations(BaseTool):
             raise ValueError("distinct_fields needs group_by.")
         requested_keys = set(group_keys) | set(distinct_keys)
         key_note = "".join(f"NOTE: {n}\n" for n in key_notes)
+        check_raw = _as_bool(self.check_raw, "check_raw", default=True)
+        if requested_keys & RAW_ROW_KEYS and not check_raw:
+            raise ValueError(f"group_by {sorted(requested_keys & RAW_ROW_KEYS)} needs check_raw=True.")
 
         rows_path = _clean_str(self.rows_path)
         if rows_path:
@@ -2175,6 +2312,8 @@ class SearchMastJwstObservations(BaseTool):
             cycle_warnings = []
             if observations and "cycle_number" in requested_keys:
                 cycle_warnings = self._annotate_cycles(observations)
+            raw_lines = (annotate_rows_with_raw_data(observations)
+                         if observations and check_raw else [])
             summary = _format_observations_summary(
                 observations, limit=10 if group_keys else 50,
                 filters=filters, query_extra=query_extra,
@@ -2187,6 +2326,8 @@ class SearchMastJwstObservations(BaseTool):
                 body = f"{summary}\n\n{diagnostics}"
             else:
                 body = saved + (f"{diagnostics}\n\n" if diagnostics else "") + summary
+            if raw_lines:
+                body += "\n\n" + "\n".join(raw_lines)
             if wants_planets:
                 body += ("\n\nNo observations, so no planets were looked up "
                          "(MAST is queried first).")
@@ -2211,6 +2352,8 @@ class SearchMastJwstObservations(BaseTool):
         cycle_warnings = []
         if rows and (population or "cycle_number" in requested_keys):
             cycle_warnings = self._annotate_cycles(rows)
+        if rows and check_raw:
+            type_lines.extend(annotate_rows_with_raw_data(rows))
 
         csv_path = None
         if self.base_directory and (demographics or _clean_str(self.output_csv)):
@@ -2284,6 +2427,9 @@ class SearchMastJwstObservations(BaseTool):
         if rows and "cycle_number" in requested and "cycle_number" not in columns:
             cycle_warnings = self._annotate_cycles(rows)
             columns.add("cycle_number")
+        if rows and requested & RAW_ROW_KEYS - columns:
+            lines.extend(annotate_rows_with_raw_data(rows))
+            columns |= RAW_ROW_KEYS
         if rows:
             _check_row_keys(sorted(requested), columns, where=rows_path)
         if grating_filters or obs_types:
@@ -2299,7 +2445,8 @@ class SearchMastJwstObservations(BaseTool):
             body = "\n".join(
                 f"{i:3}. pl_name={r.get('pl_name')} obsid={r.get('obsid')} "
                 f"inst={r.get('instrument_name')} filters={r.get('filters')} "
-                f"obs_type={r.get('obs_type', '?')} proposal_id={r.get('proposal_id')}"
+                f"obs_type={r.get('obs_type', '?')} raw={r.get('raw_data', '?')} "
+                f"proposal_id={r.get('proposal_id')}"
                 for i, r in enumerate(rows[:20], start=1)
             ) + (f"\n... ({len(rows) - 20} more rows in the CSV)" if len(rows) > 20 else "")
         else:
@@ -2685,7 +2832,7 @@ def crossmatch_observations_to_planets(
     obs_keep_keys: tuple[str, ...] = (
         "obsid", "obs_id", "instrument_name", "dataproduct_type",
         "calib_level", "proposal_id", "proposal_pi", "target_name",
-        "filters", "t_min", "t_max",
+        "filters", "t_min", "t_max", "t_obs_release",
     ),
 ) -> list[dict[str, Any]]:
     """
@@ -2956,7 +3103,8 @@ def _format_crossmatch_summary(
             f"proposal_id={row.get('proposal_id','?')} "
             f"cycle={row.get('cycle_number','?')} "
             f"obs_type={row.get('obs_type','?')} "
-            f"pi={row.get('proposal_pi','?')}"
+            + (f"raw={row['raw_data']} " if row.get("raw_data") else "")
+            + f"pi={row.get('proposal_pi','?')}"
         )
     if len(rows) > limit:
         head.append(

@@ -64,7 +64,13 @@ def mashup(request: dict) -> dict:
             return {"resolvedCoordinate": []}
         return {"resolvedCoordinate": [{"ra": ra, "decl": dec}]}
     if svc == "Mast.Caom.Products":
-        return {"status": "COMPLETE", "data": products_for(str(params["obsid"]))}
+        # Comma-separated obsids, like the real service; each product names
+        # the observation it was requested for in parent_obsid.
+        return {"status": "COMPLETE", "data": [
+            {**product, "parent_obsid": obsid}
+            for obsid in str(params["obsid"]).split(",")
+            for product in products_for(obsid.strip())
+        ]}
     if svc in ("Mast.Caom.Filtered", "Mast.Caom.Filtered.Position"):
         rows = obs_rows()
         for flt in params.get("filters", []):

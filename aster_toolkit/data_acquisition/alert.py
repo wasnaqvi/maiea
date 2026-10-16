@@ -62,7 +62,8 @@ from . import mast
 MJD_UNIX_EPOCH = 40587.0
 DEFAULT_STATE_PATH = "workspace/mast/alert/state.json"
 DEFAULT_DIGEST_DIR = "workspace/mast/alert/digests"
-ALERT_COLUMNS = list(mast.JWST_OBSERVATION_COLUMNS) + ["t_obs_release", "dataRights"]
+ALERT_COLUMNS = list(dict.fromkeys(
+    list(mast.JWST_OBSERVATION_COLUMNS) + ["t_obs_release", "dataRights"]))
 PLANET_COLUMNS = ["pl_name", "hostname", "ra", "dec", "pl_rade", "pl_eqt"]
 STATE_VERSION = 1
 

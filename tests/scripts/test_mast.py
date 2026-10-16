@@ -15,11 +15,15 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 MAST_PATH = REPO_ROOT / "aster_toolkit" / "data_acquisition" / "mast.py"
 
 
-def load_mast_module():
+def load_mast_module(*, stub_raw_check=True):
     spec = importlib.util.spec_from_file_location("mast_under_test", MAST_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
+    if stub_raw_check:
+        # Search checks every observation for raw files over the network by
+        # default; tests that are not about that check get an empty answer.
+        module.raw_data_by_obsid = lambda obsids, **kwargs: {}
     return module
 
 
@@ -2406,6 +2410,107 @@ class JwstProgramInfoTests(unittest.TestCase):
         self.assertIn("2372: Cycle 1 | GO | PI Renyu Hu", output)
         self.assertIn("Lookups FAILED", output)
         self.assertIn("9999", output)
+
+
+class RawDataCheckTests(unittest.TestCase):
+    """Search reports, by default, which observations have raw (UNCAL) data."""
+
+    def setUp(self):
+        self.mast = load_mast_module(stub_raw_check=False)
+
+    @staticmethod
+    def _products(obsid, *, public=True, ta=True):
+        rights = "PUBLIC" if public else "EXCLUSIVE_ACCESS"
+        rows = [
+            {"parent_obsid": int(obsid), "obsID": "child", "productType": "SCIENCE",
+             "productSubGroupDescription": "UNCAL", "dataRights": rights,
+             "productFilename": f"jw0{obsid}001_04101_00001-seg00{seg}_nrs1_uncal.fits",
+             "filters": "F290LP;G395H"}
+            for seg in (1, 2)
+        ]
+        rows.append({"parent_obsid": int(obsid), "productType": "SCIENCE",
+                     "productSubGroupDescription": "X1DINTS", "dataRights": rights,
+                     "productFilename": f"jw{int(obsid):05d}-o001_t001_nirspec_x1dints.fits",
+                     "filters": "F290LP;G395H"})
+        if ta:   # target acquisition: not raw science, must not be counted
+            rows.append({"parent_obsid": int(obsid), "productType": "SCIENCE",
+                         "productSubGroupDescription": "UNCAL", "dataRights": rights,
+                         "productFilename": f"jw0{obsid}001_02101_00001_nrs1_uncal.fits",
+                         "filters": "F110W;MIRROR"})
+        return rows
+
+    def test_raw_data_by_obsid_batches_and_counts_public_files(self):
+        requests_seen = []
+
+        def fake_query(request, **kwargs):
+            ids = request["params"]["obsid"].split(",")
+            requests_seen.append(len(ids))
+            data = []
+            for obsid in ids:
+                if obsid != "9":                      # 9: nothing listed
+                    data += self._products(obsid, public=obsid != "2")
+            return {"data": data}
+
+        obsids = ["1", "2", "9"] + [str(100 + i) for i in range(117)]
+        with patch.object(self.mast, "_mast_query", side_effect=fake_query):
+            info = self.mast.raw_data_by_obsid(obsids)
+        self.assertEqual(requests_seen, [50, 50, 20])
+        self.assertEqual(info["1"], {"raw_files": 2, "raw_public_files": 2})
+        self.assertEqual(info["2"], {"raw_files": 2, "raw_public_files": 0})
+        self.assertEqual(info["9"], {"raw_files": 0, "raw_public_files": 0})
+
+    def test_search_checks_raw_data_by_default(self):
+        observations = [
+            {"obsid": o, "instrument_name": "NIRSPEC/BOTS", "filters": "F290LP;G395H",
+             "t_obs_release": 61000.0}
+            for o in ("1", "2", "3")
+        ]
+
+        def fake_query(request, **kwargs):
+            ids = request["params"]["obsid"].split(",")
+            return {"data": [p for o in ids if o != "3"
+                             for p in self._products(o, public=o == "1")]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(self.mast, "search_all_jwst_observations",
+                             return_value=(observations, [])),
+                patch.object(self.mast, "_mast_query", side_effect=fake_query) as query,
+            ):
+                out = _construct_tool(
+                    self.mast.SearchMastJwstObservations,
+                    dataproduct_types=["timeseries"], group_by=["raw_data"],
+                    base_directory=tmpdir,
+                )._run()
+            query.assert_called_once()                # one batched request
+            self.assertIn("Raw (UNCAL) data: 1 of 3 observations public (2 raw files); "
+                          "0 partly public; 1 exclusive access; 1 with no UNCAL files listed.",
+                          out)
+            self.assertIn("Exclusive-access release dates: 2025-11-21", out)
+            self.assertIn("raw_data='public' count=1", out)
+            (rows_csv,) = (pathlib.Path(tmpdir) / "mast" / "demographics").glob("search_*.csv")
+            with rows_csv.open() as fh:
+                rows = {r["obsid"]: r for r in csv.DictReader(fh)}
+            self.assertEqual(rows["2"]["raw_data"], "exclusive_access")
+            self.assertEqual(rows["2"]["release_date"], "2025-11-21")
+            self.assertEqual(rows["3"]["raw_data"], "none")
+
+    def test_check_raw_false_and_the_size_cap_skip_the_product_queries(self):
+        many = [{"obsid": str(i), "filters": "F290LP;G395H"}
+                for i in range(self.mast.RAW_CHECK_MAX_OBS + 1)]
+        for kwargs, rows, expect in (({"check_raw": False}, many[:3], None),
+                                     ({}, many, "not checked")):
+            with (
+                patch.object(self.mast, "search_all_jwst_observations", return_value=(rows, [])),
+                patch.object(self.mast, "_mast_query") as query,
+            ):
+                out = _construct_tool(self.mast.SearchMastJwstObservations,
+                                      base_directory=None, **kwargs)._run()
+            query.assert_not_called()
+            if expect:
+                self.assertIn(expect, out)
+            else:
+                self.assertNotIn("Raw (UNCAL)", out)
 
 
 @unittest.skipUnless(
