@@ -1125,22 +1125,36 @@ def _filter_tokens(value: Any) -> set[str]:
     return {t for t in re.split(r"[;,/\s]+", str(value or "").upper()) if t}
 
 
-def _filters_match(row_value: Any, requested: list[Any] | None) -> bool:
-    """True if ANY requested value has ALL its tokens in the row's filters.
+def _is_filter_wheel_token(token: str) -> bool:
+    """'F290LP', 'F322W2', 'CLEAR' are filter-wheel elements; 'G395H',
+    'PRISM', 'GR700XD', 'GRISMR', 'P750L' are dispersers / pupils."""
+    return bool(re.fullmatch(r"F\d{3}[A-Z0-9]*", token)) or token in {"CLEAR", "OPAQUE"}
 
-    ``['G395H']`` matches 'F290LP;G395H'; ``['F290LP;G395H']`` requires
-    both; ``['G395H', 'G395M']`` matches either grating. Applied
-    client-side on purpose: MAST discrete filters are exact-match on the
-    full joined string, so a server-side 'G395H' would silently drop
-    'F290LP;G395H' rows.
+
+def _filters_match(row_value: Any, requested: list[Any] | None) -> bool:
+    """True if the row's CAOM filters satisfy the requested tokens.
+
+    ``['G395H']`` matches 'F290LP;G395H'; ``['G395H', 'G395M']`` matches
+    either grating; ``['F290LP', 'G395H']`` requires BOTH, because single
+    tokens are OR-ed only within their kind (filter-wheel vs disperser) and
+    AND-ed across kinds — treating that list as any-of let every G395M row
+    in through its F290LP. A joined value (``'F290LP;G395H'``) is an exact
+    combination that matches on its own. Applied client-side on purpose:
+    MAST discrete filters are exact-match on the full joined string, so a
+    server-side 'G395H' would silently drop 'F290LP;G395H' rows.
     """
     if not requested:
         return True
     have = _filter_tokens(row_value)
-    return any(
-        _filter_tokens(value) and _filter_tokens(value) <= have
-        for value in requested
-    )
+    singles: dict[bool, set[str]] = {}
+    for value in requested:
+        tokens = _filter_tokens(value)
+        if len(tokens) > 1 and tokens <= have:
+            return True
+        if len(tokens) == 1:
+            (token,) = tokens
+            singles.setdefault(_is_filter_wheel_token(token), set()).add(token)
+    return bool(singles) and all(group & have for group in singles.values())
 
 
 def _visit_prefix(product: dict[str, Any]) -> str | None:
@@ -1674,135 +1688,190 @@ def _diagnose_empty_demographics(
     return "\n".join(lines)
 
 
+# Row columns produced by the transit/eclipse classifier.
+OBS_TYPE_KEYS = frozenset({
+    "obs_type", "n_transits_in_window", "n_eclipses_in_window", "obs_type_note",
+})
+OBS_TYPES = ("transit", "eclipse", "phase_curve", "baseline", "unknown")
+# Columns that only exist once observations are joined to planets.
+PLANET_ROW_KEYS = (frozenset(DEFAULT_ARCHIVE_COLUMNS) - {"ra", "dec"}) | OBS_TYPE_KEYS
+SEARCH_ROW_KEYS = (
+    frozenset(JWST_OBSERVATION_COLUMNS) | frozenset(DEFAULT_ARCHIVE_COLUMNS)
+    | OBS_TYPE_KEYS | {"cycle_number"}
+)
+# Names models reach for that are not columns. 'event' is the one that
+# mattered: the old crossmatch preview printed obs_type as "event=", and a
+# model then grouped by a column that did not exist and got None for every
+# row instead of an error.
+ROW_KEY_ALIASES = {
+    "event": "obs_type", "event_type": "obs_type", "obs_event": "obs_type",
+    "cycle": "cycle_number", "instrument": "instrument_name",
+    "planet": "pl_name", "grating": "filters", "pi": "proposal_pi",
+    "program": "proposal_id", "proposal": "proposal_id", "target": "target_name",
+}
+
+
+def _resolve_row_keys(value: Any, notes: list[str]) -> list[str]:
+    keys = []
+    for key in _as_list(value) or []:
+        key = str(key).strip()
+        if not key:
+            continue
+        alias = ROW_KEY_ALIASES.get(key.lower())
+        if alias:
+            notes.append(f"'{key}' is not a column; read it as '{alias}'.")
+            key = alias
+        keys.append(key)
+    return keys
+
+
+def _check_row_keys(keys: list[str], available: set[str] | frozenset[str],
+                    *, where: str) -> None:
+    missing = [k for k in keys if k not in available]
+    if missing:
+        raise ValueError(
+            f"No column {missing} in {where}. Available columns: "
+            f"{sorted(available)}. Transit/eclipse is 'obs_type'."
+        )
+
+
+def _normalize_obs_types(value: Any) -> list[str]:
+    types = [str(v).strip().lower().replace("-", "_").replace(" ", "_")
+             for v in (_as_list(value) or []) if _clean_str(v)]
+    types = ["transit" if t == "transits" else "eclipse" if t == "eclipses" else t
+             for t in types]
+    bad = [t for t in types if t not in OBS_TYPES]
+    if bad:
+        raise ValueError(f"Unknown obs_types {bad}. Valid: {list(OBS_TYPES)}.")
+    return types
+
+
+def _reject_observation_columns(conditions: list[str]) -> None:
+    for condition in conditions:
+        if re.search(r"\b(event|obs_type)\b", condition, re.IGNORECASE):
+            raise ValueError(
+                f"archive_conditions {condition!r}: the Exoplanet Archive has no "
+                "event column — transit vs eclipse is a property of each JWST "
+                "observation. Pass obs_types=['transit'] instead."
+            )
+
+
+def _event_classification_lines(rows: list[dict[str, Any]], classified: int) -> list[str]:
+    lines = [
+        f"Event classification: {classified}/{len(rows)} rows typed "
+        "(transit/eclipse/phase_curve/baseline); 'unknown' rows lack "
+        "pl_tranmid/pl_orbper — see obs_type_note."
+    ]
+    notes: dict[str, int] = {}
+    for row in rows:
+        note = row.get("obs_type_note")
+        if note:
+            notes[str(note)] = notes.get(str(note), 0) + 1
+    if notes:
+        lines.append("obs_type_note breakdown (read before trusting eclipse/baseline calls):")
+        lines.extend(
+            f"  - (x{count}) {note}"
+            for note, count in sorted(notes.items(), key=lambda kv: -kv[1])
+        )
+    return lines
+
+
 class SearchMastJwstObservations(BaseTool):
     """
-    Search MAST for JWST observations (the "who/what observed" tool).
+    Search MAST for JWST observations — the one tool for every "which JWST
+    data exists" question, from one planet to a whole population, including
+    counts.
 
-    USE WHEN: the user asks who observed a planet, what instrument/mode was used,
-    which JWST program or PI, or wants to discover JWST data for a target or a
-    whole population. This is the FIRST step for any observation question.
+    USE WHEN: who observed a planet, what instrument/grating, which program
+    or PI; every observation of a population ("sub-Neptunes with NIRSpec
+    G395H transits"); or a count/breakdown ("how many per planet / cycle /
+    instrument"). Answer in ONE call: put the population, the transit filter
+    and the grouping on this call rather than chaining tools.
 
-    NOT FOR: a planet's physical parameters (`QueryExoplanetArchive`). It returns
-    observation rows (obsid, instrument, filters, proposal_id, PI) — not files.
-    To list or fetch files for an obsid, call `DownloadMastJwstProducts` next
-    (``list_only=True`` to just list them).
+    NOT FOR: a planet's physical parameters or a planet list with no
+    observations (`QueryExoplanetArchive`); files (`DownloadMastJwstProducts`,
+    ``list_only=True`` to list them); release dates (`AsterAlert`).
 
-    Three modes:
-      * **Per-planet cone search** — supply ``planet_name`` (resolved to RA/Dec
-        via MAST Name Lookup) or supply ``ra`` and ``dec`` directly.
-      * **Population / demographics search** — omit ``planet_name``, ``ra`` and
-        ``dec`` entirely. The tool runs a no-position ``Mast.Caom.Filtered``
-        query so every JWST observation matching the filters is returned. Use
-        for "all NIRSpec spectra" / "every JWST timeseries at calib level 3"
-        style questions.
-      * **Target-name filter** — supply ``target_name`` (free-text) without any
-        coordinates to constrain by MAST target_name without resolving a planet.
+    How a query runs — MAST first
+    -----------------------------
+    1. MAST is queried for JWST observations: a cone around ``planet_name``
+       (or ``ra``/``dec``), or every observation matching the filters when no
+       position is given.
+    2. ``filters`` narrows by grating, client-side.
+    3. Only if planets are needed (``population_preset``,
+       ``archive_conditions``, ``obs_types``, or a planet column in
+       ``group_by``) are the observations joined to Exoplanet Archive planets
+       by sky position, giving one row per (planet, observation) with the
+       planet's parameters, ``obs_type`` (transit / eclipse / phase_curve /
+       baseline / unknown, from the planet's ephemeris) and, for populations,
+       ``cycle_number``. With ``planet_name`` the planets are that planet (or
+       every planet of that host).
+    4. ``obs_types`` keeps rows of those types; ``group_by`` counts them.
 
-    Workflow
-    --------
-    1. Call this tool to discover JWST observations (returns obsid + metadata).
-    2. ``DownloadMastJwstProducts(obsids=..., list_only=True)`` to list files.
-    3. ``DownloadMastJwstProducts`` (same arguments, list_only=False) to fetch them.
-    4. For counts/breakdowns, pass the rows CSV this tool writes to
-       ``AggregateJwstObservations``.
-
-    Why coordinate-centered (per-planet mode)
-    -----------------------------------------
-    MAST target names are usually host-star names (e.g. 'WASP-39'), not planet names
-    ('WASP-39 b'). The per-planet mode resolves the planet name via MAST Name
-    Lookup and runs a cone-search by RA/Dec. If MAST cannot resolve the planet
-    name, pass RA and Dec directly (look them up via the exoarchive tools or
-    Simbad), or drop ``planet_name`` and use the demographics mode.
-
-    JWST instruments
-    ----------------
-    Bare instrument names expand to ALL of that instrument's MAST
-    instrument_name configurations (exact-match server-side vocabulary):
-        - "NIRSpec"  : BOTS, SLIT, IFU, MSA, IMAGE (BOTS = bright-object time
-                       series — virtually all NIRSpec transit/eclipse data)
-        - "NIRCam"   : IMAGE, GRISM, WFSS, CORON, TARGACQ
-        - "MIRI"     : SLITLESS, SLIT, IFU (MRS), IMAGE, CORON, TARGACQ
-                       (LRS TSO data is MIRI/SLITLESS)
-        - "NIRISS"   : SOSS, IMAGE, WFSS, AMI
-        - "FGS"      : fine guidance sensor (rarely needed for science)
-    Full mode strings pass through unchanged (e.g. "NIRSPEC/BOTS"), and the
-    shorthands "BOTS", "SOSS", "MRS", "LRS" map to their modes.
-
-    Zero-result behavior
-    --------------------
-    If the strict server-side query returns nothing, the tool re-runs the cone
-    unfiltered and re-applies your filters client-side (recovering data hidden
-    by MAST vocabulary drift), and otherwise reports what instruments /
-    proposals / product types ARE present in the cone — or where a given
-    proposal's observations actually live — so the next query can be corrected.
-
-    Gratings / filters
-    ------------------
-    ``filters`` keeps observations whose CAOM ``filters`` value contains the
-    given tokens, e.g. ['G395H'] keeps 'F290LP;G395H' and drops PRISM or
-    G395M; ['G395H', 'G395M'] keeps either. Matched client-side (MAST's own
-    filter is exact-match on the joined string and would drop real data).
-
-    Data product types
-    ------------------
-    Valid values for ``dataproduct_types``:
-        - "spectrum"   : 1-D extracted spectra
-        - "timeseries" : time-series exposures (transits/eclipses)
-        - "image"      : 2-D images
-        - "cube"       : 3-D IFU cubes
-
-    Calibration levels
-    ------------------
-    ``calib_level`` is the OBSERVATION's highest processing stage — NOT a way to
-    select raw vs calibrated FILES. Valid values:
-        - 1 : uncalibrated observation (JWST science obs are almost NEVER filed here)
-        - 2 : per-exposure calibrated products
-        - 3 : combined / extracted science-ready products (the usual JWST value)
-        - 4 : community / contributed products
-
-    IMPORTANT — getting RAW / uncalibrated (UNCAL) data:
-        Do NOT filter ``calib_levels=[1]`` to find raw data. A calib_level-3
-        observation still CONTAINS the raw UNCAL ramps as products. To fetch
-        them, search WITHOUT a calib_level filter, then call
-        ``DownloadMastJwstProducts(obsids=..., raw_only=True)`` (add
-        ``list_only=True`` to preview). Filtering by
-        calib_level=1 will return nothing and falsely imply "no raw data exists".
-
-    Returns
-    -------
-    A line-per-observation summary (first 50 rows) including obsid, instrument,
-    dataproduct_type, filters, calib_level, proposal_id, and target_name. Use
-    the obsid values with ``DownloadMastJwstProducts``.
-
-    The FULL row set is written to CSV — always in demographics mode
-    (auto-named under ``mast/demographics/search_*.csv`` unless ``output_csv``
-    is given), and in cone mode when ``output_csv`` is given. That CSV is the
-    input for ``AggregateJwstObservations`` and for
-    ``DownloadMastJwstProducts(rows_path=...)``.
+    The full rows are always written to CSV in population mode (cone mode
+    only with ``output_csv``); that CSV feeds
+    ``DownloadMastJwstProducts(rows_path=...)``, or this tool's own
+    ``rows_path`` to regroup it without querying MAST again.
 
     Examples
     --------
-    Per-planet cone search:
+    Sub-Neptunes with NIRSpec G395H transits, counted per planet:
         SearchMastJwstObservations(
-            planet_name="WASP-39 b",
-            instruments=["NIRSpec"],
-            dataproduct_types=["spectrum", "timeseries"],
-            calib_levels=[3],
+            population_preset="subneptune",
+            instruments=["NIRSpec"], dataproduct_types=["timeseries"],
+            filters=["G395H"], obs_types=["transit"], group_by=["pl_name"],
         )
+    Who observed WASP-39 b with NIRSpec:
+        SearchMastJwstObservations(planet_name="WASP-39 b", instruments=["NIRSpec"])
+    JWST time series per instrument (no planets needed):
+        SearchMastJwstObservations(dataproduct_types=["timeseries"],
+                                   calib_levels=[3], group_by=["instrument_name"])
+    Regroup a CSV an earlier call wrote:
+        SearchMastJwstObservations(rows_path="mast/demographics/search_....csv",
+                                   group_by=["cycle_number"])
 
-    Population / demographics search (no planet_name, no ra/dec):
-        SearchMastJwstObservations(
-            instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
-            dataproduct_types=["spectrum", "timeseries"],
-            calib_levels=[3],
-        )
+    Populations
+    -----------
+    Prefer ``population_preset`` ('subneptune', 'super_earth', 'neptune',
+    'hot_jupiter', 'warm_jupiter', ... ) to hand-written radius cuts: sub-
+    Neptune is ``pl_rade`` 1.75-4.0 (Earth radii), NOT ``pl_radj`` (Jupiter
+    radii, which gives hot Jupiters). ``archive_conditions`` are ADQL WHERE
+    clauses on pscomppars (e.g. ``"sy_dist < 50"``), AND-ed with the preset.
+    Transit/eclipse is NOT an archive column — use ``obs_types``.
+
+    JWST instruments
+    ----------------
+    Bare names expand to every MAST mode of that instrument ("NIRSpec" →
+    BOTS, SLIT, IFU, MSA, IMAGE; "MIRI" → SLITLESS, SLIT, IFU, IMAGE, ...).
+    Full mode strings pass through ("NIRSPEC/BOTS"); shorthands "BOTS",
+    "SOSS", "MRS", "LRS" map to their modes.
+
+    Gratings / filters
+    ------------------
+    ``['G395H']`` keeps 'F290LP;G395H' and drops G395M and PRISM;
+    ``['G395H', 'G395M']`` keeps either grating; ``['F290LP', 'G395H']``
+    requires both (filter-wheel and disperser tokens are AND-ed, tokens of
+    one kind OR-ed).
+
+    Calibration levels
+    ------------------
+    ``calib_levels`` is the OBSERVATION's processing stage (JWST science is
+    3), NOT a raw-vs-calibrated file selector. Never use ``[1]`` to find raw
+    data: UNCAL ramps are products under calib-level 3 observations — search
+    without calib_levels, then ``DownloadMastJwstProducts(obsids=...,
+    raw_only=True)``.
+
+    Zero results
+    ------------
+    An empty cone is re-run unfiltered and your filters re-applied
+    client-side; an empty population search names the filter that emptied
+    it. Report which stage was empty, never "no data exists".
     """
 
     planet_name: str | None = OptionalRuntimeField(
         description=(
-            "Exoplanet or host-star target name, e.g. 'WASP-39 b'. Leave None "
-            "to run a no-position demographics query over every JWST observation "
-            "matching the filters."
+            "Exoplanet or host-star target name, e.g. 'WASP-39 b' (cone search). "
+            "Leave unset for a population / all-JWST search."
         ),
     )
     ra: float | str | None = OptionalRuntimeField(
@@ -1813,7 +1882,32 @@ class SearchMastJwstObservations(BaseTool):
     )
     radius_deg: float | str = RuntimeField(
         default=0.02,
-        description="Cone-search radius in degrees (only used when planet_name or ra/dec are set).",
+        description=(
+            "Cone radius in degrees, for the planet_name/ra/dec search and for "
+            "matching observations to planets."
+        ),
+    )
+    population_preset: str | None = OptionalRuntimeField(
+        description=(
+            "Planet population to keep, e.g. 'subneptune', 'super_earth', "
+            "'neptune', 'hot_jupiter', 'warm_jupiter'. Joins each observation "
+            "to its planet (radius, Teq, ephemeris, obs_type, cycle). Use this "
+            "rather than hand-written radius cuts."
+        ),
+    )
+    archive_conditions: list | str | None = OptionalRuntimeField(
+        description=(
+            "Extra Exoplanet Archive (pscomppars) ADQL conditions, AND-ed with "
+            "population_preset, e.g. ['sy_dist < 50']. pl_rade is Earth radii, "
+            "pl_radj Jupiter radii. NOT for transit/eclipse — use obs_types."
+        ),
+    )
+    obs_types: list | str | None = OptionalRuntimeField(
+        description=(
+            "Keep only these observation types, classified per planet from its "
+            "ephemeris: 'transit', 'eclipse', 'phase_curve', 'baseline', "
+            "'unknown'. Needs planet_name or a population."
+        ),
     )
     instruments: list | str | None = OptionalRuntimeField(
         description="JWST instrument filters, e.g. ['NIRSpec', 'NIRCam', 'MIRI'].",
@@ -1826,26 +1920,45 @@ class SearchMastJwstObservations(BaseTool):
             "Optional MAST calibration levels (observation processing stage; "
             "JWST science is usually 3). Do NOT use calib_levels=[1] to find raw "
             "data — UNCAL products live under calib_level 2/3 observations; fetch "
-            "them with raw_only=True on the products/download tools instead."
+            "them with raw_only=True on DownloadMastJwstProducts instead."
+        ),
+    )
+    filters: list | str | None = OptionalRuntimeField(
+        description=(
+            "Grating/filter tokens, e.g. ['G395H']. Gratings are any-of; a "
+            "filter plus a grating (['F290LP', 'G395H']) must both match."
         ),
     )
     proposal_id: str | None = OptionalRuntimeField(
         description="Optional JWST proposal id filter.",
     )
     target_name: str | None = OptionalRuntimeField(
+        description="Optional free-text MAST target_name filter (population mode).",
+    )
+    group_by: list | str | None = OptionalRuntimeField(
         description=(
-            "Optional free-text target-name filter (MAST target_name). Used "
-            "directly in demographics mode, or combined with cone search via "
-            "target_name_filter=True semantics."
+            "Count the rows by these columns, e.g. ['pl_name'], "
+            "['instrument_name', 'filters'], ['cycle_number'], ['obs_type']. "
+            "Planet columns (pl_name, obs_type, pl_rade, ...) need planet_name "
+            "or a population."
         ),
     )
-    filters: list | str | None = OptionalRuntimeField(
-        description="Grating/filter tokens, e.g. ['G395H'] (any-of; client-side).",
+    distinct_fields: list | str | None = OptionalRuntimeField(
+        description=(
+            "With group_by: count distinct values of these columns per group, "
+            "e.g. ['instrument_name'] per pl_name for multi-instrument planets."
+        ),
+    )
+    rows_path: str | None = OptionalRuntimeField(
+        description=(
+            "A rows CSV an earlier search wrote: filter (filters, obs_types) "
+            "and group it again WITHOUT querying MAST."
+        ),
     )
     output_csv: str | None = OptionalRuntimeField(
         description=(
             "Optional CSV path (relative to the workspace) for the full rows. "
-            "Demographics mode always writes one (auto-named if unset)."
+            "Population mode always writes one (auto-named if unset)."
         ),
     )
     base_directory: str | None = StateField(default=None)
@@ -1856,17 +1969,55 @@ class SearchMastJwstObservations(BaseTool):
         output_csv = _clean_str(self.output_csv)
         if not rows or not self.base_directory or not (always or output_csv):
             return ""
-        if output_csv:
-            path = Path(self.base_directory) / output_csv
-        else:
-            path = _autoname_csv_path(
-                self.base_directory, kind="search", hint_parts=hint_parts
-            )
+        path = self._rows_csv_path(hint_parts)
         _write_rows_csv(path, rows)
         return (
             f"Full rows ({len(rows)}) written to: {path}\n"
-            "(Count/group them with AggregateJwstObservations(rows_path=...); "
-            "fetch files with DownloadMastJwstProducts(rows_path=...).)\n\n"
+            "(Fetch files with DownloadMastJwstProducts(rows_path=...); regroup "
+            "with SearchMastJwstObservations(rows_path=..., group_by=[...]).)\n\n"
+        )
+
+    def _rows_csv_path(self, hint_parts: list[Any]) -> Path:
+        output_csv = _clean_str(self.output_csv)
+        if output_csv:
+            return Path(self.base_directory or ".") / output_csv
+        return _autoname_csv_path(self.base_directory or ".", kind="search",
+                                  hint_parts=hint_parts)
+
+    def _annotate_cycles(self, rows: list[dict[str, Any]]) -> list[str]:
+        return annotate_rows_with_cycles(
+            rows, cache_path=Path(self.base_directory or ".") / JWST_PROGRAM_INFO_CACHE,
+        )
+
+    def _grouped(self, rows: list[dict[str, Any]], group_keys: list[str],
+                 distinct_keys: list[str], hint: Any) -> str:
+        """Count rows by group_keys; write the table; return its summary."""
+        if not group_keys:
+            return ""
+        groups = aggregate_observations(rows, group_by=group_keys,
+                                        distinct_fields=distinct_keys)
+        csv_path = _autoname_csv_path(self.base_directory or ".", kind="aggregate",
+                                      hint_parts=[group_keys, distinct_keys, hint])
+        _write_rows_csv(csv_path, groups)
+        return _format_aggregate_summary(
+            groups, group_by=group_keys, distinct_fields=distinct_keys,
+            total_rows=len(rows), csv_path=csv_path,
+        ) + "\n\n"
+
+    def _planets(self, population: list[str], planet_name: str | None
+                 ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Archive planets to join the MAST observations to."""
+        if population:
+            return archive_tap_query(population, columns=DEFAULT_ARCHIVE_COLUMNS), population
+        quoted = planet_name.replace("'", "''")
+        for conditions in ([f"pl_name = '{quoted}'"], [f"hostname = '{quoted}'"]):
+            planets = archive_tap_query(conditions, columns=DEFAULT_ARCHIVE_COLUMNS)
+            if planets:
+                return planets, conditions
+        raise ValueError(
+            f"The Exoplanet Archive has no planet or host named {planet_name!r}, "
+            "so obs_type cannot be computed. Use the archive's name (e.g. "
+            "'WASP-39 b') or pass archive_conditions."
         )
 
     def _run(self) -> str:
@@ -1889,6 +2040,38 @@ class SearchMastJwstObservations(BaseTool):
 
         grating_extra = {"filters (client-side)": grating_filters} if grating_filters else {}
 
+        population_preset = _clean_str(self.population_preset)
+        archive_conditions = [str(c).strip() for c in (_as_list(self.archive_conditions) or [])
+                              if _clean_str(c)]
+        _reject_observation_columns(archive_conditions)
+        population = _resolve_population_preset(population_preset) + archive_conditions
+        obs_types = _normalize_obs_types(self.obs_types)
+        key_notes: list[str] = []
+        group_keys = _resolve_row_keys(self.group_by, key_notes)
+        distinct_keys = _resolve_row_keys(self.distinct_fields, key_notes)
+        if distinct_keys and not group_keys:
+            raise ValueError("distinct_fields needs group_by.")
+        requested_keys = set(group_keys) | set(distinct_keys)
+        key_note = "".join(f"NOTE: {n}\n" for n in key_notes)
+
+        rows_path = _clean_str(self.rows_path)
+        if rows_path:
+            return key_note + self._run_on_saved_rows(
+                rows_path, by_grating, grating_filters, obs_types,
+                group_keys, distinct_keys,
+            )
+
+        # Unknown columns fail here, before any query, instead of grouping
+        # every row under None.
+        _check_row_keys(sorted(requested_keys), SEARCH_ROW_KEYS, where="search rows")
+        wants_planets = bool(population or obs_types or requested_keys & PLANET_ROW_KEYS)
+        if wants_planets and not population and planet_name is None:
+            raise ValueError(
+                "obs_types and planet columns (pl_name, obs_type, pl_rade, ...) "
+                "need planets to classify against: pass population_preset (e.g. "
+                "'subneptune') or archive_conditions, or a planet_name."
+            )
+
         # calib_level=1 is a common trap: callers use it hoping to get raw /
         # uncalibrated data, but JWST science observations are almost never
         # filed at calib_level 1 (they are calib_level 3, and the UNCAL ramps
@@ -1908,7 +2091,10 @@ class SearchMastJwstObservations(BaseTool):
                 "here does NOT mean uncalibrated data is unavailable."
             )
 
-        if planet_name is None and ra is None and dec is None:
+        # ---- 1. MAST ----
+        demographics = planet_name is None and ra is None and dec is None
+        diagnostics = ""
+        if demographics:
             observations, filters = search_all_jwst_observations(
                 instruments=self.instruments,
                 dataproduct_types=self.dataproduct_types,
@@ -1917,12 +2103,11 @@ class SearchMastJwstObservations(BaseTool):
                 proposal_id=proposal_id,
             )
             observations = by_grating(observations)
-            summary = _format_observations_summary(
-                observations,
-                filters=filters,
-                query_extra={"mode": "demographics (Mast.Caom.Filtered, no position)",
-                             **grating_extra},
-            )
+            query_extra = {"mode": "demographics (Mast.Caom.Filtered, no position)",
+                           **grating_extra}
+            hint_parts = [population_preset, archive_conditions, self.instruments,
+                          self.dataproduct_types, self.calib_levels, proposal_id,
+                          target_name, grating_filters, obs_types]
             if not observations:
                 # Empty demographics result used to dead-end as a bare "No JWST
                 # observations found", inviting a false "no such data" verdict.
@@ -1939,74 +2124,197 @@ class SearchMastJwstObservations(BaseTool):
                         f"\nAlso check the grating filter {grating_filters}: "
                         "rerun without `filters` to see which gratings exist."
                     )
-                summary = f"{summary}\n\n{diagnostics}"
-            saved = self._save_rows(
-                observations,
-                always=True,
-                hint_parts=[self.instruments, self.dataproduct_types,
-                            self.calib_levels, proposal_id, target_name],
+        else:
+            if (ra is None) != (dec is None):
+                raise ValueError(
+                    "Pass both ra and dec (or neither). A planet_name alone is "
+                    "also fine — it is resolved via MAST Name Lookup."
+                )
+            observations = by_grating(search_jwst_observations(
+                planet_name,
+                ra=ra,
+                dec=dec,
+                radius_deg=radius_deg,
+                instruments=self.instruments,
+                dataproduct_types=self.dataproduct_types,
+                calib_levels=self.calib_levels,
+                proposal_id=proposal_id,
+            ))
+            filters = _build_jwst_observation_filters(
+                instruments=self.instruments,
+                dataproduct_types=self.dataproduct_types,
+                calib_levels=self.calib_levels,
+                proposal_id=proposal_id,
             )
-            return saved + summary + raw_note
+            query_extra = {
+                "mode": "per-planet cone search (Mast.Caom.Filtered.Position)",
+                "planet_name": planet_name,
+                "radius_deg": radius_deg,
+                **grating_extra,
+            }
+            hint_parts = [planet_name, population_preset, grating_filters, obs_types]
+            if not observations:
+                # Strict query came back empty: self-diagnose instead of dead-ending.
+                if ra is None or dec is None:
+                    ra, dec = resolve_target_coordinates(planet_name)
+                recovered, diagnostics = _diagnose_empty_cone_search(
+                    planet_name,
+                    ra=ra,
+                    dec=dec,
+                    radius_deg=radius_deg,
+                    instruments=_as_list(self.instruments),
+                    dataproduct_types=_as_list(self.dataproduct_types),
+                    calib_levels=_as_int_list(self.calib_levels),
+                    proposal_id=proposal_id,
+                )
+                observations = by_grating(recovered)
 
-        if (ra is None) != (dec is None):
-            raise ValueError(
-                "Pass both ra and dec (or neither). A planet_name alone is "
-                "also fine — it is resolved via MAST Name Lookup."
-            )
-
-        observations = search_jwst_observations(
-            planet_name,
-            ra=ra,
-            dec=dec,
-            radius_deg=radius_deg,
-            instruments=self.instruments,
-            dataproduct_types=self.dataproduct_types,
-            calib_levels=self.calib_levels,
-            proposal_id=proposal_id,
-        )
-        observations = by_grating(observations)
-        filters = _build_jwst_observation_filters(
-            instruments=self.instruments,
-            dataproduct_types=self.dataproduct_types,
-            calib_levels=self.calib_levels,
-            proposal_id=proposal_id,
-        )
-        query_extra = {
-            "mode": "per-planet cone search (Mast.Caom.Filtered.Position)",
-            "planet_name": planet_name,
-            "radius_deg": radius_deg,
-            **grating_extra,
-        }
-        if observations:
-            saved = self._save_rows(observations, always=False, hint_parts=[])
-            return saved + _format_observations_summary(
-                observations, filters=filters, query_extra=query_extra
-            ) + raw_note
-
-        # Strict query came back empty: self-diagnose instead of dead-ending.
-        if ra is None or dec is None:
-            ra, dec = resolve_target_coordinates(planet_name)
-        recovered, diagnostics = _diagnose_empty_cone_search(
-            planet_name,
-            ra=ra,
-            dec=dec,
-            radius_deg=radius_deg,
-            instruments=_as_list(self.instruments),
-            dataproduct_types=_as_list(self.dataproduct_types),
-            calib_levels=_as_int_list(self.calib_levels),
-            proposal_id=proposal_id,
-        )
-        recovered = by_grating(recovered)
-        if recovered:
+        if not wants_planets or not observations:
+            # No planets wanted — or MAST found nothing, so there is nothing
+            # to join and the archive is never queried.
+            cycle_warnings = []
+            if observations and "cycle_number" in requested_keys:
+                cycle_warnings = self._annotate_cycles(observations)
             summary = _format_observations_summary(
-                recovered, filters=filters, query_extra=query_extra
+                observations, limit=10 if group_keys else 50,
+                filters=filters, query_extra=query_extra,
             )
-            saved = self._save_rows(recovered, always=False, hint_parts=[])
-            return f"{saved}{diagnostics}\n\n{summary}{raw_note}"
-        empty_summary = _format_observations_summary(
-            [], filters=filters, query_extra=query_extra
+            saved = self._save_rows(observations, always=demographics,
+                                    hint_parts=hint_parts)
+            if demographics:
+                body = saved + summary + (f"\n\n{diagnostics}" if diagnostics else "")
+            elif not observations:
+                body = f"{summary}\n\n{diagnostics}"
+            else:
+                body = saved + (f"{diagnostics}\n\n" if diagnostics else "") + summary
+            if wants_planets:
+                body += ("\n\nNo observations, so no planets were looked up "
+                         "(MAST is queried first).")
+            return (key_note + self._grouped(observations, group_keys, distinct_keys, hint_parts)
+                    + body + _format_cycle_warnings(cycle_warnings) + raw_note)
+
+        # ---- 2. Join the observations to their planets ----
+        planets, conditions = self._planets(population, planet_name)
+        rows = crossmatch_observations_to_planets(
+            observations, planets, radius_deg=radius_deg,
         )
-        return f"{empty_summary}\n\n{diagnostics}{raw_note}"
+        classified = annotate_rows_with_event_types(rows)
+        type_lines = _event_classification_lines(rows, classified) if rows else []
+        type_counts: dict[str, int] = {}
+        for row in rows:
+            type_counts[row["obs_type"]] = type_counts.get(row["obs_type"], 0) + 1
+        pairs = len(rows)
+        if obs_types:
+            rows = [r for r in rows if r.get("obs_type") in obs_types]
+            type_lines.append(f"obs_types={obs_types}: kept {len(rows)} of {pairs} pairs "
+                              f"(all pairs by type: {type_counts}).")
+        cycle_warnings = []
+        if rows and (population or "cycle_number" in requested_keys):
+            cycle_warnings = self._annotate_cycles(rows)
+
+        csv_path = None
+        if self.base_directory and (demographics or _clean_str(self.output_csv)):
+            csv_path = self._rows_csv_path(hint_parts)
+            _write_rows_csv(csv_path, rows)
+
+        def _has_coords(p: dict[str, Any]) -> bool:
+            try:
+                return (_as_float_or_none(p.get("ra"), "ra") is not None
+                        and _as_float_or_none(p.get("dec"), "dec") is not None)
+            except ValueError:
+                return False
+
+        summary = _format_crossmatch_summary(
+            rows,
+            planet_count=len(planets),
+            obs_count=len(observations),
+            planets_with_coords=sum(1 for p in planets if _has_coords(p)),
+            radius_deg=radius_deg,
+            csv_path=csv_path,
+            limit=10 if group_keys else 20,
+            preset=population_preset,
+            conditions=conditions,
+            obs_filters={
+                "instruments": _as_list(self.instruments),
+                "dataproduct_types": _as_list(self.dataproduct_types),
+                "calib_levels": _as_int_list(self.calib_levels),
+                "filters": grating_filters,
+                "proposal_id": proposal_id,
+            },
+            obs_types=obs_types,
+            pairs_before_type_filter=pairs,
+        )
+        body = (f"{diagnostics}\n\n" if diagnostics else "") + summary
+        if type_lines:
+            body += "\n\n" + "\n".join(type_lines)
+        return (key_note + self._grouped(rows, group_keys, distinct_keys, hint_parts)
+                + body + _format_cycle_warnings(cycle_warnings) + raw_note)
+
+    def _run_on_saved_rows(self, rows_path, by_grating, grating_filters,
+                           obs_types, group_keys, distinct_keys) -> str:
+        """Filter / regroup a rows CSV from an earlier search. No MAST query."""
+        path = Path(self.base_directory or ".") / rows_path
+        rows = _read_rows_from_path(path)
+        n_read = len(rows)
+        lines = [f"Re-read {n_read} row(s) from {path} — no MAST query."]
+        ignored = [name for name in (
+            "planet_name", "ra", "dec", "instruments", "dataproduct_types",
+            "calib_levels", "proposal_id", "target_name", "population_preset",
+            "archive_conditions",
+        ) if getattr(self, name, None) not in (None, "", [], ())]
+        if ignored:
+            lines.append(f"rows_path mode re-reads that file; ignored {ignored} "
+                         "(drop rows_path to query MAST).")
+        rows = by_grating(rows)
+        columns = set().union(*(r.keys() for r in rows)) if rows else set()
+        requested = set(group_keys) | set(distinct_keys)
+        type_keys = (requested & OBS_TYPE_KEYS) | ({"obs_type"} if obs_types else set())
+        if rows and type_keys - columns:
+            if "pl_tranmid" not in columns:
+                raise ValueError(
+                    f"{rows_path} has no planet ephemeris columns, so obs_type "
+                    "cannot be computed. Rerun the search with population_preset "
+                    "or planet_name instead of rows_path."
+                )
+            lines.extend(_event_classification_lines(rows, annotate_rows_with_event_types(rows)))
+            columns |= OBS_TYPE_KEYS
+        if obs_types:
+            rows = [r for r in rows if r.get("obs_type") in obs_types]
+        cycle_warnings = []
+        if rows and "cycle_number" in requested and "cycle_number" not in columns:
+            cycle_warnings = self._annotate_cycles(rows)
+            columns.add("cycle_number")
+        if rows:
+            _check_row_keys(sorted(requested), columns, where=rows_path)
+        if grating_filters or obs_types:
+            out_path = self._rows_csv_path([rows_path, grating_filters, obs_types])
+            _write_rows_csv(out_path, rows)
+            lines.append(f"Kept {len(rows)} of {n_read} rows "
+                         f"(filters={grating_filters}, obs_types={obs_types}); "
+                         f"written to: {out_path}")
+        head = "\n".join(lines) + "\n\n"
+        if group_keys:
+            body = self._grouped(rows, group_keys, distinct_keys, rows_path).rstrip()
+        elif "pl_name" in columns:
+            body = "\n".join(
+                f"{i:3}. pl_name={r.get('pl_name')} obsid={r.get('obsid')} "
+                f"inst={r.get('instrument_name')} filters={r.get('filters')} "
+                f"obs_type={r.get('obs_type', '?')} proposal_id={r.get('proposal_id')}"
+                for i, r in enumerate(rows[:20], start=1)
+            ) + (f"\n... ({len(rows) - 20} more rows in the CSV)" if len(rows) > 20 else "")
+        else:
+            body = _format_observations_summary(rows)
+        return head + body + _format_cycle_warnings(cycle_warnings)
+
+
+def _format_cycle_warnings(warnings: list[str]) -> str:
+    if not warnings:
+        return ""
+    return (
+        "\n\nWARNING — cycle_number left empty for some proposals "
+        "(no guessed values were written):\n"
+        + "\n".join(f"  - {w}" for w in warnings)
+    )
 
 
 # (Listing products for an obsid is DownloadMastJwstProducts(list_only=True);
@@ -2352,7 +2660,7 @@ def archive_tap_query(
 
     A thin wrapper over ``archive_tap.query_archive``, which owns the ADQL,
     the request, timeouts and error handling for every archive caller
-    (Patchwork discovery/fits, ASTER Alert, ``CrossmatchJwstToPlanets``,
+    (Patchwork discovery/fits, ASTER Alert, ``SearchMastJwstObservations``,
     ``QueryExoplanetArchive``). ``limit`` of 0 or None means no limit.
     """
     return _archive_tap.query_archive(
@@ -2568,6 +2876,8 @@ def _format_crossmatch_summary(
     conditions: list[str] | None = None,
     planets_with_coords: int | None = None,
     obs_filters: dict[str, Any] | None = None,
+    obs_types: list[str] | None = None,
+    pairs_before_type_filter: int | None = None,
 ) -> str:
     head: list[str] = []
     if csv_path is not None:
@@ -2607,7 +2917,7 @@ def _format_crossmatch_summary(
             head.append(
                 f"  • {planet_count} planets matched, but NONE have usable RA/Dec, "
                 "so the cone-match had nothing to match against. Ensure "
-                "archive_columns includes 'ra' and 'dec'."
+                "the archive rows include 'ra' and 'dec'."
             )
         if obs_count == 0:
             head.append(
@@ -2616,7 +2926,14 @@ def _format_crossmatch_summary(
                 "empty — loosen those filters (e.g. DROP calib_levels; JWST science "
                 "is calib_level 3, and calib_level=1 matches almost nothing)."
             )
-        if planet_count > 0 and planets_with_coords and obs_count > 0:
+        if obs_types and pairs_before_type_filter:
+            head.append(
+                f"  • {pairs_before_type_filter} (planet, observation) pairs matched, "
+                f"but none is of type {obs_types}. Rerun without obs_types (or "
+                "group_by=['obs_type']) to see what they are; 'unknown' means the "
+                "planet has no transit ephemeris."
+            )
+        elif planet_count > 0 and planets_with_coords and obs_count > 0:
             head.append(
                 f"  • Both sides are non-empty ({planet_count} planets, {obs_count} "
                 f"observations) but none fall within {radius_deg} deg of each other. "
@@ -2638,7 +2955,7 @@ def _format_crossmatch_summary(
             f"obsid={row.get('obsid','?')} "
             f"proposal_id={row.get('proposal_id','?')} "
             f"cycle={row.get('cycle_number','?')} "
-            f"event={row.get('obs_type','?')} "
+            f"obs_type={row.get('obs_type','?')} "
             f"pi={row.get('proposal_pi','?')}"
         )
     if len(rows) > limit:
@@ -2721,7 +3038,7 @@ def download_demographic_products(
     planet on disk.
 
     ``rows`` must contain ``pl_name`` and ``obsid`` columns (the schema written
-    by ``CrossmatchJwstToPlanets``). Rows are grouped by planet name; for each
+    by a ``SearchMastJwstObservations`` population search). Rows are grouped by planet name; for each
     planet, the unique obsids are downloaded under
     ``{output_directory}/{label}/{pl_name}/{obsid}/``. A per-planet
     ``manifest.json`` is written by the underlying batch downloader; a global
@@ -2809,493 +3126,6 @@ def _format_demographic_summary(manifest: dict[str, Any], limit: int = 40) -> st
 
 
 # -------------------- BaseTools --------------------
-
-
-class CrossmatchJwstToPlanets(BaseTool):
-    """
-    Cross-match a JWST demographics search against an Exoplanet-Archive planet
-    population by RA/Dec. (Population pipeline, step 2 of 3.)
-
-    USE WHEN: a population study needs each JWST observation joined to its
-    planet's archive parameters — e.g. "which sub-Neptunes have NIRSpec data,
-    with their radii". Combines a MAST demographics search + an archive TAP
-    query in one call and writes a rows CSV.
-
-    NOT FOR: a single target (use `SearchMastJwstObservations`), just counting
-    rows you already have (use `AggregateJwstObservations`), or a planet-list
-    with no observations (use `QueryExoplanetArchive`). Feed the output CSV
-    to `AggregateJwstObservations` or `DownloadMastJwstProducts(rows_path=...)`.
-
-    Workflow
-    --------
-    1. Tool runs an Exoplanet Archive TAP query for planets matching
-       ``archive_conditions`` (e.g. ``["pl_bmassj > 0.3", "pl_eqt > 500"]``)
-       and/or a ``population_preset`` (e.g. ``"subneptune"``).
-    2. Tool runs a no-position MAST JWST search with the given instrument /
-       dataproduct / calib filters (same vocabulary as
-       ``SearchMastJwstObservations``). The MAST search auto-paginates so
-       populations larger than a single page are not silently truncated.
-    3. Each MAST observation is cone-matched (default 0.02 deg) against every
-       returned planet. Each match becomes one CSV row: all planet columns
-       followed by ``obsid``, ``obs_id``, ``instrument_name``,
-       ``dataproduct_type``, ``calib_level``, ``proposal_id``, ``proposal_pi``,
-       ``target_name``, ``filters``, ``t_min``, ``t_max``, and (by default)
-       ``cycle_number`` — the JWST observing cycle fetched from STScI's
-       program-info pages (MAST has no cycle column, and cycle is NOT
-       derivable from proposal_id arithmetic: GO 2372 is Cycle 1, GO 3557
-       and GO 4098 are Cycle 2). Lookups are one-per-unique-proposal and
-       cached permanently on disk, so only the first run pays any network
-       cost. Unresolvable proposals get ``cycle_number`` empty plus a warning
-       in the summary — never a guessed value. Also by default each row is
-       classified against the planet's transit ephemeris into ``obs_type``
-       ('transit' / 'eclipse' / 'phase_curve' / 'baseline' / 'unknown') with
-       ``n_transits_in_window`` / ``n_eclipses_in_window`` /
-       ``obs_type_note`` columns (local math, no extra queries; see
-       ``add_obs_type``).
-    4. **The full row table is ALWAYS written to disk.** Pass ``output_csv``
-       to choose the path, or omit it to get an auto-named file under
-       ``{base_directory}/mast/demographics/crossmatch_*.csv``. The returned
-       summary string only previews the first ~20 rows — agents must read the
-       CSV (e.g. ``pandas.read_csv``) to get the complete list. Do NOT try to
-       reconstruct the table from the preview; rows past the preview are
-       suppressed in the text output.
-
-    Use this tool to answer questions like:
-      * "Compile every JWST NIRSpec spectrum of a warm or hot Jupiter."
-      * "Which sub-Neptunes have been observed by JWST, and with which PI?"
-      * Pipe its CSV into ``AggregateJwstObservations`` to count
-        observations per instrument / per filter / per planet.
-
-    UNITS WARNING — pl_radj vs pl_rade
-    ----------------------------------
-    The Exoplanet Archive stores planet radius in BOTH Jupiter radii
-    (``pl_radj``, 1 R_J ≈ 11.2 R_E) and Earth radii (``pl_rade``). Categorical
-    names refer to Earth radii:
-      * sub-Neptune  ≈ 1.75–4.0 R_E   (NOT 1.5–4.0 R_J — that is hot Jupiters!)
-      * Neptune      ≈ 4.0–6.0 R_E
-      * Saturn       ≈ 8.0–10.0 R_E
-      * Jupiter      ≈ 0.8–1.5 R_J  ≈ 9–17 R_E
-    Hand-translating "sub-Neptune" to ``pl_radj 1.5-4.0`` returns inflated hot
-    Jupiters and brown-dwarf companions, which is the wrong population. **Prefer
-    the ``population_preset`` argument** for canonical categories — it picks
-    the correct radius column for you.
-
-    Returns
-    -------
-    A summary string (matched row count, planets / obs scanned, radius, csv
-    path, first rows). The CSV path is the canonical source for downstream
-    use — always read it back instead of parsing the preview text.
-
-    Examples
-    --------
-        # Canonical category — preset handles units correctly.
-        CrossmatchJwstToPlanets(
-            population_preset="subneptune",
-            instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
-            dataproduct_types=["spectrum", "timeseries"],
-            calib_levels=[3],
-            output_csv="mast/demographics/subneptunes_jwst.csv",
-        )
-
-        # Custom conditions — explicit units, free-form ADQL.
-        CrossmatchJwstToPlanets(
-            archive_conditions=["pl_bmassj > 0.3", "pl_eqt > 500"],
-            instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
-            dataproduct_types=["spectrum", "timeseries"],
-            calib_levels=[3],
-            output_csv="mast/demographics/warm_hot_jupiters_jwst.csv",
-        )
-    """
-
-    archive_conditions: list | str | None = OptionalRuntimeField(
-        description=(
-            "List of ADQL WHERE conditions for the NASA Exoplanet Archive "
-            "(pscomppars). E.g. ['pl_bmassj > 0.3', 'pl_eqt > 500']. "
-            "Remember pl_rade is Earth radii, pl_radj is Jupiter radii — "
-            "sub-Neptune = pl_rade 1.75-4.0, not pl_radj. Optional if "
-            "population_preset is set; combined with it via AND."
-        ),
-    )
-    population_preset: str | None = OptionalRuntimeField(
-        description=(
-            "Canonical exoplanet population name. Maps to the right "
-            "Exoplanet Archive WHERE conditions with correct radius units "
-            "(use this instead of hand-coding category bounds). Valid: "
-            "'terrestrial', 'super_earth', 'subneptune', 'neptune', "
-            "'sub_saturn', 'saturn', 'jupiter', 'hot_jupiter', "
-            "'warm_jupiter', 'cold_jupiter', 'ultra_hot_jupiter', "
-            "'inflated_jupiter', 'brown_dwarf'. Combined with "
-            "archive_conditions via AND."
-        ),
-    )
-    archive_columns: list | str | None = OptionalRuntimeField(
-        description=(
-            "Optional archive columns to return. Defaults to a broad common set "
-            "(pl_name, ra, dec, pl_radj/rade, masses, pl_eqt, pl_orbper, stellar "
-            "params, sy_dist, discoverymethod, disc_year)."
-        ),
-    )
-    archive_table: str = RuntimeField(
-        default="pscomppars",
-        description="TAP table name. 'pscomppars' (composite) recommended.",
-    )
-    archive_limit: int | str | None = OptionalRuntimeField(
-        description="Optional row cap on the archive query.",
-    )
-    instruments: list | str | None = OptionalRuntimeField(
-        description="Optional JWST instrument filters, e.g. ['NIRSpec', 'NIRCam'].",
-    )
-    dataproduct_types: list | str | None = OptionalRuntimeField(
-        description="Optional dataproduct filters, e.g. ['spectrum', 'timeseries'].",
-    )
-    calib_levels: list | str | None = OptionalRuntimeField(
-        description="Optional MAST calibration levels, e.g. [3].",
-    )
-    proposal_id: str | None = OptionalRuntimeField(
-        description="Optional JWST proposal id filter.",
-    )
-    radius_deg: float | str = RuntimeField(
-        default=0.02,
-        description="Cone-match radius in degrees between obs and planet sky position.",
-    )
-    output_csv: str | None = OptionalRuntimeField(
-        description=(
-            "Optional CSV path relative to base_directory. The crossmatch "
-            "tool ALWAYS writes a CSV — if this is left unset, the tool "
-            "auto-generates a timestamped path under "
-            "'mast/demographics/crossmatch_*.csv' and reports it in the "
-            "result string. Set this only when you need a specific filename."
-        ),
-    )
-    add_cycle_number: bool | str = RuntimeField(
-        default=True,
-        description=(
-            "If True (default), add a cycle_number column with each "
-            "proposal's JWST observing cycle, resolved from STScI program "
-            "info (cached on disk; one lookup per unique proposal, first "
-            "run only). Set False to skip the lookups entirely."
-        ),
-    )
-    add_obs_type: bool | str = RuntimeField(
-        default=True,
-        description=(
-            "If True (default), classify each (planet, observation) row as "
-            "'transit' / 'eclipse' / 'phase_curve' / 'baseline' / 'unknown' "
-            "by comparing the observation window (t_min/t_max) with the "
-            "planet's transit ephemeris (pl_tranmid, pl_orbper, pl_trandur). "
-            "Adds obs_type, n_transits_in_window, n_eclipses_in_window, "
-            "obs_type_note columns. Purely local math — no extra queries. "
-            "Requires the ephemeris columns in archive_columns (included in "
-            "the defaults)."
-        ),
-    )
-    base_directory: str = StateField()
-
-    def _run(self) -> str:
-        population_preset = _clean_str(self.population_preset)
-        proposal_id = _clean_str(self.proposal_id)
-        output_csv = _clean_str(self.output_csv)
-        archive_table = _clean_str(self.archive_table) or "pscomppars"
-        archive_limit = _as_int_or_none(self.archive_limit, "archive_limit")
-        radius_deg = _as_float_or_none(self.radius_deg, "radius_deg")
-        if radius_deg is None:
-            radius_deg = 0.02
-
-        preset_conditions = _resolve_population_preset(population_preset)
-        user_conditions = _as_list(self.archive_conditions) or []
-        merged_conditions = preset_conditions + user_conditions
-        if not merged_conditions:
-            raise ValueError(
-                "CrossmatchJwstToPlanets requires either archive_conditions "
-                "or population_preset (or both)."
-            )
-
-        # The cone-match keys planets on RA/Dec. If the caller's archive_columns
-        # omit them, EVERY planet is silently dropped and the tool reports "no
-        # matches" — a classic false negative. Force ra/dec into the column set.
-        archive_columns = _as_list(self.archive_columns) or list(DEFAULT_ARCHIVE_COLUMNS)
-        for required in ("ra", "dec"):
-            if required not in archive_columns:
-                archive_columns.append(required)
-
-        planets = archive_tap_query(
-            merged_conditions,
-            columns=archive_columns,
-            table=archive_table,
-            limit=archive_limit,
-        )
-
-        def _has_coords(p: dict[str, Any]) -> bool:
-            try:
-                return (_as_float_or_none(p.get("ra"), "ra") is not None
-                        and _as_float_or_none(p.get("dec"), "dec") is not None)
-            except ValueError:
-                return False
-        planets_with_coords = sum(1 for p in planets if _has_coords(p))
-
-        observations, _filters = search_all_jwst_observations(
-            instruments=self.instruments,
-            dataproduct_types=self.dataproduct_types,
-            calib_levels=self.calib_levels,
-            proposal_id=proposal_id,
-        )
-
-        rows = crossmatch_observations_to_planets(
-            observations,
-            planets,
-            radius_deg=radius_deg,
-        )
-
-        cycle_warnings: list[str] = []
-        if _as_bool(self.add_cycle_number, "add_cycle_number", default=True) and rows:
-            cycle_warnings = annotate_rows_with_cycles(
-                rows,
-                cache_path=Path(self.base_directory or ".") / JWST_PROGRAM_INFO_CACHE,
-            )
-
-        obs_type_line = None
-        if _as_bool(self.add_obs_type, "add_obs_type", default=True) and rows:
-            classified = annotate_rows_with_event_types(rows)
-            obs_type_line = (
-                f"Event classification: {classified}/{len(rows)} rows typed "
-                "(transit/eclipse/phase_curve/baseline); 'unknown' rows lack "
-                "pl_tranmid/pl_orbper — see obs_type_note."
-            )
-
-        if output_csv:
-            csv_path = Path(self.base_directory) / output_csv
-        else:
-            csv_path = _autoname_csv_path(
-                self.base_directory,
-                kind="crossmatch",
-                hint_parts=[
-                    population_preset,
-                    merged_conditions,
-                    self.instruments,
-                    self.dataproduct_types,
-                    self.calib_levels,
-                    proposal_id,
-                ],
-            )
-        _write_rows_csv(csv_path, rows)
-
-        summary = _format_crossmatch_summary(
-            rows,
-            planet_count=len(planets),
-            obs_count=len(observations),
-            planets_with_coords=planets_with_coords,
-            radius_deg=radius_deg,
-            csv_path=csv_path,
-            preset=population_preset,
-            conditions=merged_conditions,
-            obs_filters={
-                "instruments": _as_list(self.instruments),
-                "dataproduct_types": _as_list(self.dataproduct_types),
-                "calib_levels": _as_int_list(self.calib_levels),
-                "proposal_id": proposal_id,
-            },
-        )
-        if obs_type_line:
-            summary += f"\n\n{obs_type_line}"
-        if cycle_warnings:
-            summary += (
-                "\n\nWARNING — cycle_number left empty for some proposals "
-                "(no guessed values were written):\n"
-                + "\n".join(f"  - {w}" for w in cycle_warnings)
-            )
-        return summary
-
-
-class AggregateJwstObservations(BaseTool):
-    """
-    Group JWST rows by one or more keys and count. (Population pipeline, step 3 of 3.)
-
-    USE WHEN: the answer is a count or breakdown — "how many planets per
-    instrument", "observations by cycle". Aggregates a rows CSV/JSON that
-    an earlier tool wrote.
-
-    NOT FOR: discovering observations (`SearchMastJwstObservations`) or joining
-    to planet params (`CrossmatchJwstToPlanets`). This tool never queries
-    MAST itself — it only groups rows already on disk.
-
-    Input: ``rows_path`` — path (relative to ``base_directory``) to a CSV or
-    JSON of rows from either
-      * ``SearchMastJwstObservations`` (demographics mode always writes its
-        full row set to CSV — raw observation rows, no planet attribution), or
-      * ``CrossmatchJwstToPlanets`` ((planet, obs) rows with archive params).
-
-    Useful aggregations
-    -------------------
-    * Per instrument (two calls: search writes the CSV, this groups it):
-        SearchMastJwstObservations(
-            instruments=['NIRSpec','NIRCam','MIRI','NIRISS'],
-            dataproduct_types=['spectrum','timeseries'],
-            calib_levels=[3],
-        )   # -> "Full rows written to: mast/demographics/search_....csv"
-        AggregateJwstObservations(
-            rows_path='mast/demographics/search_....csv',
-            group_by=['instrument_name'],
-        )
-
-    * Per instrument × filter:
-        AggregateJwstObservations(
-            rows_path=..., group_by=['instrument_name', 'filters'],
-        )
-
-    * Planets observed with multiple instruments (chain with crossmatch CSV):
-        AggregateJwstObservations(
-            rows_path='mast/demographics/warm_hot_jupiters_jwst.csv',
-            group_by=['pl_name'],
-            distinct_fields=['instrument_name', 'filters', 'proposal_id'],
-        )
-        # rows with instrument_name_distinct > 1 are multi-instrument targets
-
-    * Observation event types (transit / eclipse / phase_curve / baseline):
-        AggregateJwstObservations(
-            rows_path='mast/demographics/subneptunes_jwst.csv',
-            group_by=['pl_name', 'obs_type'],
-        )
-        # If the CSV has no obs_type column yet, it is derived on the fly
-        # from each row's ephemeris (t_min/t_max vs pl_tranmid / pl_orbper /
-        # pl_trandur) whenever group_by or distinct_fields mention obs_type,
-        # n_transits_in_window, n_eclipses_in_window, or obs_type_note.
-        # Set add_obs_type=True to force classification and ALSO persist the
-        # annotated rows to '<rows_path stem>_typed.csv'. Rows without an
-        # ephemeris (non-transiting RV planets) classify as 'unknown' with
-        # the reason in obs_type_note; eclipse calls on e > 0.1 orbits are
-        # flagged approximate (circular phase-0.5 assumption).
-
-    Output
-    ------
-    Returns a summary listing the top groups by count, with distinct counts.
-    **The full grouped table is ALWAYS written to CSV.** Pass ``output_csv``
-    for a chosen path, otherwise the tool auto-names a file under
-    ``{base_directory}/mast/demographics/aggregate_*.csv``. The preview text
-    truncates after ~40 groups — always read the CSV for the complete table.
-    """
-
-    group_by: list | str = RuntimeField(
-        description="One or more row keys to group by, e.g. ['instrument_name', 'filters'].",
-    )
-    distinct_fields: list | str | None = OptionalRuntimeField(
-        description=(
-            "Optional row keys whose distinct values are tracked per group. "
-            "E.g. ['instrument_name'] to count how many instruments observed "
-            "each planet when group_by=['pl_name']."
-        ),
-    )
-    rows_path: str = RuntimeField(
-        description=(
-            "Path (relative to base_directory) to the CSV or JSON of rows to "
-            "aggregate — written by SearchMastJwstObservations or "
-            "CrossmatchJwstToPlanets."
-        ),
-    )
-    add_obs_type: bool | str = RuntimeField(
-        default=False,
-        description=(
-            "If True, classify every row as transit / "
-            "eclipse / phase_curve / baseline / unknown from its ephemeris "
-            "columns (t_min/t_max vs pl_tranmid/pl_orbper/pl_trandur) before "
-            "aggregating, and write the annotated rows to "
-            "'<rows_path stem>_typed.csv'. Classification also happens "
-            "automatically (without writing that file) whenever group_by / "
-            "distinct_fields request obs_type columns missing from the file."
-        ),
-    )
-    output_csv: str | None = OptionalRuntimeField(
-        description=(
-            "Optional CSV path (relative to base_directory) for the grouped "
-            "table. The aggregate tool ALWAYS writes a CSV — if this is left "
-            "unset, the tool auto-generates a timestamped path under "
-            "'mast/demographics/aggregate_*.csv' and reports it in the "
-            "result string."
-        ),
-    )
-    base_directory: str = StateField()
-
-    def _run(self) -> str:
-        group_keys = _as_list(self.group_by) or []
-        distinct_keys = _as_list(self.distinct_fields) or []
-        if not group_keys:
-            raise ValueError("group_by must contain at least one key.")
-
-        rows_path = _clean_str(self.rows_path)
-        if rows_path is None:
-            raise ValueError(
-                "rows_path is required. To count fresh MAST results, first run "
-                "SearchMastJwstObservations (demographics mode writes its full "
-                "rows CSV) or CrossmatchJwstToPlanets, then pass that CSV here."
-            )
-        output_csv = _clean_str(self.output_csv)
-
-        obs_type_lines: list[str] = []
-        full_path = Path(self.base_directory) / rows_path
-        rows = _read_rows_from_path(full_path)
-
-        obs_type_keys = {
-            "obs_type", "n_transits_in_window",
-            "n_eclipses_in_window", "obs_type_note",
-        }
-        force = _as_bool(self.add_obs_type, "add_obs_type", default=False)
-        requested = (set(group_keys) | set(distinct_keys)) & obs_type_keys
-        needs_annotation = rows and (
-            force or (requested and any(k not in rows[0] for k in requested))
-        )
-        if needs_annotation:
-            classified = annotate_rows_with_event_types(rows)
-            obs_type_lines.append(
-                f"Event classification: {classified}/{len(rows)} rows "
-                "typed (transit/eclipse/phase_curve/baseline); 'unknown' "
-                "rows lack pl_tranmid/pl_orbper — see obs_type_note."
-            )
-            notes: dict[str, int] = {}
-            for row in rows:
-                note = row.get("obs_type_note")
-                if note:
-                    notes[str(note)] = notes.get(str(note), 0) + 1
-            if notes:
-                obs_type_lines.append(
-                    "obs_type_note breakdown (read before trusting "
-                    "eclipse/baseline calls):"
-                )
-                obs_type_lines.extend(
-                    f"  - (x{count}) {note}"
-                    for note, count in sorted(
-                        notes.items(), key=lambda kv: -kv[1]
-                    )
-                )
-            if force:
-                typed_path = full_path.with_name(f"{full_path.stem}_typed.csv")
-                _write_rows_csv(typed_path, rows)
-                obs_type_lines.append(f"Annotated rows saved to: {typed_path}")
-
-        groups = aggregate_observations(
-            rows,
-            group_by=group_keys,
-            distinct_fields=distinct_keys,
-        )
-
-        if output_csv:
-            csv_path = Path(self.base_directory) / output_csv
-        else:
-            csv_path = _autoname_csv_path(
-                self.base_directory,
-                kind="aggregate",
-                hint_parts=[group_keys, distinct_keys, rows_path],
-            )
-        _write_rows_csv(csv_path, groups)
-
-        summary = _format_aggregate_summary(
-            groups,
-            group_by=group_keys,
-            distinct_fields=distinct_keys,
-            total_rows=len(rows),
-            csv_path=csv_path,
-        )
-        if obs_type_lines:
-            summary += "\n\n" + "\n".join(obs_type_lines)
-        return summary
 
 
 def _obsids_by_planet(
@@ -3391,7 +3221,7 @@ class DownloadMastJwstProducts(BaseTool):
             ``{output_dir}/{label or program_<id>}/{obs_id}/``.
       * ``obsids`` — explicit MAST obsid list (one obsid is fine). Writes
         ``{output_dir}/{label}/{obsid}/``.
-      * ``rows_path`` — a CSV/JSON written by ``CrossmatchJwstToPlanets`` or
+      * ``rows_path`` — a CSV/JSON written by
         ``SearchMastJwstObservations`` (needs an ``obsid`` column). Rows with
         ``pl_name`` download per planet under
         ``{output_dir}/{label}/{pl_name}/{obsid}/`` (+ a top-level
@@ -3467,7 +3297,7 @@ class DownloadMastJwstProducts(BaseTool):
     rows_path: str | None = OptionalRuntimeField(
         description=(
             "rows_path mode: CSV/JSON (relative to the workspace) from "
-            "CrossmatchJwstToPlanets or SearchMastJwstObservations; must have "
+            "SearchMastJwstObservations; must have "
             "an obsid column (pl_name enables the per-planet layout)."
         ),
     )
@@ -3649,7 +3479,7 @@ class DownloadMastJwstProducts(BaseTool):
                 raise ValueError(
                     f"{rows_path} has no 'obsid' column (columns: "
                     f"{sorted(rows[0])[:12]}...). Pass the CSV written by "
-                    "CrossmatchJwstToPlanets or SearchMastJwstObservations."
+                    "SearchMastJwstObservations."
                 )
             by_planet = _obsids_by_planet(
                 rows, max_planets=max_planets, max_obs_per_planet=max_observations
@@ -3753,7 +3583,7 @@ class GetJwstProgramInfo(BaseTool):
     MAST CAOM metadata has NO cycle field, and the cycle CANNOT be computed
     from the proposal id (GO 2372 is Cycle 1; GO 3557 and GO 4098 are
     Cycle 2). Use this tool whenever a task needs cycle numbers — never guess
-    them. ``CrossmatchJwstToPlanets`` calls the same lookup automatically for
+    them. ``SearchMastJwstObservations`` calls the same lookup automatically for
     its ``cycle_number`` column; use this tool for ad-hoc questions ("which
     cycle is program 5959?") or to pre-warm the cache.
 

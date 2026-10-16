@@ -87,11 +87,11 @@ def test_gui_serves_aster_with_the_consolidated_tools(stack):
     _assert_clean_turn(result, model, start)
     offered = {t["function"]["name"] for t in model.requests[start]["tools"]}
     for camel in ("SearchMastJwstObservations", "DownloadMastJwstProducts",
-                  "AggregateJwstObservations", "CrossmatchJwstToPlanets",
                   "QueryExoplanetArchive", "GetJwstProgramInfo"):
         assert fake_openai_server.resolve_tool(camel, model.requests[start]["tools"]), camel
     for retired in ("getmastobservationproducts", "downloaddemographicjwstproducts",
-                    "getexoplanetparameters", "findexoplanetsbycondition"):
+                    "getexoplanetparameters", "findexoplanetsbycondition",
+                    "crossmatchjwsttoplanets", "aggregatejwstobservations"):
         assert retired not in offered
     system = model.requests[start]["messages"][0]["content"]
     assert "Tool Routing" in system                     # ASTER's prompt reached the model

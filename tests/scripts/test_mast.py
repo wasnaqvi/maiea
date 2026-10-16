@@ -1099,7 +1099,7 @@ class DemographicsTests(unittest.TestCase):
 # ---------------- crossmatch + aggregate tool tests ----------------
 
 
-class CrossmatchAndAggregateTests(unittest.TestCase):
+class PopulationSearchTests(unittest.TestCase):
     def setUp(self):
         self.mast = load_mast_module()
 
@@ -1217,36 +1217,36 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
 
     # ---- BaseTool wiring ----
 
-    def test_crossmatch_basetool_runs_archive_and_mast_then_writes_csv(self):
-        Tool = self.mast.CrossmatchJwstToPlanets
+    def test_population_search_queries_mast_first_then_writes_planet_rows(self):
+        Tool = self.mast.SearchMastJwstObservations
+        order = []
+
+        def fake_mast(**kwargs):
+            order.append("mast")
+            return self.OBSERVATIONS, [{"paramName": "obs_collection", "values": ["JWST"]}]
+
+        def fake_archive(conditions, **kwargs):
+            order.append("archive")
+            return self.PLANETS
+
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                patch.object(self.mast, "archive_tap_query", return_value=self.PLANETS) as archive_call,
-                patch.object(
-                    self.mast,
-                    "search_all_jwst_observations",
-                    return_value=(self.OBSERVATIONS, [{"paramName": "obs_collection", "values": ["JWST"]}]),
-                ) as mast_call,
+                patch.object(self.mast, "archive_tap_query", side_effect=fake_archive),
+                patch.object(self.mast, "search_all_jwst_observations", side_effect=fake_mast),
+                patch.object(self.mast, "annotate_rows_with_cycles", return_value=[]),
             ):
                 tool = self._make_tool(
                     Tool,
                     archive_conditions=["pl_bmassj > 0.3", "pl_eqt > 500"],
-                    archive_columns=None,
-                    archive_table="pscomppars",
-                    archive_limit=None,
                     instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
                     dataproduct_types=["spectrum", "timeseries"],
                     calib_levels=[3],
-                    proposal_id=None,
-                    radius_deg=0.02,
                     output_csv="demographics/test_xmatch.csv",
-                    add_cycle_number=False,  # no STScI lookups in unit tests
                     base_directory=tmpdir,
                 )
                 output = tool._run()
 
-            archive_call.assert_called_once()
-            mast_call.assert_called_once()
+            self.assertEqual(order, ["mast", "archive"])
             self.assertIn("Cross-matched 3", output)
             self.assertIn("Population planets considered: 2", output)
             self.assertIn("JWST observations considered: 4", output)
@@ -1260,90 +1260,199 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
             self.assertIn("pl_name", read_back[0])
             self.assertIn("instrument_name", read_back[0])
             self.assertIn("proposal_pi", read_back[0])
+            self.assertIn("obs_type", read_back[0])
 
-    def test_aggregate_basetool_rows_path_mode(self):
-        Tool = self.mast.AggregateJwstObservations
-        # Build a CSV the agent could have written from CrossmatchJwstToPlanets
+    def test_subneptune_g395h_transits_per_planet_in_one_call(self):
+        """The request that used to take Crossmatch + Aggregate (and failed):
+        sub-Neptunes with NIRSpec G395H transits, counted per planet."""
+        planets = [
+            {"pl_name": "TOI-X b", "hostname": "TOI-X", "ra": 50.0, "dec": 10.0,
+             "pl_rade": 2.5, "pl_tranmid": 2460000.5, "pl_orbper": 2.0, "pl_trandur": 2.4},
+            {"pl_name": "TOI-X c", "hostname": "TOI-X", "ra": 50.0, "dec": 10.0,
+             "pl_rade": 3.0, "pl_tranmid": 2460000.9, "pl_orbper": 9.0, "pl_trandur": 3.0},
+            {"pl_name": "K2-18 b", "hostname": "K2-18", "ra": 172.56, "dec": 7.5878,
+             "pl_rade": 2.6, "pl_tranmid": 2460000.5, "pl_orbper": 2.0, "pl_trandur": 2.4},
+        ]
+        base = {"instrument_name": "NIRSPEC/SLIT", "dataproduct_type": "timeseries",
+                "calib_level": 3, "proposal_id": "1", "proposal_pi": "PI"}
+        observations = [
+            {**base, "obsid": "1", "s_ra": 50.0, "s_dec": 10.0, "filters": "F290LP;G395H",
+             "target_name": "TOI-X", "t_min": 59999.9, "t_max": 60000.2},   # b transits
+            {**base, "obsid": "2", "s_ra": 50.0, "s_dec": 10.0, "filters": "F290LP;G395M",
+             "target_name": "TOI-X", "t_min": 59999.9, "t_max": 60000.2},   # wrong grating
+            {**base, "obsid": "3", "s_ra": 172.56, "s_dec": 7.5878, "filters": "F290LP;G395H",
+             "target_name": "K2-18", "t_min": 60000.9, "t_max": 60001.15},  # eclipse
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(self.mast, "search_all_jwst_observations",
+                             return_value=(observations, [])) as mast_call,
+                patch.object(self.mast, "archive_tap_query", return_value=planets) as archive,
+                patch.object(self.mast, "annotate_rows_with_cycles", return_value=[]),
+            ):
+                out = self._make_tool(
+                    self.mast.SearchMastJwstObservations,
+                    population_preset="subneptune",
+                    instruments=["NIRSpec"], dataproduct_types=["timeseries"],
+                    filters=["F290LP", "G395H"], obs_types=["transit"],
+                    group_by=["pl_name"], base_directory=tmpdir,
+                )._run()
+            mast_call.assert_called_once()
+            self.assertEqual(archive.call_args.args[0], ["pl_rade >= 1.75", "pl_rade <= 4.0"])
+            self.assertIn("obs_types=['transit']: kept 1 of 3 pairs", out)
+            self.assertIn("pl_name='TOI-X b' count=1", out)
+            self.assertNotIn("pl_name='TOI-X c'", out)   # baseline for c
+            self.assertNotIn("pl_name='K2-18 b'", out)   # eclipse
+            (rows_csv,) = (pathlib.Path(tmpdir) / "mast" / "demographics").glob("search_*.csv")
+            with rows_csv.open() as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual([(r["pl_name"], r["obsid"], r["obs_type"]) for r in rows],
+                             [("TOI-X b", "1", "transit")])
+
+    def test_planet_name_obs_types_joins_that_planet_or_its_host(self):
+        obs = [{**self.OBSERVATIONS[0], "t_min": 59999.9, "t_max": 60000.2}]
+        planet = {**self.PLANETS[0], "pl_tranmid": 2460000.5, "pl_orbper": 2.0,
+                  "pl_trandur": 2.4}
+        seen = []
+
+        def fake_archive(conditions, **kwargs):
+            seen.append(conditions)
+            return [planet] if conditions[0].startswith("hostname") else []
+
+        with (
+            patch.object(self.mast, "search_jwst_observations", return_value=obs),
+            patch.object(self.mast, "archive_tap_query", side_effect=fake_archive),
+            patch.object(self.mast, "annotate_rows_with_cycles") as no_cycles,
+        ):
+            out = self._make_tool(
+                self.mast.SearchMastJwstObservations,
+                planet_name="WASP-39", obs_types=["transit"], base_directory="/tmp",
+            )._run()
+        self.assertEqual(seen, [["pl_name = 'WASP-39'"], ["hostname = 'WASP-39'"]])
+        no_cycles.assert_not_called()   # cone mode: cycles only on request
+        self.assertIn("pl_name=WASP-39 b", out)
+        self.assertIn("obs_type=transit", out)
+
+    def test_search_rows_path_regroups_without_querying_mast(self):
+        Tool = self.mast.SearchMastJwstObservations
         with tempfile.TemporaryDirectory() as tmpdir:
             rows = self.mast.crossmatch_observations_to_planets(
                 self.OBSERVATIONS, self.PLANETS,
             )
-            csv_path = pathlib.Path(tmpdir) / "rows.csv"
-            self.mast._write_rows_csv(csv_path, rows)
+            self.mast._write_rows_csv(pathlib.Path(tmpdir) / "rows.csv", rows)
 
-            tool = self._make_tool(
-                Tool,
-                group_by=["pl_name"],
-                distinct_fields=["instrument_name"],
-                rows_path="rows.csv",
-                instruments=None,
-                dataproduct_types=None,
-                calib_levels=None,
-                proposal_id=None,
-                target_name=None,
-                output_csv="grouped.csv",
-                base_directory=tmpdir,
-            )
-            output = tool._run()
+            with (
+                patch.object(self.mast, "search_all_jwst_observations") as no_mast,
+                patch.object(self.mast, "archive_tap_query") as no_archive,
+            ):
+                output = self._make_tool(
+                    Tool,
+                    group_by=["pl_name"],
+                    distinct_fields=["instrument_name"],
+                    rows_path="rows.csv",
+                    base_directory=tmpdir,
+                )._run()
+            no_mast.assert_not_called()
+            no_archive.assert_not_called()
 
+            self.assertIn("no MAST query", output)
             self.assertIn("Aggregated 3 row(s)", output)
             self.assertIn("instrument_name_distinct", output)
-            grouped_csv = pathlib.Path(tmpdir) / "grouped.csv"
-            self.assertTrue(grouped_csv.is_file())
-            with grouped_csv.open() as fh:
+            grouped = list((pathlib.Path(tmpdir) / "mast" / "demographics").glob("aggregate_*.csv"))
+            self.assertEqual(len(grouped), 1)
+            with grouped[0].open() as fh:
                 groups = list(csv.DictReader(fh))
             per_planet = {g["pl_name"]: g for g in groups}
             self.assertEqual(per_planet["WASP-39 b"]["instrument_name_distinct"], "2")
             self.assertIn("NIRCAM/GRISM", per_planet["WASP-39 b"]["instrument_name_values"])
 
-    def test_search_csv_feeds_aggregate(self):
-        """Population counts are now Search (writes full rows CSV) ->
-        Aggregate(rows_path). Aggregate never queries MAST itself."""
+    def test_search_groups_in_the_same_call(self):
+        """A count is ONE call: group_by on the search itself."""
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(
                 self.mast,
                 "search_all_jwst_observations",
                 return_value=(self.OBSERVATIONS, []),
-            ) as call:
-                search = self._make_tool(
+            ) as call, patch.object(self.mast, "archive_tap_query") as no_archive:
+                out = self._make_tool(
                     self.mast.SearchMastJwstObservations,
                     instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
                     dataproduct_types=["spectrum", "timeseries"],
                     calib_levels=[3],
-                    base_directory=tmpdir,
-                )
-                search_out = search._run()
-            call.assert_called_once()
-            self.assertIn("Full rows (4) written to:", search_out)
-            csvs = list((pathlib.Path(tmpdir) / "mast" / "demographics").glob("search_*.csv"))
-            self.assertEqual(len(csvs), 1)
-
-            with patch.object(self.mast, "search_all_jwst_observations") as no_call:
-                agg = self._make_tool(
-                    self.mast.AggregateJwstObservations,
                     group_by=["instrument_name", "filters"],
-                    distinct_fields=None,
-                    rows_path=str(csvs[0].relative_to(tmpdir)),
-                    output_csv=None,
                     base_directory=tmpdir,
-                )
-                output = agg._run()
-            no_call.assert_not_called()
-            self.assertIn("Aggregated 4 row(s)", output)
-            self.assertIn("NIRSPEC/SLIT", output)
-            self.assertIn("filters=", output)
+                )._run()
+            call.assert_called_once()
+            no_archive.assert_not_called()       # no planet column requested
+            self.assertIn("Full rows (4) written to:", out)
+            self.assertIn("Aggregated 4 row(s)", out)
+            self.assertIn("instrument_name='NIRSPEC/SLIT'", out)
+            demo = pathlib.Path(tmpdir) / "mast" / "demographics"
+            self.assertEqual(len(list(demo.glob("search_*.csv"))), 1)
+            self.assertEqual(len(list(demo.glob("aggregate_*.csv"))), 1)
 
-    def test_aggregate_requires_rows_path(self):
-        tool = self._make_tool(
-            self.mast.AggregateJwstObservations,
-            group_by=["instrument_name"],
-            distinct_fields=None,
-            rows_path="",  # LLM empty-string stuffing
-            output_csv=None,
-            base_directory="/tmp",
-        )
-        with self.assertRaisesRegex(ValueError, "SearchMastJwstObservations"):
-            tool._run()
+    def test_unknown_group_key_fails_before_any_query(self):
+        """Grouping by a column that does not exist used to put every row
+        under None; it must now fail and name the real columns."""
+        with patch.object(self.mast, "search_all_jwst_observations") as no_call:
+            tool = self._make_tool(
+                self.mast.SearchMastJwstObservations,
+                group_by=["pl_name", "sky_quality"],
+                population_preset="subneptune",
+                base_directory="/tmp",
+            )
+            with self.assertRaisesRegex(ValueError, r"sky_quality.*obs_type"):
+                tool._run()
+        no_call.assert_not_called()
+
+    def test_event_is_read_as_obs_type(self):
+        rows = [{"pl_name": "b", "obs_type": "transit"},
+                {"pl_name": "b", "obs_type": "eclipse"}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.mast._write_rows_csv(pathlib.Path(tmpdir) / "typed.csv", rows)
+            out = self._make_tool(
+                self.mast.SearchMastJwstObservations,
+                rows_path="typed.csv", group_by=["pl_name", "event"],
+                base_directory=tmpdir,
+            )._run()
+        self.assertIn("'event' is not a column; read it as 'obs_type'", out)
+        self.assertIn("obs_type='transit'", out)
+        self.assertNotIn("obs_type=None", out)
+
+    def test_event_in_archive_conditions_is_redirected_to_obs_types(self):
+        with patch.object(self.mast, "search_all_jwst_observations") as no_call:
+            tool = self._make_tool(
+                self.mast.SearchMastJwstObservations,
+                population_preset="subneptune",
+                archive_conditions=["event = 'transit'"],
+                base_directory="/tmp",
+            )
+            with self.assertRaisesRegex(ValueError, r"obs_types=\['transit'\]"):
+                tool._run()
+        no_call.assert_not_called()
+
+    def test_obs_types_without_planets_fails_before_any_query(self):
+        with patch.object(self.mast, "search_all_jwst_observations") as no_call:
+            tool = self._make_tool(
+                self.mast.SearchMastJwstObservations,
+                obs_types=["transit"], base_directory="/tmp",
+            )
+            with self.assertRaisesRegex(ValueError, "population_preset"):
+                tool._run()
+        no_call.assert_not_called()
+
+    def test_empty_mast_result_never_queries_the_archive(self):
+        with (
+            patch.object(self.mast, "search_all_jwst_observations", return_value=([], [])),
+            patch.object(self.mast, "_diagnose_empty_demographics", return_value="diag"),
+            patch.object(self.mast, "archive_tap_query") as no_archive,
+        ):
+            out = self._make_tool(
+                self.mast.SearchMastJwstObservations,
+                population_preset="subneptune", base_directory="/tmp",
+            )._run()
+        no_archive.assert_not_called()
+        self.assertIn("no planets were looked up", out)
 
     def test_search_cone_mode_writes_csv_only_when_asked(self):
         rows = [{"obsid": "1", "instrument_name": "NIRSPEC/BOTS"}]
@@ -1576,17 +1685,14 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
                                   base_directory="/tmp")._run()
         self.assertIn("ran in obsids mode; ignored planet_name", out)
 
-    def test_aggregate_basetool_rejects_empty_group_by(self):
-        Tool = self.mast.AggregateJwstObservations
+    def test_distinct_fields_needs_group_by(self):
         tool = self._make_tool(
-            Tool,
-            group_by=[],
-            distinct_fields=None,
+            self.mast.SearchMastJwstObservations,
+            distinct_fields=["instrument_name"],
             rows_path="rows.csv",
-            output_csv=None,
             base_directory="/tmp",
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "group_by"):
             tool._run()
 
     # ---- auto-CSV behaviour (regression: agent must never have to fabricate
@@ -1682,7 +1788,7 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
             for i, p in enumerate(planets)
         ]
 
-        Tool = self.mast.CrossmatchJwstToPlanets
+        Tool = self.mast.SearchMastJwstObservations
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
                 patch.object(self.mast, "archive_tap_query", return_value=planets),
@@ -1690,20 +1796,16 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
                     self.mast, "search_all_jwst_observations",
                     return_value=(observations, []),
                 ),
+                # no STScI lookups in unit tests
+                patch.object(self.mast, "annotate_rows_with_cycles", return_value=[]),
             ):
                 tool = self._make_tool(
                     Tool,
                     archive_conditions=["pl_radj < 0.4"],
-                    archive_columns=None,
-                    archive_table="pscomppars",
-                    archive_limit=None,
                     instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
                     dataproduct_types=["spectrum", "timeseries"],
                     calib_levels=[3],
-                    proposal_id=None,
-                    radius_deg=0.02,
                     output_csv=None,                # <-- the case that broke
-                    add_cycle_number=False,  # no STScI lookups in unit tests
                     base_directory=tmpdir,
                 )
                 output = tool._run()
@@ -1713,7 +1815,7 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
 
             demographics_dir = pathlib.Path(tmpdir) / "mast" / "demographics"
             self.assertTrue(demographics_dir.is_dir())
-            csvs = list(demographics_dir.glob("crossmatch_*.csv"))
+            csvs = list(demographics_dir.glob("search_*.csv"))
             self.assertEqual(
                 len(csvs), 1, f"expected one auto-named CSV, got {csvs}",
             )
@@ -1729,19 +1831,16 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
             # Verify the auto-name path is the one announced in the summary
             self.assertIn(str(csvs[0]), output)
 
-    def test_aggregate_auto_writes_csv_when_output_csv_omitted(self):
-        Tool = self.mast.AggregateJwstObservations
+    def test_grouped_table_always_written_to_csv(self):
+        Tool = self.mast.SearchMastJwstObservations
         with tempfile.TemporaryDirectory() as tmpdir:
             self.mast._write_rows_csv(pathlib.Path(tmpdir) / "obs.csv", self.OBSERVATIONS)
-            tool = self._make_tool(
+            output = self._make_tool(
                 Tool,
                 group_by=["instrument_name"],
-                distinct_fields=None,
                 rows_path="obs.csv",
-                output_csv=None,
                 base_directory=tmpdir,
-            )
-            output = tool._run()
+            )._run()
 
             self.assertIn("FULL RESULTS", output)
             demographics_dir = pathlib.Path(tmpdir) / "mast" / "demographics"
@@ -1753,7 +1852,6 @@ class CrossmatchAndAggregateTests(unittest.TestCase):
                 {g["instrument_name"] for g in groups},
                 {"NIRSPEC/SLIT", "NIRCAM/GRISM", "NIRISS/SOSS", "NIRCAM/IMAGE"},
             )
-
 
 # ---------------- optional live demographics compilation ----------------
 # Enabled by ASTER_LIVE_MAST=1. Hits live NASA Exoplanet Archive + MAST.
@@ -2064,7 +2162,7 @@ class JwstProgramInfoTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("9999", warnings[0])
 
-    def test_crossmatch_tool_writes_cycle_number_column(self):
+    def test_population_search_writes_cycle_number_column(self):
         planets = [{"pl_name": "K2-18 b", "hostname": "K2-18",
                     "ra": 172.56, "dec": 7.5878,
                     "pl_tranmid": 2460000.5, "pl_orbper": 32.94,
@@ -2077,7 +2175,7 @@ class JwstProgramInfoTests(unittest.TestCase):
             "filters": "F290LP;G395H", "target_name": "K2-18",
             "t_min": 59999.95, "t_max": 60000.25,  # covers the transit center
         }]
-        Tool = self.mast.CrossmatchJwstToPlanets
+        Tool = self.mast.SearchMastJwstObservations
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
                 patch.object(self.mast, "archive_tap_query", return_value=planets),
@@ -2099,7 +2197,7 @@ class JwstProgramInfoTests(unittest.TestCase):
                 output = tool._run()
 
             self.assertIn("cycle=1", output)
-            self.assertIn("event=transit", output)
+            self.assertIn("obs_type=transit", output)
             self.assertNotIn("WARNING — cycle_number", output)
             with (pathlib.Path(tmpdir) / "xmatch_cycle.csv").open() as fh:
                 rows = list(csv.DictReader(fh))
@@ -2222,63 +2320,54 @@ class JwstProgramInfoTests(unittest.TestCase):
         self.mast._write_rows_csv(in_path, rows)
         return in_path
 
-    def test_aggregate_auto_classifies_when_grouping_by_obs_type(self):
-        # No add_obs_type flag: requesting obs_type on a CSV that lacks the
-        # column must derive it on the fly (and not write a *_typed.csv).
+    def test_rows_path_classifies_when_grouping_by_obs_type(self):
+        # Requesting obs_type on a CSV that lacks the column derives it on
+        # the fly (and, with nothing filtered out, writes no new rows CSV).
         with tempfile.TemporaryDirectory() as tmpdir:
             self._write_typed_fixture_csv(tmpdir)
-            tool = _construct_tool(
-                self.mast.AggregateJwstObservations,
+            output = _construct_tool(
+                self.mast.SearchMastJwstObservations,
                 group_by=["obs_type"],
                 rows_path="xmatch.csv",
-                output_csv="grouped.csv",
                 base_directory=tmpdir,
-            )
-            output = tool._run()
+            )._run()
 
             self.assertIn("Event classification: 2/3 rows typed", output)
             self.assertIn("obs_type_note breakdown", output)
             self.assertIn("approximate", output)
-            self.assertFalse(
-                (pathlib.Path(tmpdir) / "xmatch_typed.csv").exists(),
-                "auto mode must not write a typed CSV",
-            )
-            with (pathlib.Path(tmpdir) / "grouped.csv").open() as fh:
+            demo = pathlib.Path(tmpdir) / "mast" / "demographics"
+            self.assertEqual(list(demo.glob("search_*.csv")), [])
+            (grouped,) = demo.glob("aggregate_*.csv")
+            with grouped.open() as fh:
                 groups = {r["obs_type"]: r["count"] for r in csv.DictReader(fh)}
             self.assertEqual(
                 groups, {"transit": "1", "eclipse": "1", "unknown": "1"},
             )
 
-    def test_aggregate_add_obs_type_persists_typed_csv(self):
+    def test_rows_path_obs_types_writes_filtered_typed_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             in_path = self._write_typed_fixture_csv(tmpdir)
-            tool = _construct_tool(
-                self.mast.AggregateJwstObservations,
-                group_by=["pl_name"],          # obs_type not even requested
+            output = _construct_tool(
+                self.mast.SearchMastJwstObservations,
                 rows_path="xmatch.csv",
-                add_obs_type=True,
-                output_csv="grouped.csv",
+                obs_types=["transit"],
+                output_csv="transits.csv",
                 base_directory=tmpdir,
-            )
-            output = tool._run()
+            )._run()
 
-            typed = pathlib.Path(tmpdir) / "xmatch_typed.csv"
-            self.assertIn(str(typed), output)
-            self.assertTrue(typed.is_file())
-            with typed.open() as fh:
-                read_back = {r["obsid"]: r for r in csv.DictReader(fh)}
-            self.assertEqual(read_back["1"]["obs_type"], "transit")
-            self.assertEqual(read_back["1"]["obs_type_note"], "")
-            self.assertEqual(read_back["2"]["obs_type"], "eclipse")
-            self.assertIn("approximate", read_back["2"]["obs_type_note"])
-            self.assertEqual(read_back["3"]["obs_type"], "unknown")
-            self.assertIn("pl_tranmid", read_back["3"]["obs_type_note"])
+            out_path = pathlib.Path(tmpdir) / "transits.csv"
+            self.assertIn("Kept 1 of 3 rows", output)
+            self.assertIn(str(out_path), output)
+            with out_path.open() as fh:
+                read_back = list(csv.DictReader(fh))
+            self.assertEqual([r["obsid"] for r in read_back], ["1"])
+            self.assertEqual(read_back[0]["obs_type"], "transit")
             # Input file untouched (no obs_type column added in place).
             with in_path.open() as fh:
                 original = list(csv.DictReader(fh))
             self.assertNotIn("obs_type", original[0])
 
-    def test_aggregate_skips_classification_when_column_already_present(self):
+    def test_rows_path_skips_classification_when_column_already_present(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             rows = [{"pl_name": "b", "obs_type": "transit"},
                     {"pl_name": "b", "obs_type": "eclipse"}]
@@ -2287,10 +2376,9 @@ class JwstProgramInfoTests(unittest.TestCase):
                 self.mast, "annotate_rows_with_event_types"
             ) as annotate:
                 tool = _construct_tool(
-                    self.mast.AggregateJwstObservations,
+                    self.mast.SearchMastJwstObservations,
                     group_by=["obs_type"],
                     rows_path="typed.csv",
-                    output_csv="grouped.csv",
                     base_directory=tmpdir,
                 )
                 output = tool._run()
@@ -2341,8 +2429,6 @@ class OrchestralSchemaContractTests(unittest.TestCase):
         expected = {
             "SearchMastJwstObservations": [],
             "DownloadMastJwstProducts": [],
-            "CrossmatchJwstToPlanets": [],
-            "AggregateJwstObservations": sorted(["group_by", "rows_path"]),
             "GetJwstProgramInfo": ["proposal_ids"],
         }
         for name, required in expected.items():
@@ -2404,13 +2490,14 @@ class OrchestralSchemaContractTests(unittest.TestCase):
         self.assertNotIn("Missing Required Fields", output)
 
     def test_execute_missing_required_field_still_errors(self):
-        tool = self.mast.AggregateJwstObservations(base_directory="/tmp/aster_ws")
-        output = tool.execute(group_by="['pl_name']")
+        tool = self.mast.GetJwstProgramInfo(base_directory="/tmp/aster_ws")
+        output = tool.execute()
         self.assertIn("Missing Required Fields", output)
-        self.assertIn("rows_path", output)
+        self.assertIn("proposal_ids", output)
 
     def test_retired_tools_are_gone(self):
-        for name in ("GetMastObservationProducts", "DownloadDemographicJwstProducts"):
+        for name in ("GetMastObservationProducts", "DownloadDemographicJwstProducts",
+                     "CrossmatchJwstToPlanets", "AggregateJwstObservations"):
             self.assertFalse(hasattr(self.mast, name), name)
 
 
@@ -2500,6 +2587,19 @@ class ExotedrfDownloadParityTests(unittest.TestCase):
         self.assertFalse(m("CLEAR;PRISM", ["G395H"]))
         self.assertFalse(m("F290LP;G395M", ["G395H"]))   # no substring leakage
         self.assertTrue(m("anything", None))
+
+    def test_filters_match_ands_a_filter_with_a_grating(self):
+        """['F290LP', 'G395H'] used to be any-of, so every G395M row came in
+        through its F290LP."""
+        m = self.mast._filters_match
+        self.assertTrue(m("F290LP;G395H", ["F290LP", "G395H"]))
+        self.assertFalse(m("F290LP;G395M", ["F290LP", "G395H"]))
+        self.assertTrue(m("F290LP;G395M", ["G395H", "G395M"]))   # same kind: either
+        self.assertTrue(m("F290LP;G395M", ["F290LP"]))
+        self.assertFalse(m("F170LP;G235H", ["F290LP", "G395H", "G235H"]))
+        self.assertTrue(m("CLEAR;GR700XD", ["CLEAR", "GR700XD"]))
+        self.assertTrue(m("F322W2;GRISMR", ["F322W2", "F444W"]))
+        self.assertTrue(m("F290LP;G395M", ["F290LP;G395M", "PRISM"]))
 
     def test_visit_numbering_is_global_and_sorted(self):
         sets = [(k, self._raw_products(k)) for k in ("2", "1")]

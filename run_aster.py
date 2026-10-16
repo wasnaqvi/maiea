@@ -30,7 +30,7 @@ def require_groq_credentials():
 
 
 def get_llm_provider():
-    # Default to 'openai': tool-routing accuracy across ASTER's 26 tools is
+    # Default to 'openai': tool-routing accuracy across ASTER's 24 tools is
     # poor on small local models (llama3.2 routinely picks the wrong tool and
     # invents arguments). '.env' can still override to 'ollama' or 'groq'.
     return os.getenv('ASTER_LLM_PROVIDER', 'openai').lower()
@@ -142,8 +142,6 @@ from aster_toolkit import (
     DownloadDataset,
     SearchMastJwstObservations,
     DownloadMastJwstProducts,
-    CrossmatchJwstToPlanets,
-    AggregateJwstObservations,
     GetJwstProgramInfo,
     AsterAlert,
     DiscoverPatchworkVisits,
@@ -200,8 +198,6 @@ tools = [
     # MAST / JWST tools
     SearchMastJwstObservations(base_directory=base_directory),
     DownloadMastJwstProducts(base_directory=base_directory),
-    CrossmatchJwstToPlanets(base_directory=base_directory),
-    AggregateJwstObservations(base_directory=base_directory),
     GetJwstProgramInfo(base_directory=base_directory),
 
     # ASTER Alert: release dates, recent releases, release-day emails

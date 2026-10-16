@@ -24,6 +24,9 @@ RETIRED = {
     "InspectNirspecG395hUncalData", "DetectNirspecTiltEvents",
     "VerifyContaminationBackends", "GeneratePatchworkFirJob",
     "GenerateFirOptimizerJobs",
+    # merged into SearchMastJwstObservations (population_preset / obs_types /
+    # group_by / rows_path)
+    "CrossmatchJwstToPlanets", "AggregateJwstObservations",
 }
 
 
@@ -39,9 +42,9 @@ def _construct(Tool, **kwargs):
 
 # ---------------- registry ----------------
 
-def test_exports_are_the_26_consolidated_tools():
-    assert len(aster_toolkit.__all__) == 26
-    assert len(set(aster_toolkit.__all__)) == 26
+def test_exports_are_the_24_consolidated_tools():
+    assert len(aster_toolkit.__all__) == 24
+    assert len(set(aster_toolkit.__all__)) == 24
     assert not RETIRED & set(aster_toolkit.__all__)
     for name in RETIRED:
         with pytest.raises(AttributeError):
@@ -275,7 +278,7 @@ def test_omitted_arguments_do_not_leak_from_the_previous_call(tmp_path):
 def test_state_fields_survive_the_reset(tmp_path):
     pytest.importorskip("orchestral")
     from aster_toolkit.data_acquisition import mast
-    tool = mast.AggregateJwstObservations(base_directory=str(tmp_path))
+    tool = mast.SearchMastJwstObservations(base_directory=str(tmp_path))
     tool.execute(rows_path="missing.csv", group_by="['x']")
     assert tool.base_directory == str(tmp_path)
 
@@ -285,11 +288,11 @@ def test_failing_call_returns_error_text_instead_of_raising(tmp_path):
     when _run failed on a tool with required fields."""
     pytest.importorskip("orchestral")
     from aster_toolkit.data_acquisition import mast
-    tool = mast.AggregateJwstObservations(base_directory=str(tmp_path))
-    out = tool.execute(rows_path="missing.csv", group_by="['x']")
+    tool = mast.GetJwstProgramInfo(base_directory=str(tmp_path))
+    out = tool.execute(proposal_ids="[]")
     assert out.startswith("Error: Execution Error")
-    out = tool.execute(group_by="['x']")             # next call: still sane
-    assert "Missing Required Fields" in out and "rows_path" in out
+    out = tool.execute()                             # next call: still sane
+    assert "Missing Required Fields" in out and "proposal_ids" in out
 
 
 # ---------------- schema contract: exactly these arguments are required ----------------
@@ -307,8 +310,6 @@ EXPECTED_REQUIRED = {
     "DownloadDataset": [],
     "SearchMastJwstObservations": [],
     "DownloadMastJwstProducts": [],
-    "CrossmatchJwstToPlanets": [],
-    "AggregateJwstObservations": ["group_by", "rows_path"],
     "GetJwstProgramInfo": ["proposal_ids"],
     "AsterAlert": [],
     "DiscoverPatchworkVisits": ["raw_root"],

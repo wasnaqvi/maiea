@@ -312,8 +312,9 @@ class QueryExoplanetArchive(BaseTool):
 
     NOT FOR: "who observed X", instruments, JWST programs/PIs/cycles — the
     archive parameter tables have no observation logs. Route those to
-    `SearchMastJwstObservations` / `GetJwstProgramInfo`. To join JWST
-    observations to a planet population, use `CrossmatchJwstToPlanets`.
+    `SearchMastJwstObservations` / `GetJwstProgramInfo`. For JWST
+    observations of a planet population, use `SearchMastJwstObservations`
+    with `population_preset`.
 
     Modes (supply exactly one of ``planet_name`` / ``conditions``)
     -------------------------------------------------------------
