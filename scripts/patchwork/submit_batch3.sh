@@ -6,6 +6,8 @@
 #   chmod +x scripts/patchwork/submit_batch3.sh
 #   ./scripts/patchwork/submit_batch3.sh             # discover + dry-run plan
 #   ./scripts/patchwork/submit_batch3.sh --submit    # ...then submit STEPS=inspect,reduce
+#   ./scripts/patchwork/submit_batch3.sh --submit --mail-user you@example.com
+#                                                    # SLURM mail on BEGIN, END, FAIL
 #
 # Steps:
 #   1. Discovery on mast/jwst_raw/batch3_download ONLY, into its own manifest
@@ -35,17 +37,21 @@
 # GO 4126): its transit window does not match the archive ephemeris, so
 # discovery cannot resolve it. It is then excluded by SKIP, not reduced here.
 #
-# Environment overrides: ASTER_REPO, ASTER_ENV, MANIFEST_DIR, SKIP,
+# Environment overrides: ASTER_REPO, ASTER_ENV, MANIFEST_DIR, SKIP, MAIL_USER,
 # OVERRIDE_LIST (semicolon-separated KEY=PLANET items; names may contain spaces).
 
 set -uo pipefail
 
 SUBMIT=0
-for arg in "$@"; do
-    case "$arg" in
-        --submit) SUBMIT=1 ;;
+MAIL_USER="${MAIL_USER:-}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --submit) SUBMIT=1; shift ;;
+        --mail-user)
+            [[ $# -ge 2 ]] || { echo "--mail-user needs an address" >&2; exit 1; }
+            MAIL_USER="$2"; shift 2 ;;
         -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
-        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
 
@@ -90,6 +96,7 @@ fi
 echo
 echo "== Reduce plan (skipping: $SKIP)"
 ARGS=(--manifest-dir "$MANIFEST_DIR" --skip "$SKIP" --mode reduce)
+[[ -n "$MAIL_USER" ]] && ARGS+=(--mail-user "$MAIL_USER")
 if [[ $SUBMIT -eq 1 ]]; then
     ARGS+=(--submit)
 else
