@@ -15,7 +15,7 @@
 #   2. STOPS if any visit is unresolved. Read the discovery table first: the
 #      two TOI-402 visits and the two TOI-451 visits are where a wrong planet
 #      would give a confidently wrong depth. Never guess; supply an override:
-#        OVERRIDES="--override jw02512017001=<planet name>" ./submit_batch3.sh
+#        OVERRIDE_LIST="jw02512017001=<planet name>;<visit>=<planet>" ./submit_batch3.sh
 #   3. Hands the new manifests to submit_survey.sh (reduce mode, 2 CPUs).
 #
 # Deliberately not handled:
@@ -31,7 +31,12 @@
 # visit, segments_complete true, exotedrf.path and crds_context identical to
 # the rest of the survey. Fit only after that.
 #
-# Environment overrides: ASTER_REPO, ASTER_ENV, MANIFEST_DIR, SKIP, OVERRIDES.
+# jw04126201001 is always overridden to "TOI-125 c" (locked survey decision,
+# GO 4126): its transit window does not match the archive ephemeris, so
+# discovery cannot resolve it. It is then excluded by SKIP, not reduced here.
+#
+# Environment overrides: ASTER_REPO, ASTER_ENV, MANIFEST_DIR, SKIP,
+# OVERRIDE_LIST (semicolon-separated KEY=PLANET items; names may contain spaces).
 
 set -uo pipefail
 
@@ -49,7 +54,11 @@ ASTER_ENV="${ASTER_ENV:-$HOME/aster/aster-env}"
 RAW_BATCH="$(readlink -f "$ASTER_REPO/workspace/mast/jwst_raw/batch3_download")"
 MANIFEST_DIR="${MANIFEST_DIR:-$HOME/patchwork/manifests_batch3}"
 SKIP="${SKIP:-TOI_125_c}"
-OVERRIDES="${OVERRIDES:-}"
+OVERRIDE_ARGS=(--override "jw04126201001=TOI-125 c")
+IFS=';' read -r -a EXTRA_OVERRIDES <<< "${OVERRIDE_LIST:-}"
+for item in "${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}"; do
+    [[ -n "$item" ]] && OVERRIDE_ARGS+=(--override "$item")
+done
 
 if [[ -z "$RAW_BATCH" || ! -d "$RAW_BATCH" ]]; then
     echo "batch3_download not found under $ASTER_REPO/workspace/mast/jwst_raw" >&2
@@ -67,14 +76,13 @@ rm -f "$MANIFEST_DIR/_unresolved.json"   # stale from a previous run
     # shellcheck disable=SC1091
     source "$ASTER_ENV/bin/activate" || exit 1
     cd "$ASTER_REPO" || exit 1
-    # shellcheck disable=SC2086
     python -m aster_toolkit.data_reduction.discover \
-        --raw-root "$RAW_BATCH" --manifest-dir "$MANIFEST_DIR" $OVERRIDES
+        --raw-root "$RAW_BATCH" --manifest-dir "$MANIFEST_DIR" "${OVERRIDE_ARGS[@]}"
 ) || { echo "Discovery failed." >&2; exit 1; }
 
 if [[ -e "$MANIFEST_DIR/_unresolved.json" ]]; then
     echo >&2
-    echo "UNRESOLVED visits in $MANIFEST_DIR/_unresolved.json. Fix with OVERRIDES and re-run;" >&2
+    echo "UNRESOLVED visits in $MANIFEST_DIR/_unresolved.json. Fix with OVERRIDE_LIST and re-run;" >&2
     echo "never guess a planet name. Nothing submitted." >&2
     exit 1
 fi
