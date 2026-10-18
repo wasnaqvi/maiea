@@ -11,8 +11,8 @@ jobs:
   alert:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: "3.12" }
       - run: pip install requests
       # State persists between runs through the Actions cache. Cache keys are
@@ -29,7 +29,7 @@ jobs:
           ASTER_ALERT_SMTP_HOST: ${{ secrets.ASTER_ALERT_SMTP_HOST }}
           ASTER_ALERT_SMTP_USER: ${{ secrets.ASTER_ALERT_SMTP_USER }}
           ASTER_ALERT_SMTP_PASSWORD: ${{ secrets.ASTER_ALERT_SMTP_PASSWORD }}
-        run: python -m aster_toolkit.data_acquisition.alert --preset subneptune
+        run: python -m aster_toolkit.data_acquisition.alert --preset subneptune --tolerate-outage
       - uses: actions/cache/save@v4
         if: always()
         with:

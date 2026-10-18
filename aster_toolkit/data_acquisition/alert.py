@@ -1207,6 +1207,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--upcoming", action="store_true",
                    help="Print everything still proprietary and exit (no state).")
     p.add_argument("--dry-run", action="store_true", help="Do not write state.")
+    p.add_argument("--tolerate-outage", action="store_true",
+                   help="If MAST or the Exoplanet Archive is down after retries, "
+                        "emit a ::warning:: and exit 0 (state is left untouched).")
     p.add_argument("--deliver", action="store_true",
                    help="Send due release-day emails for GUI subscriptions and exit "
                         "(for cron, when the GUI is not running).")
@@ -1257,7 +1260,14 @@ def main(argv: list[str] | None = None) -> int:
     state_path = Path(args.state)
     if not state_path.is_absolute():
         state_path = base / state_path
-    run_alert(config, state_path=state_path, notifiers=notifiers, dry_run=args.dry_run)
+    try:
+        run_alert(config, state_path=state_path, notifiers=notifiers, dry_run=args.dry_run)
+    except requests.RequestException as exc:
+        if not args.tolerate_outage:
+            raise
+        first = str(exc).splitlines()[0]
+        print(f"::warning title=ASTER Alert skipped::upstream outage, no state written: {first}")
+        return 0
     return 0
 
 

@@ -15,6 +15,7 @@ import csv
 import io
 import os
 import re
+import time
 from typing import Any, Iterable
 
 import requests
@@ -32,6 +33,13 @@ _QUERY_ERROR_RE = re.compile(
     r'<INFO[^>]*name="QUERY_STATUS"[^>]*value="ERROR"[^>]*>(.*?)</INFO>',
     re.DOTALL | re.IGNORECASE,
 )
+
+
+# The archive's backing database drops out now and then ("Failed to connect to
+# cx_Oracle", HTTP 5xx). Those are retried; a query it rejects is not.
+RETRY_DELAYS = (15.0, 45.0, 120.0)
+_TRANSIENT_RE = re.compile(r"failed to connect|connection (?:refused|reset)|timed? ?out|unavailable",
+                           re.IGNORECASE)
 
 
 class ArchiveTapError(requests.HTTPError):
@@ -68,6 +76,30 @@ def build_adql(
 
 
 def run_adql(
+    adql: str,
+    *,
+    session: requests.Session | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    retry_delays: Iterable[float] | None = None,
+) -> list[dict[str, Any]]:
+    """:func:`_run_adql_once`, retried with backoff on transient archive outages."""
+    delays = list(RETRY_DELAYS if retry_delays is None else retry_delays)
+    for attempt in range(len(delays) + 1):
+        try:
+            return _run_adql_once(adql, session=session, timeout=timeout)
+        except ArchiveTapError as exc:
+            status = getattr(exc.response, "status_code", 0) or 0
+            transient = status >= 500 or bool(_TRANSIENT_RE.search(str(exc).split("\nADQL:")[0]))
+            if not transient or attempt == len(delays):
+                raise
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == len(delays):
+                raise
+        time.sleep(delays[attempt])
+    raise AssertionError("unreachable")
+
+
+def _run_adql_once(
     adql: str,
     *,
     session: requests.Session | None = None,
