@@ -46,6 +46,12 @@ from aster_toolkit.data_reduction.survey import (  # noqa: E402
 )
 
 # slug -> (reduce_walltime, fit_walltime, reduce_mem, fit_mem, wave, note)
+#
+# FIT WALLTIMES x3 for v1.6 (2026-10-20), capped at 7 days. v1.6 adds a
+# GP to the final white fit and to every channel; its cost on Fir is not
+# measured yet, and a fit is not resumable, so a timeout loses the whole
+# run. Tighten these from the v1.6 sacct Elapsed once the survey refit
+# has run (the pre-v1.6 values were the x1 numbers).
 # Waves: 1 = cheap single-visit validation, 2 = remaining single-visit,
 # 3 = multi-visit, 4 = large / needs a human decision first.
 #
@@ -58,36 +64,36 @@ from aster_toolkit.data_reduction.survey import (  # noqa: E402
 # ~5 min. The reduce_mem values below are sized for a COLD run (Stages
 # 1-3), which is why they exceed these numbers.
 SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
-    "TOI_1468_c": ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
-    "LTT_3780_c": ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
-    "TOI_270_c":  ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
-    "TOI_1231_b": ("2:00:00", "15:00:00", "48G", "24G", 1, ""),
-    "GJ_1214_b":  ("2:00:00", "15:00:00", "48G", "24G", 2,
+    "TOI_1468_c": ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
+    "LTT_3780_c": ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
+    "TOI_270_c":  ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
+    "TOI_1231_b": ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
+    "GJ_1214_b":  ("2:00:00", "1-21:00:00", "48G", "24G", 2,
                    "only visit o019 usable; 13430 ppm depth = easiest sanity check"),
-    "TOI_270_b":  ("2:00:00", "15:00:00", "48G", "24G", 4,
+    "TOI_270_b":  ("2:00:00", "1-21:00:00", "48G", "24G", 4,
                    "GO 4098 o017 contains nearly simultaneous b+d transits; "
                    "BLOCKED until Patchwork has a two-planet light-curve model"),
-    "L_98_59_d":  ("2:00:00", "15:00:00", "48G", "24G", 2, "below demographic"),
-    "GJ_357_b":   ("3:00:00", "15:00:00", "48G", "24G", 2,
+    "L_98_59_d":  ("2:00:00", "1-21:00:00", "48G", "24G", 2, "below demographic"),
+    "GJ_357_b":   ("3:00:00", "1-21:00:00", "48G", "24G", 2,
                    "below demographic; folder label says d, headers say b — APT check"),
     # TWO visits since the o006 NRS2 uncal was repaired (2026-08-27): it
     # had been truncated on disk since August 1, so o006 produced nothing
     # and the target fit as single-visit. Two visits is ~112 nested
     # sampling runs against ~56, and the wave-2 15 h allocation timed out
     # at exactly that point. Sized with the other two-visit targets.
-    "TOI_776_b":  ("4:00:00", "30:00:00", "48G", "24G", 3,
+    "TOI_776_b":  ("4:00:00", "3-18:00:00", "48G", "24G", 3,
                    "2 visits since the o006 truncated-uncal repair"),
-    "TOI_836_01": ("4:00:00", "15:00:00", "48G", "24G", 2,
+    "TOI_836_01": ("4:00:00", "1-21:00:00", "48G", "24G", 2,
                    "keep the .01 designation — 'TOI-836 c' is not in pscomppars"),
-    "GJ_9827_d":  ("3:00:00", "30:00:00", "48G", "24G", 3,
+    "GJ_9827_d":  ("3:00:00", "3-18:00:00", "48G", "24G", 3,
                    "REDO of the PyPI-reduced test run, now on the optimizer branch"),
-    "GJ_3090_b":  ("3:00:00", "30:00:00", "48G", "24G", 3, ""),
-    "TOI_776_c":  ("4:00:00", "30:00:00", "48G", "24G", 3, ""),
-    "TOI_836_b":  ("6:00:00", "30:00:00", "48G", "24G", 3, ""),
+    "GJ_3090_b":  ("3:00:00", "3-18:00:00", "48G", "24G", 3, ""),
+    "TOI_776_c":  ("4:00:00", "3-18:00:00", "48G", "24G", 3, ""),
+    "TOI_836_b":  ("6:00:00", "3-18:00:00", "48G", "24G", 3, ""),
     # Walltimes raised 2026-07-30 after both TIMED OUT during Stages 1-2
     # at the original 4 h / 12 h. Measured: every other target finished
     # Stages 1-2 in 27 min - 2 h; these two are the outliers by volume.
-    "K2_18_b":    ("8:00:00", "2-12:00:00", "48G", "24G", 4,
+    "K2_18_b":    ("8:00:00", "7-00:00:00", "48G", "24G", 4,
                    "cross-program 4-visit combine APPROVED (Wasi 2026-07-30); "
                    "TIMED OUT at 4 h on the first attempt"),
     # Memory raised 64G -> 128G. MEASURED Stage 3 MaxRSS on Wave 1 scales
@@ -101,7 +107,7 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     # materialises an (nints, npix) array before selecting bright pixels,
     # which at 21228 integrations peaks near 33 GB. The fit walltime was
     # also still 15 h, the same as targets with 8x fewer integrations.
-    "TOI_561_b":  ("24:00:00", "2-12:00:00", "128G", "128G", 4,
+    "TOI_561_b":  ("24:00:00", "7-00:00:00", "128G", "128G", 4,
                    "21228 integrations in one visit; reduce TIMED OUT at 12 h "
                    "and the fit OOM'd at 32G — both raised"),
     # GO 4126 observed TOI-125 b AND c, one transit each (proposal
@@ -109,9 +115,9 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     #   --override jw04126101001="TOI-125 b" --override jw04126201001="TOI-125 c"
     # If the b/c <-> obs 101/201 assignment is swapped, the fit-time
     # transit-in-window guard refuses loudly — then swap the overrides.
-    "TOI_125_b":  ("3:00:00", "15:00:00", "48G", "24G", 2,
+    "TOI_125_b":  ("3:00:00", "1-21:00:00", "48G", "24G", 2,
                    "ID from GO 4126 abstract; guard catches a b/c swap"),
-    "TOI_125_c":  ("3:00:00", "15:00:00", "48G", "24G", 2,
+    "TOI_125_c":  ("3:00:00", "1-21:00:00", "48G", "24G", 2,
                    "ID from GO 4126 abstract; guard catches a b/c swap"),
     # Batch 3 (reduced 2026-10-19). Fit walltimes are ~3.3x the MEASURED
     # v1.5 elapsed (HD 15337 b 8.9 h, c 14.5 h, HIP 9618 b 10.9 h,
