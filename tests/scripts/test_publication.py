@@ -187,7 +187,11 @@ def test_restamp_refuses_grazing_target_whole(tmp_path):
     target = _v14_target(tmp_path, [0.3, 0.94])
     with pytest.raises(Refused, match="b = 0.94"):
         plan_target(target)
-    main([str(tmp_path), "--write"])
+    # The script encodes the v1.4 -> v1.5 delta only. v1.6 (joint fit + GP)
+    # changes every number, so once the code is past v1.5 main() must refuse
+    # outright rather than restamp anything.
+    with pytest.raises(SystemExit, match="v1.4->v1.5"):
+        main([str(tmp_path), "--write"])
     assert not list(target.rglob("*.pre-restamp"))
     assert json.loads((target / "patchwork_summary.json").read_text())["fit_version"] == "1.4"
 

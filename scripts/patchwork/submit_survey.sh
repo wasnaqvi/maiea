@@ -31,7 +31,11 @@
 #
 # MODES
 #   reduce (default)  STEPS=inspect,reduce   2 CPUs, per-target reduce sizing.
-#   fit               STEPS=fit,combine FORCE_REFIT=1   4 CPUs, fit sizing.
+#   fit               STEPS=fit,combine,contamination FORCE_REFIT=1
+#                     4 CPUs, fit sizing. Stage 6.5 (unocculted spots) runs
+#                     at the end of every fit job -- seconds, and a failure
+#                     there is recorded, not fatal -- so no refit can finish
+#                     without its contamination check.
 #                     Refuses a target with no Stage 3 products. Passing
 #                     the CAMPAIGN.md step-5 checklist (2 Stage 3 products
 #                     per visit, segments_complete, identical
@@ -102,7 +106,7 @@ done
 
 case "$MODE" in
     reduce)        STEPS="inspect,reduce"; CPUS=2; EXTRA_ENV="" ;;
-    fit)           STEPS="fit,combine";    CPUS=4; EXTRA_ENV="FORCE_REFIT=1 " ;;
+    fit)           STEPS="fit,combine,contamination"; CPUS=4; EXTRA_ENV="FORCE_REFIT=1 " ;;
     contamination) STEPS="contamination";  CPUS=2; EXTRA_ENV="" ;;
     *) echo "Unknown --mode '$MODE' (reduce|fit|contamination)" >&2; exit 1 ;;
 esac

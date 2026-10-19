@@ -108,9 +108,30 @@ def _import_juliet():
         p for p in sys.path if os.path.abspath(p or os.getcwd()) != this_dir
     ]
     try:
+        _repair_batman_namespace()
         return importlib.import_module("juliet")
     finally:
         sys.path = saved_path
+
+
+def _repair_batman_namespace() -> None:
+    """Re-export ``TransitParams``/``TransitModel`` at ``batman`` top level.
+
+    juliet calls ``batman.TransitParams()``. A second PyPI distribution
+    that also installs a ``batman`` package (a CLI toolkit) can overwrite
+    batman-package's ``__init__.py`` with an empty one, leaving only the
+    ``batman.transitmodel`` submodule (seen in the Mac ``exo`` env). The
+    classes are the same objects either way; this touches no numerics.
+    """
+    try:
+        import batman
+        if hasattr(batman, "TransitParams"):
+            return
+        from batman import transitmodel
+    except ImportError:
+        return
+    batman.TransitParams = transitmodel.TransitParams
+    batman.TransitModel = transitmodel.TransitModel
 
 
 # Frozen survey-wide fitting settings. Bump the version if any change.
@@ -124,7 +145,26 @@ def _import_juliet():
 # facula crossings are masked and the lightcurve is refit. A fit where
 # the scan did not run is stamped "1.3-noscan". The stamps compose:
 # "1.3-nopca-noscan" is possible and is not a survey fit.
-PATCHWORK_FIT_VERSION = "1.5"
+# v1.6 (decision Wasi 2026-10-20): the white light is ONE joint fit of
+# NRS1 and NRS2, and the noise model gains a GP.
+#   * Joint: P, t0, a/Rs and b are shared -- the two detectors record the
+#     same photons at the same instant, so the geometry is one set of
+#     numbers. Depth (p_p1_NRS1/NRS2), limb darkening, jitter, baseline
+#     and every regressor stay per detector. Fitted separately, HD 15337 c
+#     o019 put the two mid-transits 77 min apart (NRS2 caught ingress,
+#     missed egress and faked the recovery with its time slope; b 0.89 vs
+#     0.14). Sarkar et al. (2026) fit TOI-1231 b's two detectors as one
+#     white lightcurve for the same reason.
+#   * GP: celerite Matern-3/2 in time per detector (final white pass and
+#     every channel), for the correlated noise behind betas of 3-14 that
+#     linear regressors leave. The channels fit GP_sigma and keep GP_rho
+#     fixed to the white-light posterior, the same freeze the orbit gets.
+#   * Pass 1 (input to the Stage 5.5 scan) is joint but GP-free on
+#     purpose: a GP would absorb the spot bumps the scan is looking for.
+# Stamps: "-1det" when only one detector had Stage 3 products (no shared
+# geometry to constrain it), "-nogp" when the GP was off. Either is not a
+# survey fit.
+PATCHWORK_FIT_VERSION = "1.6"
 SAMPLER = "dynesty"
 N_LIVE_WHITE = 500
 N_LIVE_SPEC = 300
@@ -153,6 +193,16 @@ LD_FIX_IMPACT_PARAM = 0.80
 LD_MODE = "JWST_NIRSpec_G395H"
 LD_MODEL = "mps1"
 THETA_BOUNDS = [-0.1, 0.1]    # uniform prior on every linear regressor coeff
+# v1.6 joint white light: parameters both detectors share.
+JOINT_SHARED_PARAMS = ("P_p1", "t0_p1", "a_p1", "b_p1")
+# v1.6 GP: celerite Matern-3/2 (juliet's GP_sigma + GP_rho pair) in time.
+GP_KERNEL = "celerite-matern32"
+GP_SIGMA_BOUNDS = [1e-6, 1e-2]        # amplitude, relative flux (1-10000 ppm)
+# rho below a few minutes is indistinguishable from the white jitter that
+# sigma_w already fits; above the visit span it is a baseline offset that
+# mflux and the time slope already fit. Either end would only let the two
+# trade against each other.
+GP_RHO_MIN_DAYS = 2.0 / 1440.0
 
 # Back-compat alias (pre-Stage4 name).
 load_extracted_spectra = load_stage3_spectra
@@ -491,6 +541,15 @@ def _white_priors(
     n_regressors: int,
     ld: dict[str, float] | None,
 ) -> dict[str, dict[str, Any]]:
+    p = _orbit_priors(priors, t0_obs)
+    p["p_p1"] = {"distribution": "uniform", "hyperparameters": [0.0, 0.3]}
+    p.update(_ld_prior_entries(instrument, ld))
+    p.update(_common_instrument_priors(instrument, n_regressors))
+    return p
+
+
+def _orbit_priors(priors: dict[str, Any], t0_obs: float) -> dict[str, dict[str, Any]]:
+    """P, t0, b, a/Rs (+ circular orbit): the geometry of one transit."""
     period = priors["period"]
     if period is None:
         raise ValueError("No orbital period available from the archive.")
@@ -502,7 +561,6 @@ def _white_priors(
         },
         # t0 propagated to this visit; 0.01 d Gaussian (validated run).
         "t0_p1": {"distribution": "normal", "hyperparameters": [t0_obs, 0.01]},
-        "p_p1": {"distribution": "uniform", "hyperparameters": [0.0, 0.3]},
         "b_p1": {"distribution": "uniform", "hyperparameters": [0.0, 1.0]},
         "ecc_p1": {"distribution": "fixed", "hyperparameters": 0.0},
         "omega_p1": {"distribution": "fixed", "hyperparameters": 90.0},
@@ -513,9 +571,53 @@ def _white_priors(
         p["a_p1"] = {"distribution": "normal", "hyperparameters": [a_rs, 3 * err]}
     else:
         p["a_p1"] = {"distribution": "uniform", "hyperparameters": [1.0, 300.0]}
-    p.update(_ld_prior_entries(instrument, ld))
-    p.update(_common_instrument_priors(instrument, n_regressors))
     return p
+
+
+def _gp_priors(instrument: str, time: np.ndarray) -> dict[str, dict[str, Any]]:
+    """Matern-3/2 GP in time for one detector (juliet: GP_sigma + GP_rho)."""
+    span = float(np.ptp(np.asarray(time, dtype=float)))
+    return {
+        f"GP_sigma_{instrument}": {"distribution": "loguniform",
+                                   "hyperparameters": list(GP_SIGMA_BOUNDS)},
+        f"GP_rho_{instrument}": {"distribution": "loguniform",
+                                 "hyperparameters": [GP_RHO_MIN_DAYS,
+                                                     max(span, 2 * GP_RHO_MIN_DAYS)]},
+    }
+
+
+def _joint_white_priors(
+    priors: dict[str, Any],
+    t0_obs: float,
+    detectors: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Priors for one white-light fit of every detector in ``detectors``.
+
+    ``detectors`` maps a detector name to ``{"n_regressors", "ld",
+    "gp_time"}`` (``gp_time`` None = no GP). The orbit (JOINT_SHARED_PARAMS)
+    is one set of parameters; the depth is ``p_p1_<det>`` per detector.
+    """
+    p = _orbit_priors(priors, t0_obs)
+    for det, spec in detectors.items():
+        p[f"p_p1_{det}"] = {"distribution": "uniform", "hyperparameters": [0.0, 0.3]}
+        p.update(_ld_prior_entries(det, spec.get("ld")))
+        p.update(_common_instrument_priors(det, int(spec["n_regressors"])))
+        if spec.get("gp_time") is not None:
+            p.update(_gp_priors(det, spec["gp_time"]))
+    return p
+
+
+def _require_celerite() -> None:
+    """The v1.6 GP needs celerite. Fail before sampling, never silently
+    fall back to a white-noise fit stamped as a survey fit."""
+    try:
+        import celerite  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Patchwork fit v1.6 models red noise with a celerite GP, and "
+            "celerite is not importable in this environment. Install it "
+            "(pip install celerite) in the env that runs the fit."
+        ) from exc
 
 
 # -------------------- fitting --------------------
@@ -636,91 +738,229 @@ def fit_white_lightcurve(
     tilt_report: dict[str, Any] | None = None,
     n_spot_masked: int = 0,
     n_tilt_masked: int = 0,
+    gp: bool = True,
 ) -> dict[str, Any]:
-    """Fit the white-light transit of one visit x detector with juliet.
+    """Fit the white-light transit of ONE detector with juliet.
 
-    ``lc`` is a Stage 4 product from ``build_lightcurves``. Returns the
-    posterior summary (medians + 1-sigma), residual rms, and metadata
-    (regressors used, LD source, tilt events) — the orbit is frozen to
-    this in the spectroscopic fits.
-
-    ``keep_mask`` (True = use this integration) drops transition samples
-    that no step/ramp regressor can represent. Occulted spot/facula
-    crossings are modelled with Gaussian regressors. Pass ``anomaly_scan``
-    so the summary records what was found; without it the fit is version-stamped ``-noscan``,
-    because a fit that never looked for crossings is not uniform with
-    one that looked and found none.
+    The single-detector form of ``fit_white_lightcurve_joint``, kept for
+    the per-detector tools and smoke tests. The survey fits both
+    detectors jointly; a fit made here is stamped ``-1det`` because
+    nothing outside this one detector constrains its geometry.
     """
     if model_type != "transit":
         raise NotImplementedError(
             "Only model_type='transit' is implemented. Phase-curve support "
             "is a planned extension."
         )
+    out = fit_white_lightcurve_joint(
+        {instrument: lc}, priors, {instrument: output_dir},
+        joint_dir=output_dir,
+        regressors={instrument: regressors},
+        regressor_names={instrument: regressor_names},
+        ld={instrument: ld},
+        keep_masks={instrument: keep_mask},
+        gp=gp, program=program, visit=visit, n_live=n_live,
+        anomaly_scan=anomaly_scan,
+        tilt_reports={instrument: tilt_report},
+        n_spot_masked={instrument: n_spot_masked},
+        n_tilt_masked={instrument: n_tilt_masked},
+    )
+    return out[instrument]
+
+
+def _posterior_stat(samples: np.ndarray) -> dict[str, float]:
+    med, lo, hi = np.percentile(samples, [50, 16, 84])
+    return {"median": float(med), "minus": float(med - lo), "plus": float(hi - med)}
+
+
+def fit_white_lightcurve_joint(
+    lcs: dict[str, dict[str, Any]],
+    priors: dict[str, Any],
+    output_dirs: dict[str, str | os.PathLike[str]],
+    *,
+    joint_dir: str | os.PathLike[str],
+    regressors: dict[str, np.ndarray | None] | None = None,
+    regressor_names: dict[str, list[str] | None] | None = None,
+    ld: dict[str, dict[str, float] | None] | None = None,
+    keep_masks: dict[str, np.ndarray | None] | None = None,
+    gp: bool = True,
+    program: str = "",
+    visit: str = "",
+    n_live: int = N_LIVE_WHITE,
+    anomaly_scan: dict[str, Any] | None = None,
+    tilt_reports: dict[str, dict[str, Any] | None] | None = None,
+    n_spot_masked: dict[str, int] | None = None,
+    n_tilt_masked: dict[str, int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Fit one visit's white light on every detector at once (fit v1.6).
+
+    ``lcs`` maps detector -> Stage 4 lightcurve. The orbit
+    (JOINT_SHARED_PARAMS: P, t0, a/Rs, b) is shared; depth
+    (``p_p1_<det>``), limb darkening, mflux, jitter, regressors and the GP
+    are per detector. juliet writes its products to ``joint_dir``; each
+    detector gets the usual per-detector summary, residual npz and figure
+    in ``output_dirs[det]``, with its own depth reported as ``p_p1`` so
+    every downstream reader (spectroscopic fits, plots, depth check)
+    works unchanged.
+
+    ``gp=True`` adds a Matern-3/2 GP in time per detector. Leave it off
+    only for pass 1, whose residuals feed the Stage 5.5 scan.
+
+    Returns ``{det: summary}``.
+    """
     juliet = _import_juliet()
+    if gp:
+        _require_celerite()
+    dets = list(lcs)
+    if not dets:
+        raise ValueError("fit_white_lightcurve_joint needs at least one detector.")
+    regressors = dict(regressors or {})
+    regressor_names = dict(regressor_names or {})
+    ld = dict(ld or {})
+    keep_masks = dict(keep_masks or {})
+    tilt_reports = dict(tilt_reports or {})
+    n_spot_masked = dict(n_spot_masked or {})
+    n_tilt_masked = dict(n_tilt_masked or {})
 
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    jdir = Path(joint_dir)
+    jdir.mkdir(parents=True, exist_ok=True)
 
-    times = lc["time"]
-    if regressors is None:
-        regressors, regressor_names = build_regressor_matrix(times)
-    n_reg = regressors.shape[1]
+    times, keeps, regs, names = {}, {}, {}, {}
+    for det in dets:
+        lc = lcs[det]
+        t = lc["time"]
+        r = regressors.get(det)
+        n = regressor_names.get(det)
+        if r is None:
+            r, n = build_regressor_matrix(t)
+        keep = (np.ones(t.size, dtype=bool) if keep_masks.get(det) is None
+                else np.asarray(keep_masks[det], dtype=bool))
+        if keep.size != t.size:
+            raise ValueError(
+                f"{det}: keep_mask has {keep.size} entries but the lightcurve "
+                f"has {t.size} integrations."
+            )
+        if keep.sum() < 50:
+            raise ValueError(
+                f"{det}: the anomaly mask leaves only {int(keep.sum())} of "
+                f"{t.size} integrations. Masking that much of a visit is not a "
+                "correction — inspect the Stage 5.5 scan; the event is probably "
+                "instrumental or the whole visit is bad."
+            )
+        times[det], keeps[det], regs[det], names[det] = t, keep, r, list(n or [])
 
-    keep = (np.ones(times.size, dtype=bool) if keep_mask is None
-            else np.asarray(keep_mask, dtype=bool))
-    if keep.size != times.size:
-        raise ValueError(
-            f"keep_mask has {keep.size} entries but the lightcurve has "
-            f"{times.size} integrations."
-        )
-    n_masked = int((~keep).sum())
-    if keep.sum() < 50:
-        raise ValueError(
-            f"The anomaly mask leaves only {int(keep.sum())} of {times.size} "
-            "integrations. Masking that much of a visit is not a correction — "
-            "inspect the Stage 5.5 scan; the event is probably instrumental "
-            "or the whole visit is bad."
-        )
-
-    prior_dict = _white_priors(priors, lc["t0_obs"], instrument, n_reg, ld)
+    # Both detectors are propagated from the same ephemeris, so their
+    # t0_obs agree; the mean only guards against rounding.
+    t0_obs = float(np.mean([lcs[d]["t0_obs"] for d in dets]))
+    prior_dict = _joint_white_priors(priors, t0_obs, {
+        det: {"n_regressors": regs[det].shape[1], "ld": ld.get(det),
+              "gp_time": times[det][keeps[det]] if gp else None}
+        for det in dets
+    })
     dataset = juliet.load(
         priors=prior_dict,
-        t_lc={instrument: times[keep]},
-        y_lc={instrument: lc["wl_flux"][keep]},
-        yerr_lc={instrument: lc["wl_err"][keep]},
-        linear_regressors_lc={instrument: regressors[keep]},
-        out_folder=str(out),
+        t_lc={d: times[d][keeps[d]] for d in dets},
+        y_lc={d: lcs[d]["wl_flux"][keeps[d]] for d in dets},
+        yerr_lc={d: lcs[d]["wl_err"][keeps[d]] for d in dets},
+        linear_regressors_lc={d: regs[d][keeps[d]] for d in dets},
+        GP_regressors_lc=({d: times[d][keeps[d]] for d in dets} if gp else None),
+        out_folder=str(jdir),
     )
     results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
-
     posterior = results.posteriors["posterior_samples"]
+
+    joint_record = {
+        "detectors": dets,
+        "shared": list(JOINT_SHARED_PARAMS),
+        "joint_dir": str(jdir),
+    }
+    summaries: dict[str, dict[str, Any]] = {}
+    for det in dets:
+        summaries[det] = _summarize_white_detector(
+            results, posterior, det, lcs[det], priors,
+            Path(output_dirs[det]),
+            keep=keeps[det], regressor_names=names[det], ld=ld.get(det),
+            gp=gp, n_detectors=len(dets), joint_record=joint_record,
+            program=program, visit=visit,
+            anomaly_scan=anomaly_scan, tilt_report=tilt_reports.get(det),
+            n_spot_masked=int(n_spot_masked.get(det, 0)),
+            n_tilt_masked=int(n_tilt_masked.get(det, 0)),
+        )
+    if len(dets) > 1:
+        shared = {k: summaries[dets[0]][k] for k in JOINT_SHARED_PARAMS
+                  if k in summaries[dets[0]]}
+        with (jdir / "joint_white_fit_summary.json").open("w") as handle:
+            json.dump({"fit_version": summaries[dets[0]]["fit_version"],
+                       "detectors": dets, "shared": shared,
+                       "depth_ppm": {d: summaries[d]["depth_ppm"] for d in dets}},
+                      handle, indent=2)
+    return summaries
+
+
+def _summarize_white_detector(
+    results,
+    posterior: dict[str, np.ndarray],
+    instrument: str,
+    lc: dict[str, Any],
+    priors: dict[str, Any],
+    out: Path,
+    *,
+    keep: np.ndarray,
+    regressor_names: list[str],
+    ld: dict[str, float] | None,
+    gp: bool,
+    n_detectors: int,
+    joint_record: dict[str, Any],
+    program: str,
+    visit: str,
+    anomaly_scan: dict[str, Any] | None,
+    tilt_report: dict[str, Any] | None,
+    n_spot_masked: int,
+    n_tilt_masked: int,
+) -> dict[str, Any]:
+    """One detector's white-fit summary, residuals and figure from a
+    (possibly joint) juliet result. Same layout as every fit before v1.6,
+    plus ``joint_fit`` and ``noise_model``."""
+    out.mkdir(parents=True, exist_ok=True)
+    times = lc["time"]
+    n_reg = len(regressor_names)
+    n_masked = int((~keep).sum())
+
     # PCA detrending is part of frozen v1.2. A fit without the PCA
     # columns (calints unavailable, or the as-is escape hatch) is
     # stamped so it can never be silently mixed with the survey fits.
     fit_version = PATCHWORK_FIT_VERSION
-    if not any(str(n).startswith("pca_") for n in (regressor_names or [])):
+    if not any(str(n).startswith("pca_") for n in regressor_names):
         fit_version = f"{fit_version}-nopca"
     # v1.3: the Stage 5.5 occulted-spot scan is part of the frozen fit.
     # "scan ran and found nothing" and "scan never ran" are different
     # states and must not share a version stamp.
     if anomaly_scan is None:
         fit_version = f"{fit_version}-noscan"
+    # v1.6: a lone detector has no partner to share the geometry with,
+    # and a GP-free fit has a different noise model.
+    if n_detectors < 2:
+        fit_version = f"{fit_version}-1det"
+    if not gp:
+        fit_version = f"{fit_version}-nogp"
     summary: dict[str, Any] = {
         "instrument": instrument,
         "fit_version": fit_version,
-        "regressor_names": list(regressor_names or []),
+        "regressor_names": list(regressor_names),
         "ld_source": "exotic-ld" if ld is not None else "uniform",
         "ld_coeffs": ld,
         "t0_obs": lc["t0_obs"],
         "planet_name": priors.get("planet_name", ""),
         "program": program,
         "visit": visit,
+        "joint_fit": dict(joint_record, n_detectors=n_detectors),
+        "noise_model": {"kind": GP_KERNEL if gp else "white"},
         "spot_handling": {
             "scan_ran": anomaly_scan is not None,
             "method": ("mask" if n_spot_masked else
                        "gaussian regressor" if any(
                            str(name).startswith("spot_gauss_")
-                           for name in (regressor_names or [])) else
+                           for name in regressor_names) else
                        "none detected" if anomaly_scan is not None else None),
             "n_masked": int(n_spot_masked),
             "frac_masked": float(n_spot_masked / max(1, times.size)),
@@ -759,21 +999,42 @@ def fit_white_lightcurve(
         "n_masked_total": n_masked,
         "n_used": int(keep.sum()),
     }
-    keys = ["P_p1", "t0_p1", "p_p1", "b_p1", "a_p1",
-            f"q1_{instrument}", f"q2_{instrument}", f"sigma_w_{instrument}"]
+    # A joint fit names this detector's depth p_p1_<det>; a single-detector
+    # fit may name it either way. Report it as p_p1 regardless, so readers
+    # of white_fit_summary.json never need to know which kind of fit ran.
+    p_key = f"p_p1_{instrument}" if f"p_p1_{instrument}" in posterior else "p_p1"
+    keys = list(JOINT_SHARED_PARAMS) + [
+        f"q1_{instrument}", f"q2_{instrument}", f"sigma_w_{instrument}",
+        f"GP_sigma_{instrument}", f"GP_rho_{instrument}",
+    ]
     keys += [f"theta{i}_{instrument}" for i in range(n_reg)]
     for key in keys:
         if key in posterior:
-            samples = posterior[key]
-            med, lo, hi = np.percentile(samples, [50, 16, 84])
-            summary[key] = {"median": float(med),
-                            "minus": float(med - lo), "plus": float(hi - med)}
-    d = np.percentile(posterior["p_p1"] ** 2, [50, 16, 84]) * 1e6
+            summary[key] = _posterior_stat(posterior[key])
+    summary["p_p1"] = _posterior_stat(posterior[p_key])
+    d = np.percentile(posterior[p_key] ** 2, [50, 16, 84]) * 1e6
     summary["depth_ppm"] = {"median": float(d[0]),
                             "minus": float(d[0] - d[1]), "plus": float(d[2] - d[0])}
+    if gp:
+        summary["noise_model"].update({
+            "GP_sigma_ppm": summary[f"GP_sigma_{instrument}"]["median"] * 1e6,
+            "GP_rho_min": summary[f"GP_rho_{instrument}"]["median"] * 1440.0,
+        })
 
+    flux = lc["wl_flux"][keep]
     model = results.lc.evaluate(instrument)
-    residual = lc["wl_flux"][keep] - model
+    residual = flux - model
+    # juliet's full model is transit + linear model + GP. Without the GP
+    # the residual still holds the correlated noise -- that is the series
+    # the pre-v1.6 beta was measured on, so it is kept for comparison.
+    if gp:
+        _, components = results.lc.evaluate(instrument, return_components=True)
+        deterministic = np.asarray(components["transit"], dtype=float)
+        if "lm" in components:
+            deterministic = deterministic + np.asarray(components["lm"], dtype=float)
+        gp_component = model - deterministic
+    else:
+        gp_component = np.zeros_like(model)
     summary["residual_rms_ppm"] = float(np.nanstd(residual) * 1e6)
 
     # Stage 5.5 reads these back to scan for occulted-spot crossings
@@ -786,10 +1047,11 @@ def fit_white_lightcurve(
         index=np.flatnonzero(keep),
         n_total=np.asarray(times.size),
         time=times[keep],
-        flux=lc["wl_flux"][keep],
+        flux=flux,
         flux_err=lc["wl_err"][keep],
         model=model,
         residual=residual,
+        gp=gp_component,
         oot_mask=lc["oot_mask"][keep],
         t0_obs=np.asarray(lc["t0_obs"]),
         n_integrations_full=np.asarray(times.size),
@@ -805,7 +1067,14 @@ def fit_white_lightcurve(
     # by accident. The moment a step got masked (7 integrations per
     # event) it raised IndexError mid-fit, after the sampling was
     # already done.
+    # With the GP on, this beta is AFTER the GP, so ~1 means the noise
+    # model is adequate (the depth errors already carry the correlated
+    # noise). rednoise_before_gp is the same statistic without the GP
+    # term: how much correlated noise there was to model.
     summary["rednoise"] = rednoise_beta(residual, times[keep])
+    if gp:
+        summary["rednoise_before_gp"] = rednoise_beta(
+            residual + gp_component, times[keep])
 
     # Sanity check against the best available reference depth. Prefers a
     # published same-band (G395H) value; falls back to the archive
@@ -836,7 +1105,7 @@ def fit_white_lightcurve(
         title=figure_title(priors.get("planet_name", ""), instrument,
                            program=program, visit=visit,
                            suffix="white light"),
-        keep=keep)
+        keep=keep, model=model)
 
     with (out / "white_fit_summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
@@ -1054,16 +1323,20 @@ def plot_white_fit_series(
 
 def _plot_white_fit(results, lc, instrument: str, out: Path,
                     summary: dict[str, Any], title: str = "",
-                    keep: np.ndarray | None = None) -> None:
+                    keep: np.ndarray | None = None,
+                    model: np.ndarray | None = None) -> None:
     """Draw the fit figure (see ``plot_white_fit_series``) and save the
     plotted series so figures can be restyled without refitting.
 
     ``keep`` is the fit mask; excluded integrations are drawn greyed.
+    ``model`` is the already-evaluated full model (evaluating a GP model
+    again costs a posterior-sample loop).
     """
     keep = (np.ones(lc["time"].size, dtype=bool) if keep is None
             else np.asarray(keep, dtype=bool))
     flux = lc["wl_flux"][keep]
-    model = results.lc.evaluate(instrument)
+    if model is None:
+        model = results.lc.evaluate(instrument)
     plot_white_fit_series(
         out, summary, lc["time"][keep], flux, lc["wl_err"][keep], model,
         title=title,
@@ -1122,6 +1395,15 @@ def fit_transmission_spectrum(
         "a_p1": white_summary["a_p1"]["median"],
     }
 
+    # v1.6: a white fit with a GP passes it on. The timescale is a
+    # property of the visit's systematics, not of the channel, so it is
+    # frozen to the white posterior like the orbit; only the amplitude is
+    # free per channel.
+    gp_rho = None
+    if (white_summary.get("noise_model") or {}).get("kind") == GP_KERNEL:
+        _require_celerite()
+        gp_rho = float(white_summary[f"GP_rho_{instrument}"]["median"])
+
     use_ld = stellar is not None and white_summary.get("ld_source") == "exotic-ld"
     # Near-grazing geometry: fix (q1, q2) per channel rather than fit them.
     b_white = (white_summary.get("b_p1") or {}).get("median")
@@ -1176,6 +1458,12 @@ def fit_transmission_spectrum(
         else:
             prior_dict.update(_ld_prior_entries(instrument, ld))
         prior_dict.update(_common_instrument_priors(instrument, n_reg))
+        if gp_rho is not None:
+            prior_dict[f"GP_sigma_{instrument}"] = {
+                "distribution": "loguniform",
+                "hyperparameters": list(GP_SIGMA_BOUNDS)}
+            prior_dict[f"GP_rho_{instrument}"] = {
+                "distribution": "fixed", "hyperparameters": gp_rho}
 
         dataset = juliet.load(
             priors=prior_dict,
@@ -1183,6 +1471,8 @@ def fit_transmission_spectrum(
             y_lc={instrument: f[good]},
             yerr_lc={instrument: e[good]},
             linear_regressors_lc={instrument: regressors[good]},
+            GP_regressors_lc=({instrument: times[good]}
+                              if gp_rho is not None else None),
             out_folder=str(out / f"bin{i:03d}"),
         )
         results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
@@ -1209,6 +1499,8 @@ def fit_transmission_spectrum(
         f"regressors={','.join(white_summary.get('regressor_names', []))}, "
         f"masked_integrations={int((~keep).sum())}"
         + (f", spot_events={len(spot.get('events') or [])}" if spot else "")
+        + (f", noise={GP_KERNEL} rho={gp_rho * 1440:.1f}min"
+           if gp_rho is not None else ", noise=white")
     ))
 
     dat_path = out / "transmission_spectrum.dat"

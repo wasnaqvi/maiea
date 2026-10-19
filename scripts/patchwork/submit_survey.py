@@ -28,7 +28,8 @@ If a planet is missing, run discover first (login node, needs archive):
 Modes
 -----
 reduce (default)   STEPS=inspect,reduce  2 CPUs, per-target reduce sizing.
-fit                STEPS=fit,combine FORCE_REFIT=1  4 CPUs, fit sizing.
+fit                STEPS=fit,combine,contamination FORCE_REFIT=1  4 CPUs,
+                   fit sizing. Stage 6.5 runs at the end of every fit job.
                    Refuses per target unless Stage 3 products exist under
                    the output root. Passing the human verification
                    checklist (CAMPAIGN.md step 5: 2 Stage 3 products per
@@ -70,7 +71,7 @@ from aster_toolkit.data_reduction.survey import (  # noqa: E402
 # (steps, cpus, uses_reduce_sizing, extra_env)
 MODES = {
     "reduce": ("inspect,reduce", 2, True, ""),
-    "fit": ("fit,combine", 4, False, "FORCE_REFIT=1 "),
+    "fit": ("fit,combine,contamination", 4, False, "FORCE_REFIT=1 "),
     "contamination": ("contamination", 2, False, ""),
 }
 # Stage 6.5 is seconds of emcee on ~50 channels; no entry in SIZING.

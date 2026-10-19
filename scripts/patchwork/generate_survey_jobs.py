@@ -113,6 +113,21 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
                    "ID from GO 4126 abstract; guard catches a b/c swap"),
     "TOI_125_c":  ("3:00:00", "15:00:00", "48G", "24G", 2,
                    "ID from GO 4126 abstract; guard catches a b/c swap"),
+    # Batch 3 (reduced 2026-10-19). Fit walltimes are ~3.3x the MEASURED
+    # v1.5 elapsed (HD 15337 b 8.9 h, c 14.5 h, HIP 9618 b 10.9 h,
+    # TOI-4336 A b 8.3 h, TOI-451 c 7.6 h, d 8.5 h) because v1.6 adds a GP
+    # to the final white fit and to every channel, at a cost not yet
+    # measured on Fir. HD 15337 c is the v1.6 canary: size the rest of
+    # the survey from its sacct Elapsed, not from this guess.
+    "HD_15337_b":   ("6:00:00", "1-12:00:00", "48G", "24G", 2, "5500 ints"),
+    "HD_15337_c":   ("6:00:00", "2-00:00:00", "48G", "24G", 3,
+                     "2 visits; o019 was the per-detector t0 failure; v1.6 canary"),
+    "HIP_9618_b":   ("6:00:00", "1-12:00:00", "48G", "24G", 2, "6494 ints"),
+    "TOI_4336_A_b": ("6:00:00", "1-12:00:00", "48G", "24G", 2, "1701 ints"),
+    "TOI_451_c":    ("6:00:00", "1-12:00:00", "48G", "24G", 2,
+                     "same host as TOI-451 d; check the depths differ"),
+    "TOI_451_d":    ("6:00:00", "1-12:00:00", "48G", "24G", 2,
+                     "same host as TOI-451 c; check the depths differ"),
 }
 
 EXPECTED_DEPTH_PPM = {

@@ -2193,3 +2193,251 @@ class TestTiltTransitionMask:
         assert M.shape == (v["flux"].size, 1)
         idx = r["events"][0]["index"]
         assert M[:idx].sum() == 0 and M[idx:].all()
+
+
+# -------------------- fit v1.6: joint NRS1+NRS2 white light + GP --------------------
+
+
+def _joint_priors():
+    return {"planet_name": "Test b", "period": 5.0, "period_err": 1e-5,
+            "a_rs": 15.0, "a_rs_err": 0.5, "rp_rs": 0.03}
+
+
+class TestJointWhitePriors:
+    def test_orbit_is_shared_and_depth_is_per_detector(self):
+        import aster_toolkit.data_reduction.juliet as J
+        t = np.linspace(0.0, 0.25, 200)
+        p = J._joint_white_priors(_joint_priors(), 0.12, {
+            "NRS1": {"n_regressors": 3, "ld": None, "gp_time": t},
+            "NRS2": {"n_regressors": 2, "ld": None, "gp_time": t},
+        })
+        # One geometry for both detectors: the HD 15337 c o019 failure was
+        # two independent fits putting the same transit 77 min apart.
+        for key in J.JOINT_SHARED_PARAMS:
+            assert key in p
+            assert not any(k.startswith(key + "_") for k in p)
+        assert "p_p1" not in p
+        assert {"p_p1_NRS1", "p_p1_NRS2", "q1_NRS1", "q1_NRS2"} <= set(p)
+        assert {"theta2_NRS1", "theta1_NRS2"} <= set(p)
+        assert "theta2_NRS2" not in p   # regressor counts stay per detector
+
+    def test_gp_rho_spans_minutes_to_the_visit(self):
+        import aster_toolkit.data_reduction.juliet as J
+        t = np.linspace(0.0, 0.25, 200)
+        gp = J._gp_priors("NRS1", t)
+        lo, hi = gp["GP_rho_NRS1"]["hyperparameters"]
+        assert lo == pytest.approx(2.0 / 1440)
+        assert hi == pytest.approx(0.25)
+        assert gp["GP_sigma_NRS1"]["hyperparameters"] == J.GP_SIGMA_BOUNDS
+
+    def test_no_gp_keys_when_gp_is_off(self):
+        import aster_toolkit.data_reduction.juliet as J
+        p = J._joint_white_priors(_joint_priors(), 0.12, {
+            "NRS1": {"n_regressors": 1, "ld": None, "gp_time": None}})
+        assert not any(k.startswith("GP_") for k in p)
+
+
+def _synthetic_joint_lcs(n=400, seed=0):
+    rng = np.random.default_rng(seed)
+    t = np.linspace(-0.12, 0.12, n)
+    oot = np.abs(t) > 0.05
+    lcs = {}
+    for det, depth in (("NRS1", 900e-6), ("NRS2", 1000e-6)):
+        flux = 1.0 - depth * (~oot) + rng.normal(0, 200e-6, n)
+        lcs[det] = {"time": t, "wl_flux": flux, "wl_err": np.full(n, 200e-6),
+                    "oot_mask": oot, "t0_obs": 0.0}
+    return lcs
+
+
+class _FakeJulietResults:
+    """Stands in for a juliet results object: a posterior for the joint
+    parameter names, and evaluate() returning a box transit (+ a GP-like
+    wiggle when the fit had a GP)."""
+
+    def __init__(self, load_kwargs):
+        self.load_kwargs = load_kwargs
+        rng = np.random.default_rng(1)
+        n = 500
+        post = {}
+        for name, spec in load_kwargs["priors"].items():
+            if spec["distribution"] == "fixed":
+                continue
+            hp = spec["hyperparameters"]
+            centre = hp[0] if spec["distribution"] in ("normal", "truncatednormal") \
+                else float(np.sqrt(hp[0] * hp[1])) if spec["distribution"] == "loguniform" \
+                else 0.5 * (hp[0] + hp[1])
+            post[name] = centre + rng.normal(0, 1e-4, n)
+        post["p_p1_NRS1"] = 0.030 + rng.normal(0, 1e-4, n)
+        post["p_p1_NRS2"] = 0.0316 + rng.normal(0, 1e-4, n)
+        post["b_p1"] = 0.3 + rng.normal(0, 1e-3, n)
+        post["a_p1"] = 15.0 + rng.normal(0, 1e-2, n)
+        for d in ("NRS1", "NRS2"):
+            post[f"q1_{d}"] = 0.1 + rng.normal(0, 1e-3, n)
+            post[f"q2_{d}"] = 0.2 + rng.normal(0, 1e-3, n)
+        self.posteriors = {"posterior_samples": post}
+        outer = self
+
+        class _LC:
+            def evaluate(self, det, return_components=False):
+                t = outer.load_kwargs["t_lc"][det]
+                transit = 1.0 - (post[f"p_p1_{det}"].mean() ** 2) * (np.abs(t) < 0.05)
+                lm = np.zeros_like(t)
+                gp = (20e-6 * np.sin(t * 200)
+                      if outer.load_kwargs.get("GP_regressors_lc") else 0 * t)
+                model = transit + lm + gp
+                if return_components:
+                    return model, {"transit": transit, "lm": lm, "p1": transit}
+                return model
+        self.lc = _LC()
+
+
+class _FakeJuliet:
+    def __init__(self):
+        self.calls = []
+
+    def load(self, **kwargs):
+        self.calls.append(kwargs)
+        outer = self
+
+        class _Dataset:
+            def fit(self, **_):
+                return _FakeJulietResults(outer.calls[-1])
+        return _Dataset()
+
+
+class TestJointWhiteFitPlumbing:
+    def _run(self, monkeypatch, tmp_path, dets=("NRS1", "NRS2"), gp=True, scan=True):
+        import aster_toolkit.data_reduction.juliet as J
+        fake = _FakeJuliet()
+        monkeypatch.setattr(J, "_import_juliet", lambda: fake)
+        monkeypatch.setattr(J, "_require_celerite", lambda: None)
+        lcs = {d: v for d, v in _synthetic_joint_lcs().items() if d in dets}
+        regs = {d: np.column_stack([lcs[d]["time"], np.ones(lcs[d]["time"].size)])
+                for d in lcs}
+        names = {d: ["time", "pca_1"] for d in lcs}
+        out = J.fit_white_lightcurve_joint(
+            lcs, _joint_priors(), {d: tmp_path / d.lower() for d in lcs},
+            joint_dir=tmp_path / "joint", regressors=regs, regressor_names=names,
+            gp=gp, anomaly_scan={"contam_version": "1.1", "events": []} if scan else None,
+        )
+        return fake, out
+
+    def test_one_juliet_call_shares_the_orbit(self, monkeypatch, tmp_path):
+        fake, out = self._run(monkeypatch, tmp_path)
+        assert len(fake.calls) == 1                       # ONE joint fit
+        call = fake.calls[0]
+        assert set(call["t_lc"]) == {"NRS1", "NRS2"}
+        assert set(call["GP_regressors_lc"]) == {"NRS1", "NRS2"}
+        assert "t0_p1" in call["priors"] and "t0_p1_NRS1" not in call["priors"]
+        # Both detector summaries carry the SAME geometry, each its own depth.
+        for key in ("t0_p1", "b_p1", "a_p1"):
+            assert out["NRS1"][key] == out["NRS2"][key]
+        assert out["NRS1"]["p_p1"]["median"] == pytest.approx(0.030, abs=1e-3)
+        assert out["NRS2"]["p_p1"]["median"] == pytest.approx(0.0316, abs=1e-3)
+        assert out["NRS2"]["depth_ppm"]["median"] > out["NRS1"]["depth_ppm"]["median"]
+        assert out["NRS1"]["fit_version"] == J_VERSION()
+        assert out["NRS1"]["noise_model"]["kind"] == "celerite-matern32"
+        assert "rednoise_before_gp" in out["NRS1"]
+        assert (tmp_path / "joint" / "joint_white_fit_summary.json").is_file()
+        npz = np.load(tmp_path / "nrs2" / "white_lightcurve_residuals.npz")
+        assert "gp" in npz.files and np.ptp(npz["gp"]) > 0
+        on_disk = json.loads((tmp_path / "nrs1" / "white_fit_summary.json").read_text())
+        assert on_disk["joint_fit"]["n_detectors"] == 2
+
+    def test_stamps_mark_non_survey_fits(self, monkeypatch, tmp_path):
+        _, one = self._run(monkeypatch, tmp_path, dets=("NRS1",))
+        assert one["NRS1"]["fit_version"].endswith("-1det")
+        _, nogp = self._run(monkeypatch, tmp_path / "b", gp=False)
+        assert nogp["NRS1"]["fit_version"].endswith("-nogp")
+        assert "rednoise_before_gp" not in nogp["NRS1"]
+        _, noscan = self._run(monkeypatch, tmp_path / "c", scan=False)
+        assert "-noscan" in noscan["NRS1"]["fit_version"]
+
+    def test_channels_inherit_the_white_gp_timescale(self, monkeypatch, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        fake = _FakeJuliet()
+        monkeypatch.setattr(J, "_import_juliet", lambda: fake)
+        monkeypatch.setattr(J, "_require_celerite", lambda: None)
+        lc = _synthetic_joint_lcs()["NRS1"]
+        n = lc["time"].size
+        lc.update(wave=np.array([3.0, 3.5]), wave_err=np.array([0.01, 0.01]),
+                  sp_flux=np.column_stack([lc["wl_flux"]] * 2),
+                  sp_err=np.column_stack([lc["wl_err"]] * 2))
+        white = {"P_p1": {"median": 5.0}, "t0_p1": {"median": 0.0},
+                 "b_p1": {"median": 0.3}, "a_p1": {"median": 15.0},
+                 "ld_source": "uniform", "fit_version": J.PATCHWORK_FIT_VERSION,
+                 "noise_model": {"kind": J.GP_KERNEL},
+                 "GP_rho_NRS1": {"median": 0.01}, "regressor_names": ["time"]}
+        J.fit_transmission_spectrum(lc, white, tmp_path, instrument="NRS1",
+                                    regressors=np.ones((n, 1)))
+        assert len(fake.calls) == 2
+        for call in fake.calls:
+            assert call["priors"]["GP_rho_NRS1"] == {"distribution": "fixed",
+                                                     "hyperparameters": 0.01}
+            assert call["priors"]["GP_sigma_NRS1"]["distribution"] == "loguniform"
+            assert "NRS1" in call["GP_regressors_lc"]
+        header = (tmp_path / "transmission_spectrum.csv").read_text().splitlines()[0]
+        assert "noise=celerite-matern32" in header
+
+
+def J_VERSION():
+    from aster_toolkit.data_reduction.juliet import PATCHWORK_FIT_VERSION
+    return PATCHWORK_FIT_VERSION
+
+
+def _real_juliet_available():
+    try:
+        import aster_toolkit.data_reduction.juliet as J
+        J._import_juliet()
+        import celerite  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _real_juliet_available(),
+                    reason="needs juliet + celerite (the fit environment)")
+class TestJointWhiteFitRealJuliet:
+    """A real joint juliet fit on synthetic NRS1+NRS2 data with correlated
+    noise and opposite time slopes per detector. Recovers each injected
+    depth and ONE shared mid-transit."""
+
+    def test_recovers_depths_and_shared_t0(self, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        J._import_juliet()   # repairs the batman namespace if needed
+        from batman.transitmodel import TransitModel, TransitParams
+        rng = np.random.default_rng(3)
+        n, t0_true = 300, 0.004
+        t = np.linspace(-0.12, 0.12, n)
+        red = np.convolve(rng.normal(size=n), np.ones(15) / 15, "same") * 300e-6
+
+        def transit(rp):
+            p = TransitParams()
+            p.t0, p.per, p.rp, p.a = t0_true, 5.0, rp, 15.0
+            p.inc = float(np.degrees(np.arccos(0.3 / 15.0)))
+            p.ecc, p.w, p.limb_dark, p.u = 0.0, 90.0, "quadratic", [0.1, 0.1]
+            return TransitModel(p, t).light_curve(p)
+
+        slope = t / 0.12
+        lcs = {
+            "NRS1": transit(0.030) + 3e-4 * slope + red + rng.normal(0, 250e-6, n),
+            "NRS2": transit(0.032) - 3e-4 * slope + 0.8 * red + rng.normal(0, 350e-6, n),
+        }
+        lcs = {d: {"time": t, "wl_flux": f,
+                   "wl_err": np.full(n, 250e-6 if d == "NRS1" else 350e-6),
+                   "oot_mask": np.abs(t) > 0.05, "t0_obs": 0.0}
+               for d, f in lcs.items()}
+        priors = dict(_joint_priors(), a_rs_err=0.7)
+        out = J.fit_white_lightcurve_joint(
+            lcs, priors, {d: tmp_path / d.lower() for d in lcs},
+            joint_dir=tmp_path / "joint",
+            regressors={d: slope[:, None] for d in lcs},
+            regressor_names={d: ["time"] for d in lcs},
+            gp=True, n_live=100, anomaly_scan={"events": []},
+        )
+        t0 = out["NRS1"]["t0_p1"]
+        assert out["NRS2"]["t0_p1"] == t0
+        assert abs(t0["median"] - t0_true) < 4 * max(t0["plus"], t0["minus"]) + 1e-4
+        for det, rp in (("NRS1", 0.030), ("NRS2", 0.032)):
+            p = out[det]["p_p1"]
+            assert abs(p["median"] - rp) < 4 * max(p["plus"], p["minus"])

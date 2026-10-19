@@ -9,3 +9,6 @@ taurex_ultranest
 # Stage 6.5 unocculted-spot retrieval (contamination.py). Stage 5.5 is
 # pure numpy, so the fit step does not need this.
 emcee
+# Fit v1.6 red-noise GP (juliet's celerite Matern-3/2). The fit step
+# refuses to start without it.
+celerite

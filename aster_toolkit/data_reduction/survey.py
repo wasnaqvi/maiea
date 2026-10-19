@@ -85,10 +85,11 @@ from .juliet import (
     detector_offset_ppm,
     fetch_transit_priors,
     fit_transmission_spectrum,
-    fit_white_lightcurve,
+    fit_white_lightcurve_joint,
     prepare_visit_fit_inputs,
     write_spectrum_csv,
     _plot_combined,
+    _require_celerite,
 )
 from .contamination import (
     PATCHWORK_CONTAM_VERSION,
@@ -422,15 +423,20 @@ def run_patchwork_target(
                 "fit properly, or use a fresh output_root."
             )
 
+        # v1.6 needs celerite for the GP. Check before any sampling, not
+        # after pass 1 has already spent its walltime.
+        _require_celerite()
+
         for vname in visit_dirs:
-            # -- pass 1: unmasked white fits, one per detector ----------
+            # -- pass 1: one unmasked joint white fit --------------------
             # The Stage 5.5 spot scan needs a clean transit model to
             # subtract, and it needs BOTH detectors before it can confirm
             # anything (a bump in one detector alone is instrumental).
-            # So every detector is fitted once unmasked, then scanned
-            # together, then refitted with the mask.
+            # So the detectors are fitted once unmasked, then scanned
+            # together, then refitted with the corrections. Since v1.6
+            # both fits are joint, so the scan never subtracts a transit
+            # whose timing one detector got wrong on its own.
             preps: dict[str, dict[str, Any]] = {}
-            pass1: dict[str, dict[str, Any]] = {}
             for det in detectors:
                 det_dir = root / "reductions" / vname / det.lower()
                 products = [
@@ -443,7 +449,7 @@ def run_patchwork_target(
                 if len(products) > 1:
                     log(f"[{slug}] {vname} {det}: {len(products)} Stage 3 "
                         f"products found; using {products[0]}")
-                log(f"[{slug}] fitting {vname} {det} white light (pass 1)...")
+                log(f"[{slug}] preparing {vname} {det} lightcurves...")
                 prep = prepare_visit_fit_inputs(
                     products[0], planet,
                     instrument=det, reduction_dir=str(det_dir),
@@ -456,17 +462,6 @@ def run_patchwork_target(
                     resolution=resolution,
                 )
                 preps[det] = prep
-                pass1[det] = fit_white_lightcurve(
-                    prep["lc"], prep["priors"],
-                    root / "fits" / vname / det.lower() / "pass1",
-                    instrument=det, program=program, visit=vname,
-                    regressors=prep["regressors"],
-                    regressor_names=prep["regressor_names"],
-                    ld=prep["ld"],
-                    keep_mask=prep["tilt_keep_mask"],
-                    tilt_report=prep["tilt_report"],
-                    n_tilt_masked=prep["n_tilt_masked"],
-                )
                 tr = prep["tilt_report"] or {}
                 if tr.get("events"):
                     log(f"[{slug}] {vname} {det}: {len(tr['events'])} tilt "
@@ -481,6 +476,27 @@ def run_patchwork_target(
                     log(f"[{slug}] {vname} {det}: WARNING {tr['rate_warning']}")
             if not preps:
                 continue
+
+            # v1.6: ONE white fit for both detectors (shared orbit), no
+            # GP in pass 1 -- a GP would soak up the very bumps the
+            # Stage 5.5 scan has to find in these residuals.
+            log(f"[{slug}] fitting {vname} white light, pass 1 "
+                f"({'+'.join(preps)} joint, no GP)...")
+            pass1 = fit_white_lightcurve_joint(
+                {det: p["lc"] for det, p in preps.items()},
+                next(iter(preps.values()))["priors"],
+                {det: root / "fits" / vname / det.lower() / "pass1"
+                 for det in preps},
+                joint_dir=root / "fits" / vname / "joint" / "pass1",
+                regressors={det: p["regressors"] for det, p in preps.items()},
+                regressor_names={det: p["regressor_names"]
+                                 for det, p in preps.items()},
+                ld={det: p["ld"] for det, p in preps.items()},
+                keep_masks={det: p["tilt_keep_mask"] for det, p in preps.items()},
+                gp=False, program=program, visit=vname,
+                tilt_reports={det: p["tilt_report"] for det, p in preps.items()},
+                n_tilt_masked={det: p["n_tilt_masked"] for det, p in preps.items()},
+            )
 
             # -- Stage 5.5: scan pass-1 residuals, cross-confirm --------
             anomaly_dir = root / "fits" / vname / "anomalies"
@@ -557,9 +573,11 @@ def run_patchwork_target(
                 "report": str(anomaly_dir / "anomaly_report.json"),
             }
 
-            # -- pass 2: masked white refit + spectroscopic channels ----
+            # -- pass 2: corrected joint white refit (+ GP), channels ----
+            # Build every detector's corrections first: the refit is one
+            # joint fit, so it needs all of them at once.
+            p2: dict[str, dict[str, Any]] = {}
             for det, prep in preps.items():
-                fit_dir = root / "fits" / vname / det.lower()
                 keep = masks[det]
                 # A step confirmed by the Stage 5.5 scan but missed by
                 # the Stage 4 trace search would otherwise be corrected
@@ -602,32 +620,45 @@ def run_patchwork_target(
                                     f"{e['peak_sigma']:.1f} sigma, "
                                     f"width {e.get('width_ints', 0):.0f} ints)"
                                     for e in scan_steps))
-                n_masked = int((~keep).sum())
                 fit_tilt_report = dict(prep["tilt_report"] or {})
                 fit_tilt_report["events"] = (
                     list(fit_tilt_report.get("events") or []) + scan_steps
                 )
-                log(f"[{slug}] fitting {vname} {det} white light "
-                    f"(pass 2, {n_masked} integration(s) masked)...")
-                white = fit_white_lightcurve(
-                    prep["lc"], prep["priors"], fit_dir,
-                    instrument=det,
-                    program=program, visit=vname,
-                    regressors=regressors,
-                    regressor_names=regressor_names,
-                    ld=prep["ld"],
-                    keep_mask=keep,
-                    anomaly_scan=scan_payload,
-                    tilt_report=fit_tilt_report,
-                    n_spot_masked=0,
-                    n_tilt_masked=n_masked,
-                )
+                p2[det] = {"keep": keep, "regressors": regressors,
+                           "regressor_names": regressor_names,
+                           "scan_steps": scan_steps, "spot_meta": spot_meta,
+                           "n_masked": int((~keep).sum()),
+                           "tilt_report": fit_tilt_report}
+
+            log(f"[{slug}] fitting {vname} white light, pass 2 "
+                f"({'+'.join(preps)} joint, GP; masked "
+                + ", ".join(f"{d} {p2[d]['n_masked']}" for d in p2) + ")...")
+            whites = fit_white_lightcurve_joint(
+                {det: p["lc"] for det, p in preps.items()},
+                next(iter(preps.values()))["priors"],
+                {det: root / "fits" / vname / det.lower() for det in preps},
+                joint_dir=root / "fits" / vname / "joint",
+                regressors={det: p2[det]["regressors"] for det in preps},
+                regressor_names={det: p2[det]["regressor_names"] for det in preps},
+                ld={det: p["ld"] for det, p in preps.items()},
+                keep_masks={det: p2[det]["keep"] for det in preps},
+                gp=True, program=program, visit=vname,
+                anomaly_scan=scan_payload,
+                tilt_reports={det: p2[det]["tilt_report"] for det in preps},
+                n_spot_masked={det: 0 for det in preps},
+                n_tilt_masked={det: p2[det]["n_masked"] for det in preps},
+            )
+
+            for det, prep in preps.items():
+                fit_dir = root / "fits" / vname / det.lower()
+                white = whites[det]
+                keep, n_masked = p2[det]["keep"], p2[det]["n_masked"]
                 log(f"[{slug}] fitting {vname} {det} spectroscopic channels...")
                 spec = fit_transmission_spectrum(
                     prep["lc"], white, fit_dir / "spectro",
                     instrument=det,
                     program=program, visit=vname,
-                    regressors=regressors,
+                    regressors=p2[det]["regressors"],
                     stellar=stellar,
                     keep_mask=keep,
                 )
@@ -636,15 +667,21 @@ def run_patchwork_target(
                     "white_depth_ppm_pass1": pass1[det]["depth_ppm"],
                     "white_rms_ppm": white["residual_rms_ppm"],
                     "fit_version": white["fit_version"],
+                    "joint_fit": white.get("joint_fit"),
+                    "noise_model": white.get("noise_model"),
+                    "t0_p1": white.get("t0_p1"),
+                    "b_p1": white.get("b_p1"),
+                    "a_p1": white.get("a_p1"),
                     "tilt_events": len(prep["tilt_events"]),
-                    "scan_steps_corrected": scan_steps,
-                    "spot_crossings_modelled": spot_meta,
+                    "scan_steps_corrected": p2[det]["scan_steps"],
+                    "spot_crossings_modelled": p2[det]["spot_meta"],
                     "tilt_handling": white.get("tilt_handling"),
                     "spot_handling": white.get("spot_handling"),
                     "ld_source": white["ld_source"],
                     "priors_source": prep["priors_source"],
                     "priors_override_used": prep.get("priors_override_used"),
                     "rednoise": white.get("rednoise"),
+                    "rednoise_before_gp": white.get("rednoise_before_gp"),
                     "rednoise_pass1": pass1[det].get("rednoise"),
                     "depth_check": white.get("depth_check"),
                     "n_channels": spec["n_bins"],
@@ -663,19 +700,21 @@ def run_patchwork_target(
                     log(f"[{slug}] {vname} {det}: depth "
                         f"{dc['difference_frac'] * 100:+.1f}% from the optical "
                         "archive value (different band — indicative only).")
-                # Masking is only worth its integrations if it actually
-                # improves the noise. Record the comparison so a target
-                # where it did not can be spotted without a rerun.
-                if n_masked:
-                    b1 = (pass1[det].get("rednoise") or {}).get("beta_median")
-                    b2 = (white.get("rednoise") or {}).get("beta_median")
-                    d1 = pass1[det]["depth_ppm"]["median"]
-                    d2 = white["depth_ppm"]["median"]
-                    log(f"[{slug}] {vname} {det}: masking moved the depth "
-                        f"{d2 - d1:+.0f} ppm and beta {b1:.2f} -> {b2:.2f}."
-                        if b1 and b2 else
-                        f"[{slug}] {vname} {det}: masking moved the depth "
-                        f"{d2 - d1:+.0f} ppm.")
+                # Corrections are only worth their integrations if they
+                # actually improve the noise. Record the comparison so a
+                # target where they did not can be spotted without a
+                # rerun. Compare like with like: pass 1 has no GP, so its
+                # beta is set against pass 2's beta BEFORE the GP term.
+                b1 = (pass1[det].get("rednoise") or {}).get("beta_median")
+                b2 = ((white.get("rednoise_before_gp") or white.get("rednoise")
+                       or {}).get("beta_median"))
+                bgp = (white.get("rednoise") or {}).get("beta_median")
+                d1 = pass1[det]["depth_ppm"]["median"]
+                d2 = white["depth_ppm"]["median"]
+                log(f"[{slug}] {vname} {det}: pass 2 moved the depth "
+                    f"{d2 - d1:+.0f} ppm"
+                    + (f"; beta {b1:.2f} -> {b2:.2f} (after GP {bgp:.2f})"
+                       if b1 and b2 and bgp else "") + ".")
 
     # -- combine ------------------------------------------------------
     if "combine" in steps:
@@ -718,8 +757,10 @@ def run_patchwork_target(
         # Per-visit NRS1-NRS2 white-light t0 offset. COMPASS reports
         # statistically significant transit-time offsets between the two
         # detectors on some targets; record it as a survey health metric.
+        # A v1.6 joint fit has ONE t0 by construction, so the offset is not
+        # measured there and is recorded as shared rather than as a fake 0.
         for vname in visit_dirs:
-            t0s = {}
+            t0s, joint = {}, False
             for det in ("NRS1", "NRS2"):
                 ws = root / "fits" / vname / det.lower() / "white_fit_summary.json"
                 if ws.is_file():
@@ -727,7 +768,12 @@ def run_patchwork_target(
                         w = json.load(fh)
                     if "t0_p1" in w:
                         t0s[det] = w["t0_p1"]["median"]
-            if len(t0s) == 2:
+                    joint = joint or (w.get("joint_fit") or {}).get("n_detectors", 1) > 1
+            if joint:
+                visit_rec = summary["visits"].setdefault(vname, {})
+                visit_rec.pop("nrs1_nrs2_t0_offset_s", None)
+                visit_rec["t0_shared_across_detectors"] = True
+            elif len(t0s) == 2:
                 summary["visits"].setdefault(vname, {})[
                     "nrs1_nrs2_t0_offset_s"
                 ] = (t0s["NRS1"] - t0s["NRS2"]) * 86400.0

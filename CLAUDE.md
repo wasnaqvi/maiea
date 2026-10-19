@@ -322,7 +322,7 @@ and never mix old and new products in one analysis.
 |---|---|---|
 | `PATCHWORK_CONFIG_VERSION` | 1.1 | `exotedrf.py` |
 | `PATCHWORK_STAGE4_VERSION` | 1.3 | `lightcurves.py` |
-| `PATCHWORK_FIT_VERSION` | 1.5 | `juliet.py` |
+| `PATCHWORK_FIT_VERSION` | 1.6 | `juliet.py` |
 | `PATCHWORK_CONTAM_VERSION` | 1.1 | `contamination.py` |
 | `PATCHWORK_OPTIMIZER_VERSION` | 1.0 | `optimize.py` |
 | `DEFAULT_RESOLUTION` | 100 | `lightcurves.py` |
@@ -351,6 +351,29 @@ larger). Below 0.80, v1.5 runs the v1.4 code path, so v1.4 fits there were
 in its summary and `v1.5 (restamped from v1.4)` in its CSV/DAT headers,
 and it counts as a survey fit. A v1.4 fit with b > 0.80 is not uniform
 and must be refit; the script refuses those targets whole.
+
+Fit **v1.6** (2026-10-20) changes the model, so **every target is refit**
+— nothing restamps to 1.6 (`restamp_fit_version.py` now refuses to run).
+Two changes:
+- **Joint NRS1+NRS2 white light** (`fit_white_lightcurve_joint`): one
+  juliet fit per visit with P, t0, a/Rs, b shared (`JOINT_SHARED_PARAMS`)
+  and depth `p_p1_NRS1`/`p_p1_NRS2`, limb darkening, jitter, baseline and
+  regressors per detector. Fitted separately, HD 15337 c o019 put the two
+  mid-transits 77 min apart (NRS2 caught ingress, missed egress, faked the
+  recovery with its time slope). Each detector still gets its own
+  `white_fit_summary.json` with its depth as `p_p1`; the joint products
+  are in `fits/<visit>/joint/`. One t0 means `nrs1_nrs2_t0_offset_s` is
+  no longer measured (`t0_shared_across_detectors: true` instead).
+- **GP red noise**: celerite Matern-3/2 in time per detector on the final
+  white fit and every channel (channels fit `GP_sigma`, `GP_rho` frozen to
+  the white posterior like the orbit). Pass 1, which feeds the Stage 5.5
+  scan, stays GP-free on purpose — a GP would absorb the spot bumps the
+  scan must find. `rednoise` is now measured after the GP (~1 = adequate
+  noise model); `rednoise_before_gp` is the pre-v1.6-comparable beta.
+  celerite is required; the fit step refuses to start without it.
+
+New stamps: `-1det` (only one detector had Stage 3 products) and `-nogp`.
+Neither is a survey fit.
 
 `-nopca` now carries a second meaning worth knowing: no PCA components
 means no Stage 2 calints, which means no trace diagnostics, which means
@@ -527,6 +550,10 @@ band — that is the prior-returning fit, and it is bandpass-independent.
 - **`scripts/patchwork/generate_survey_jobs.py`** — writes sized sbatch
   scripts and prints the submission plan. **Single source of truth for
   walltime and memory; never hand-write them.**
+- **`scripts/patchwork/gate_fits.py`** — the after-fit checklist as a
+  script (version, joint geometry, GP, betas, depth check, tilts, spots,
+  Stage 6.5). Exit 1 on any STOP-level failure. Run it on the output
+  root after every fit wave.
 - `scripts/patchwork/patchwork_gj9827d.py` — a single-target, as-is
   baseline script. Do NOT generalize it to other targets; the toolkit is
   the target-agnostic path and has the guards.
@@ -537,7 +564,8 @@ band — that is the prior-returning fit, and it is bandpass-independent.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/scripts/test_data_reduction.py -q
 ```
 
-184 tests, no network and no exoTEDRF/juliet environment required. They
+191 tests, no network and no exoTEDRF environment required (one v1.6
+joint-fit test runs real juliet + celerite and skips without them). They
 cover the transit-in-window and force-refit guards, MJD→BJD conversion,
 constant-R binning, tilt detection (including that a real transit is not
 flagged), planet resolution, staging deduplication, the frozen-config

@@ -220,25 +220,32 @@ After REDUCE:
 - [ ] `exotedrf.path` in the reduction manifest = `~/exoTEDRF` for
       EVERY target (one tree for the whole survey)
 
-After FIT:
+After FIT (`python scripts/patchwork/gate_fits.py ~/scratch/patchwork` checks
+most of this list and exits 1 on a STOP):
 - [ ] transit coverage ~100% (log line, seconds into the fit)
 - [ ] `depth_check.status` is `ok` or `indicative` — **not** `suspect`.
       `indicative` just means the only reference was the optical archive
       value; check `depth_check.band` before reacting to a % offset
-- [ ] `fit_version` is exactly `1.5` — earlier versions do not include the
-      grazing-transit (b > 0.80) per-channel limb-darkening fix, so such a
-      fit is NOT uniform with the survey. A `1.5` fit with a `fit_restamps`
-      record in `patchwork_summary.json` is a v1.4 fit with every b <= 0.80,
-      where v1.5 runs identical code; it counts. A v1.4 fit above 0.80 is
-      refit, never restamped (`restamp_fit_version.py` refuses it)
+- [ ] `fit_version` is exactly `1.6` — no suffix. `-1det` (one detector
+      only), `-nogp`, `-noscan`, `-nopca` are not survey fits. Every v1.5
+      (and restamped v1.5) fit is superseded: v1.6 is a joint NRS1+NRS2
+      white fit with a GP, so it changes every number and is never restamped
+- [ ] `joint_fit.n_detectors: 2`, and `t0_p1` / `b_p1` / `a_p1` identical
+      in the NRS1 and NRS2 summaries (they are one shared parameter)
+- [ ] `noise_model.kind: celerite-matern32`; `GP_rho_min` a few minutes to
+      a few hours. A rho railing at the visit span means the GP is doing
+      the baseline's job — look at the white figure
 - [ ] `median_depth_err_ppm` << depth (tens of ppm, not ~1500)
-- [ ] white rms hundreds of ppm; record `rednoise.beta_median`. Treat
-      beta > 3 as a survey-quality flag and sensitivity test, not an automatic
-      per-channel error multiplier (doing so over-inflates these spectra)
+- [ ] white rms hundreds of ppm; record `rednoise.beta_median` (after the
+      GP — should now sit near 1) and `rednoise_before_gp.beta_median` (the
+      v1.5-comparable number: how much correlated noise the GP took). A
+      post-GP beta still > ~1.5 means structure the GP cannot describe
+      (a missed step, a spot crossing) — read the residual panel
 - [ ] `ld_source: "exotic-ld"`, `priors_source: "archive"` (cache
       fallback means the node was offline — fine, but note it)
 - [ ] ~29 (NRS1) + ~24 (NRS2) channels at R=100;
-      `nrs1_nrs2_offset_ppm` small; `nrs1_nrs2_t0_offset_s` recorded
+      `nrs1_nrs2_offset_ppm` small (`nrs1_nrs2_t0_offset_s` is no longer
+      measured: v1.6 fits one t0, recorded as `t0_shared_across_detectors`)
 
 Tilt events (`tilt_handling` in `white_fit_summary.json`):
 - [ ] `searched_diagnostics: true`. If false the search saw flux only
