@@ -201,3 +201,54 @@ def test_restamp_leaves_native_v15_grazing_fit_alone(tmp_path):
     fit.update(ld_fixed_per_channel=True, impact_parameter=0.94)
     (target / "patchwork_summary.json").write_text(json.dumps(summary))
     assert plan_target(target)["status"] == "current"
+
+
+def _white_summary(**over):
+    s = {"instrument": "NRS1", "t0_obs": 100.0 - 50 / 1440,
+         "P_p1": {"median": 5.0}, "t0_p1": {"median": 100.0},
+         "p_p1": {"median": 0.03}, "b_p1": {"median": 0.3},
+         "a_p1": {"median": 20.0}, "q1_NRS1": {"median": 0.1},
+         "q2_NRS1": {"median": 0.2}, "depth_ppm": {"median": 900.0},
+         "rednoise": {"beta_median": 1.4}, "regressor_names": ["time"],
+         "planet_name": "Test b", "visit": "o001"}
+    s.update(over)
+    return s
+
+
+def test_transit_only_model_is_the_bare_transit():
+    pytest.importorskip("batman.transitmodel")
+    from aster_toolkit.data_reduction.juliet import transit_only_model
+    t = np.linspace(99.8, 100.2, 2000)
+    transit = transit_only_model(_white_summary(), t)
+    assert transit[0] == pytest.approx(1.0) and transit[-1] == pytest.approx(1.0)
+    # Limb darkening deepens the centre past p^2 = 900 ppm, not by much.
+    assert 900 < (1 - transit.min()) * 1e6 < 1100
+    assert t[np.argmin(transit)] == pytest.approx(100.0, abs=1e-3)
+
+
+def test_white_fit_figure_removes_systematics(tmp_path, monkeypatch):
+    pytest.importorskip("batman.transitmodel")
+    pytest.importorskip("matplotlib")
+    from aster_toolkit.data_reduction import juliet
+    s = _white_summary()
+    t = np.linspace(99.85, 100.15, 1500)
+    transit = juliet.transit_only_model(s, t)
+    rng = np.random.default_rng(1)
+    jitter = 300e-6 * rng.standard_normal(t.size)   # a ragged regressor
+    model = transit + 2e-3 * (t - 100.0) + jitter
+    flux = model + 100e-6 * rng.standard_normal(t.size)
+    drawn = []
+    real_bin = juliet._bin_series
+
+    def capture(x, y, **kwargs):  # the figure bins exactly what it draws
+        drawn.append(np.asarray(y))
+        return real_bin(x, y, **kwargs)
+
+    monkeypatch.setattr(juliet, "_bin_series", capture)
+    path = juliet.plot_white_fit_series(tmp_path, s, t, flux, np.full(t.size, 1e-4), model)
+    assert Path(path).is_file() and (tmp_path / "white_lightcurve_fit.svg").is_file()
+    corrected, residual = drawn[0], drawn[1]
+    # Drawn data = transit + residual: no trend, no regressor jitter left.
+    np.testing.assert_allclose(corrected, transit + (flux - model))
+    np.testing.assert_allclose(residual, (flux - model) * 1e6)
+    assert np.std(corrected - transit) < 150e-6

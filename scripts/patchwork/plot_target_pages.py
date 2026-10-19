@@ -4,9 +4,10 @@
 Everything that decides whether a target is trustworthy on a single
 page, rather than spread over five pages of a merged figure book.
 
-  * white lightcurves per visit x detector, offset, with binned points
-    over the integrations so the transit shape is readable at a glance
-    and the fitted model on top;
+  * white lightcurves per visit x detector, offset, systematics removed
+    (fitted transit + residuals), with binned points over the
+    integrations so the transit shape is readable at a glance and the
+    transit model alone on top;
   * residuals, offset the same way and labelled with rms and beta --
     this is where a spot crossing, a tilt step or a mis-fit contact
     actually shows, so it gets its own vertical space per series rather
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from aster_toolkit.data_reduction.juliet import (  # noqa: E402
     _PLOT_STYLE, BINNED_COLOR, DATA_COLOR, GAP_COLOR, MEAN_COLOR,
     MODEL_COLOR, NRS2_COLOR, figure_title, read_spectrum_csv,
+    transit_only_model,
 )
 
 DET_COLOR = {"nrs1": DATA_COLOR, "nrs2": NRS2_COLOR}
@@ -62,11 +64,23 @@ def target_data(tdir: Path) -> dict:
         d = np.load(npz)
         js = Path(npz).with_name("white_fit_summary.json")
         s = json.load(js.open()) if js.exists() else {}
+        t = np.asarray(d["time"], float)
+        flux = np.asarray(d["flux"], float)
+        model = np.asarray(d["model"], float)
+        # Draw the transit alone over flux with the systematics removed
+        # (transit + residual); the full model jitters with every
+        # regressor and hides the transit. Raw flux/model only when the
+        # summary lacks the posterior to rebuild the transit.
+        try:
+            transit = transit_only_model(s, t)
+            flux, model = transit + (flux - model), transit
+        except (KeyError, TypeError, ValueError):
+            pass
         out["visits"].append({
             "visit": parts[-3], "det": parts[-2],
-            "t": np.asarray(d["time"], float),
-            "flux": np.asarray(d["flux"], float),
-            "model": np.asarray(d["model"], float),
+            "t": t,
+            "flux": flux,
+            "model": model,
             "resid": np.asarray(d["residual"], float),
             "index": np.asarray(d["index"], int) if "index" in d
                      else np.arange(len(d["time"])),
@@ -216,7 +230,7 @@ def draw(name: str, data: dict, pdf_dir: Path, svg_dir: Path, pdf=None):
             ax_lc.plot([], [], ls=":", color=STEP_COLOR, label="fitted step")
         ax_lc.plot([], [], "o", ms=3, color=BINNED_COLOR,
                    label="visits combined")
-        ax_lc.plot([], [], "-", color=MODEL_COLOR, label="fitted model")
+        ax_lc.plot([], [], "-", color=MODEL_COLOR, label="transit model")
         ax_lc.legend(loc="upper center", bbox_to_anchor=(0.5, 1.02),
                      fontsize=8.5, ncol=3)
 

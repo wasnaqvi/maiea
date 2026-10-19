@@ -832,11 +832,10 @@ def fit_white_lightcurve(
               "problem in itself.")
 
     _plot_white_fit(
-        results, lc, instrument, out,
+        results, lc, instrument, out, summary,
         title=figure_title(priors.get("planet_name", ""), instrument,
                            program=program, visit=visit,
                            suffix="white light"),
-        depth_ppm=summary["depth_ppm"]["median"],
         keep=keep)
 
     with (out / "white_fit_summary.json").open("w") as handle:
@@ -903,73 +902,138 @@ def _savefig(fig, out: Path, stem: str) -> str:
     return str(out / f"{stem}.pdf")
 
 
-def _plot_white_fit(results, lc, instrument: str, out: Path,
-                    title: str = "", depth_ppm: float | None = None,
-                    keep: np.ndarray | None = None) -> None:
-    """White-light fit figure, formatted for circulation.
+def transit_only_model(summary: dict[str, Any], time: np.ndarray,
+                       instrument: str | None = None) -> np.ndarray:
+    """The fitted transit alone, from the white-fit posterior medians.
 
-    ``depth_ppm`` is the transit depth from the posterior (median of
-    p^2). Pass it — do NOT infer the depth from ``min(model)``, which
-    also contains the linear-systematics trend and any tilt-step
-    offsets. On a visit with strong systematics the two disagree badly
-    (TOI-270 c: 7249 ppm from the model minimum vs 5230 ppm from the
-    posterior), and the figure would misreport the measurement.
+    juliet's full model is the transit plus a linear model in every
+    regressor (time, trace x/y/FWHM, PCA). Those regressors jitter from
+    integration to integration, so the full model drawn over the data is
+    a ragged band, not a transit -- which hides whether the TRANSIT was
+    fitted at all. This is the batman light curve juliet evaluates
+    inside that model (quadratic law, Kipping q1/q2, circular orbit),
+    normalised to 1 out of transit.
+    """
+    from batman.transitmodel import TransitModel, TransitParams
 
-    ``keep`` is the Stage 5.5 anomaly mask. Masked integrations are
-    still drawn, greyed out, because a figure that silently omits them
-    hides the very thing the mask was applied for.
+    inst = instrument or summary.get("instrument", "")
+    med = lambda key: float(summary[key]["median"])  # noqa: E731
+    q1, q2 = med(f"q1_{inst}"), med(f"q2_{inst}")
+    params = TransitParams()
+    params.t0, params.per = med("t0_p1"), med("P_p1")
+    params.rp, params.a = med("p_p1"), med("a_p1")
+    params.inc = float(np.degrees(np.arccos(med("b_p1") / med("a_p1"))))
+    params.ecc, params.w = 0.0, 90.0
+    params.limb_dark = "quadratic"
+    params.u = [2 * np.sqrt(q1) * q2, np.sqrt(q1) * (1 - 2 * q2)]
+    time = np.asarray(time, dtype=float)
+    return TransitModel(params, time).light_curve(params)
+
+
+def plot_white_fit_series(
+    out: Path,
+    summary: dict[str, Any],
+    time: np.ndarray,
+    flux: np.ndarray,
+    flux_err: np.ndarray,
+    model: np.ndarray,
+    *,
+    title: str = "",
+    excluded_time: np.ndarray | None = None,
+    excluded_flux: np.ndarray | None = None,
+) -> str:
+    """White-light fit figure: systematics removed, transit model alone.
+
+    The data are drawn as ``flux - (model - transit)``, i.e. the fitted
+    transit plus the residuals, with the transit as one smooth curve.
+    The residual panel is unchanged by this (it is ``flux - model``
+    either way), so nothing the fit got wrong is hidden. Time is centred
+    on the FITTED mid-transit. When the ephemeris prediction sits more
+    than 5 min away, it is marked, because a large offset is exactly the
+    situation in which the t0 prior fights the data.
+
+    The annotated depth is the posterior median of p^2, never
+    ``1 - min(model)``: the latter contains the systematics too
+    (TOI-270 c: 7249 vs 5230 ppm).
+
+    ``excluded_*`` are integrations dropped at fitted step transitions.
+    They are drawn greyed, corrected by the systematics model
+    interpolated from their neighbours, so the figure does not silently
+    hide them.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.patheffects as pe
 
-    with plt.rc_context(_PLOT_STYLE):
-        keep = (np.ones(lc["time"].size, dtype=bool) if keep is None
-                else np.asarray(keep, dtype=bool))
-        t_hr_all = (lc["time"] - lc["t0_obs"]) * 24
-        t_hr = t_hr_all[keep]
-        flux = lc["wl_flux"][keep]
-        model = results.lc.evaluate(instrument)
-        residual = flux - model
-        rms = float(np.nanstd(residual) * 1e6)
-        if depth_ppm is None:  # fallback only; see docstring
-            depth_ppm = (1.0 - float(np.nanmin(model))) * 1e6
+    time = np.asarray(time, float)
+    flux, flux_err = np.asarray(flux, float), np.asarray(flux_err, float)
+    model = np.asarray(model, float)
+    transit = transit_only_model(summary, time)
+    systematics = model - transit
+    corrected = flux - systematics
+    residual = flux - model
+    rms = float(np.nanstd(residual) * 1e6)
+    depth_ppm = float(summary["depth_ppm"]["median"])
+    beta = (summary.get("rednoise") or {}).get("beta_median")
+    t0_fit = float(summary["t0_p1"]["median"])
+    t_hr = (time - t0_fit) * 24
+    order = np.argsort(time)
+    grid = np.linspace(time.min(), time.max(), 3000)
+    grid_hr = (grid - t0_fit) * 24
+    smooth = transit_only_model(summary, grid)
 
+    with plt.rc_context(_PLOT_STYLE):
         fig, (a1, a2) = plt.subplots(2, 1, figsize=(10.0, 6.4), sharex=True,
                                      height_ratios=[3, 1])
-        # Per-integration errors, drawn as a separate faint layer under
-        # more opaque markers. One errorbar() call with a single alpha
-        # either buries the binned series (bars too strong) or hides the
-        # uncertainties (markers too weak); splitting them shows the
-        # scatter is consistent with the quoted error without mush.
-        if not keep.all():
-            a1.plot(t_hr_all[~keep], lc["wl_flux"][~keep], "x", ms=3.6,
-                    color=GAP_COLOR, alpha=0.9, zorder=1,
+        if excluded_time is not None and len(excluded_time):
+            ex_t = np.asarray(excluded_time, float)
+            ex_sys = np.interp(ex_t, time[order], systematics[order])
+            a1.plot((ex_t - t0_fit) * 24, np.asarray(excluded_flux) - ex_sys,
+                    "x", ms=3.6, color=GAP_COLOR, alpha=0.9, zorder=1,
                     label="excluded transition")
-        a1.errorbar(t_hr, flux, yerr=lc["wl_err"][keep], fmt="none",
+        # Per-integration errors as a faint layer under more opaque
+        # markers: one alpha either buries the binned series or hides the
+        # uncertainties.
+        a1.errorbar(t_hr, corrected, yerr=flux_err, fmt="none",
                     ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
                     alpha=0.18, zorder=1)
-        a1.plot(t_hr, flux, "o", ms=2.4, mew=0, color=DATA_COLOR, alpha=0.38,
-                zorder=2, label="integrations")
-        bx, by, be = _bin_series(t_hr, flux)
+        a1.plot(t_hr, corrected, "o", ms=2.4, mew=0, color=DATA_COLOR,
+                alpha=0.38, zorder=2, label="integrations, systematics removed")
+        bx, by, be = _bin_series(t_hr, corrected)
         a1.errorbar(bx, by, yerr=be, fmt="o", ms=5.0, mew=0,
                     color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.2,
                     capsize=0, alpha=0.95, zorder=3, label="binned")
-        a1.plot(t_hr, model, color=MODEL_COLOR, lw=2.6, zorder=4,
-                solid_capstyle="round", label="juliet transit model",
+        a1.plot(grid_hr, smooth, color=MODEL_COLOR, lw=2.6, zorder=4,
+                solid_capstyle="round", label="transit model",
                 path_effects=[pe.Stroke(linewidth=4.6, foreground="white"),
                               pe.Normal()])
+        t0_obs = summary.get("t0_obs")
+        if t0_obs is not None:
+            offset_min = (float(t0_obs) - t0_fit) * 1440
+            if abs(offset_min) > 5:
+                for ax in (a1, a2):
+                    ax.axvline(offset_min / 60, ls="--", lw=1.1,
+                               color=MEAN_COLOR, zorder=0)
+                a1.plot([], [], ls="--", lw=1.1, color=MEAN_COLOR,
+                        label=f"ephemeris mid-transit ({offset_min:+.0f} min)")
         a1.set_ylabel("Relative flux")
-        a1.set_title(title or f"JWST NIRSpec/G395H {instrument} white light",
-                     pad=12)
-        a1.legend(loc="lower left", ncol=3, columnspacing=1.4,
+        a1.set_title(title or figure_title(
+            summary.get("planet_name", ""), summary.get("instrument", ""),
+            program=summary.get("program", ""), visit=summary.get("visit", ""),
+            suffix="white light"), pad=12)
+        a1.legend(loc="lower left", ncol=2, columnspacing=1.4,
                   handletextpad=0.5)
-        a1.annotate(f"depth {depth_ppm:.0f} ppm\nresidual rms {rms:.0f} ppm",
-                    xy=(0.985, 0.06), xycoords="axes fraction", ha="right",
-                    va="bottom", fontsize=10.5, color="#4E5866")
+        note = f"depth {depth_ppm:.0f} ppm\nresidual rms {rms:.0f} ppm"
+        if beta is not None and np.isfinite(beta):
+            note += f"\nred-noise $\\beta$ = {beta:.2f}"
+        n_reg = len(summary.get("regressor_names") or [])
+        if n_reg:
+            note += f"\n{n_reg} systematics regressors removed"
+        a1.annotate(note, xy=(0.985, 0.06), xycoords="axes fraction",
+                    ha="right", va="bottom", fontsize=10.5, color="#4E5866")
 
-        a2.errorbar(t_hr, residual * 1e6, yerr=lc["wl_err"][keep] * 1e6, fmt="none",
+        a2.errorbar(t_hr, residual * 1e6, yerr=flux_err * 1e6, fmt="none",
                     ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
                     alpha=0.18, zorder=1)
         a2.plot(t_hr, residual * 1e6, "o", ms=2.4, mew=0, color=DATA_COLOR,
@@ -979,12 +1043,31 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
                     color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.1,
                     capsize=0, alpha=0.95, zorder=3)
         a2.axhline(0, color=MODEL_COLOR, lw=1.8, zorder=2)
-        a2.set_xlabel("Time from mid-transit  [h]")
+        a2.set_xlabel("Time from fitted mid-transit  [h]")
         a2.set_ylabel("Residual  [ppm]")
         a2.set_ylim(-4 * rms, 4 * rms)
         fig.tight_layout()
-        _savefig(fig, out, "white_lightcurve_fit")
+        path = _savefig(fig, out, "white_lightcurve_fit")
         plt.close(fig)
+    return path
+
+
+def _plot_white_fit(results, lc, instrument: str, out: Path,
+                    summary: dict[str, Any], title: str = "",
+                    keep: np.ndarray | None = None) -> None:
+    """Draw the fit figure (see ``plot_white_fit_series``) and save the
+    plotted series so figures can be restyled without refitting.
+
+    ``keep`` is the fit mask; excluded integrations are drawn greyed.
+    """
+    keep = (np.ones(lc["time"].size, dtype=bool) if keep is None
+            else np.asarray(keep, dtype=bool))
+    flux = lc["wl_flux"][keep]
+    model = results.lc.evaluate(instrument)
+    plot_white_fit_series(
+        out, summary, lc["time"][keep], flux, lc["wl_err"][keep], model,
+        title=title,
+        excluded_time=lc["time"][~keep], excluded_flux=lc["wl_flux"][~keep])
 
     # Save the plotted series so figures can be restyled without refitting.
     np.savetxt(out / "white_lightcurve_series.csv",
