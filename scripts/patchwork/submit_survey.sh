@@ -144,7 +144,7 @@ from pathlib import Path
 
 sys.path.insert(0, "scripts/patchwork")
 
-from generate_survey_jobs import EXPECTED_DEPTH_PPM, SIZING
+from generate_survey_jobs import EXCLUDED, EXPECTED_DEPTH_PPM, SIZING
 from aster_toolkit.data_reduction.survey import _slug, write_fir_slurm_script
 
 manifest_dir = os.path.expanduser(os.environ["MANIFEST_DIR"])
@@ -164,6 +164,9 @@ for mpath in manifests:
     with open(mpath) as fh:
         manifest = json.load(fh)
     slug = _slug(manifest["planet_name"])
+    if slug in EXCLUDED:
+        print(f"# EXCLUDED {slug}: {EXCLUDED[slug]}", file=sys.stderr)
+        continue
     red_t, fit_t, red_m, fit_m, wave, note = SIZING.get(slug, DEFAULT)
     script = write_fir_slurm_script(
         mpath, output_root, script_path=job_dir / f"run_{slug}.sbatch")

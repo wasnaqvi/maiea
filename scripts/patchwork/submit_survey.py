@@ -62,7 +62,7 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
 sys.path.insert(0, str(_HERE.parent))
 
-from generate_survey_jobs import EXPECTED_DEPTH_PPM, SIZING  # noqa: E402
+from generate_survey_jobs import EXCLUDED, EXPECTED_DEPTH_PPM, SIZING  # noqa: E402
 from aster_toolkit.data_reduction.survey import (  # noqa: E402
     _slug,
     write_fir_slurm_script,
@@ -175,6 +175,9 @@ def main() -> int:
             manifest = json.load(fh)
         slug = _slug(manifest["planet_name"])
         if (only and slug not in only) or slug in skip:
+            continue
+        if slug in EXCLUDED:
+            skipped.append(f"{slug}: EXCLUDED from the survey — {EXCLUDED[slug]}")
             continue
         sizing = SIZING.get(slug, DEFAULT_SIZING)
         red_t, fit_t, red_m, fit_m, wave, note = sizing

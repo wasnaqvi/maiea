@@ -136,6 +136,14 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
                      "same host as TOI-451 c; check the depths differ"),
 }
 
+# Targets dropped from the survey. Every submitter and job generator skips
+# them, whatever manifest directory they are pointed at, so a stale
+# manifest can never quietly put one back. Record why.
+EXCLUDED: dict[str, str] = {
+    "TOI_561_b": "ultra-short-period lava world, not a sub-Neptune "
+                 "(dropped from Patchwork, Wasi 2026-10-20)",
+}
+
 EXPECTED_DEPTH_PPM = {
     "TOI_561_b": 231, "TOI_836_b": 552, "K2_18_b": 2889, "TOI_776_c": 1183,
     "TOI_836_01": 1274, "GJ_3090_b": 1436, "GJ_9827_d": 957, "GJ_357_b": 955,
@@ -176,6 +184,9 @@ def main() -> int:
         with open(mpath) as fh:
             manifest = json.load(fh)
         slug = _slug(manifest["planet_name"])
+        if slug in EXCLUDED:
+            print(f"# EXCLUDED {slug}: {EXCLUDED[slug]}")
+            continue
         if not manifest.get("priors"):
             missing_priors.append(slug)
         sizing = SIZING.get(slug)
@@ -210,12 +221,12 @@ def main() -> int:
             )
         else:
             block.append(
-                f"# STEPS=fit,combine FORCE_REFIT=1 sbatch --export=ALL "
+                f"# STEPS=fit,combine,contamination FORCE_REFIT=1 sbatch --export=ALL "
                 f"--time={fit_t} --cpus-per-task=4 --mem={fit_m}{mail} {script}"
             )
         by_wave[wave].append("\n".join(block))
 
-    print(f"# Patchwork survey submission plan — {len(manifests)} targets")
+    print(f"# Patchwork survey submission plan — {sum(len(v) for v in by_wave.values())} targets")
     print(f"# Job scripts in {job_dir}; logs land in the directory you "
           "sbatch from.")
     print("# Submit from a shell with NO venv active; use absolute paths.")

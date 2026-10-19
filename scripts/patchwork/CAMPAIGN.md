@@ -203,8 +203,11 @@ This prints every sbatch command, sized per target, in order:
   L 98-59 d, GJ 357 b, TOI-776 b, TOI-836.01, TOI-125 b, TOI-125 c
 - **Wave 3** (multi-visit): GJ 9827 d (redo), GJ 3090 b, TOI-776 c,
   TOI-836 b
-- **Wave 4**: K2-18 b (4-visit cross-program combine, approved),
-  TOI-561 b (21k integrations; watch MaxRSS)
+- **Wave 4**: K2-18 b (4-visit cross-program combine, approved)
+- **Dropped** (2026-10-20): TOI-561 b — ultra-short-period lava world, not
+  a sub-Neptune. Listed in `generate_survey_jobs.EXCLUDED`, which every
+  submitter honours; its old products stay on disk but are not survey
+  products.
 
 Rules that have already cost jobs: submit with NO venv active; absolute
 sbatch paths; never two jobs on one workdir; REDUCE alone first
