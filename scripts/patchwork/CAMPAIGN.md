@@ -226,8 +226,11 @@ After FIT:
       `indicative` just means the only reference was the optical archive
       value; check `depth_check.band` before reacting to a % offset
 - [ ] `fit_version` is exactly `1.5` — earlier versions do not include the
-      current grazing-transit and per-channel limb-darkening safeguards
-      means this fit is NOT uniform with the survey
+      grazing-transit (b > 0.80) per-channel limb-darkening fix, so such a
+      fit is NOT uniform with the survey. A `1.5` fit with a `fit_restamps`
+      record in `patchwork_summary.json` is a v1.4 fit with every b <= 0.80,
+      where v1.5 runs identical code; it counts. A v1.4 fit above 0.80 is
+      refit, never restamped (`restamp_fit_version.py` refuses it)
 - [ ] `median_depth_err_ppm` << depth (tens of ppm, not ~1500)
 - [ ] white rms hundreds of ppm; record `rednoise.beta_median`. Treat
       beta > 3 as a survey-quality flag and sensitivity test, not an automatic

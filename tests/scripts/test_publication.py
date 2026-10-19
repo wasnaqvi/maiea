@@ -111,3 +111,93 @@ def test_forward_model_uses_system_parameters(monkeypatch, tmp_path):
     assert kwargs["star"].radius == pytest.approx(BlackbodyStar(radius=.3).radius)
     with pytest.raises(ValueError, match="positive"):
         module.generate_taurex_model(atm_min_pressure=0)
+
+
+def _v14_target(root, impacts, version="1.4"):
+    """A minimal v1.4-shaped target: one visit per impact parameter."""
+    from aster_toolkit.data_reduction.juliet import write_spectrum_csv
+    target = root / "T_1_b"
+    rows = [{"wave": 3.0, "wave_err": .015, "depth": .001, "depth_err": 2e-5,
+             "rms_ppm": 500.}]
+    summary = {"fit_version": version, "visits": {}}
+    # v1.4 wrote the half bin width to the DAT, v1.5 the full width.
+    width, scale = (("bin_half_width_um", 1) if version == "1.4"
+                    else ("bin_width_um", 2))
+    for i, b in enumerate(impacts):
+        visit = f"o00{i + 1}"
+        fit_dir = target / "fits" / visit / "nrs1"
+        (fit_dir / "pass1").mkdir(parents=True)
+        (fit_dir / "spectro").mkdir()
+        white = {"fit_version": version, "b_p1": {"median": b}}
+        (fit_dir / "white_fit_summary.json").write_text(json.dumps(white))
+        (fit_dir / "pass1" / "white_fit_summary.json").write_text(
+            json.dumps(dict(white, fit_version=f"{version}-noscan")))
+        write_spectrum_csv(fit_dir / "spectro" / "transmission_spectrum.csv",
+                           rows, header=f"Patchwork juliet fit v{version}, instrument=NRS1")
+        (fit_dir / "spectro" / "transmission_spectrum.dat").write_text(
+            f"# wavelength_um  transit_depth  depth_err  {width}\n"
+            f"# Patchwork juliet fit v{version}, instrument=NRS1\n"
+            f"3.000000  0.00100000  0.00002000  {.015 * scale:.6f}\n")
+        summary["visits"][visit] = {"fits": {"NRS1": {"fit_version": version}}}
+    (target / "combined").mkdir()
+    write_spectrum_csv(target / "combined" / "combined_nrs1_transmission_spectrum.csv",
+                       rows, header=f"T 1 b — NRS1, 1 visit(s), Patchwork v{version}")
+    (target / "patchwork_summary.json").write_text(json.dumps(summary))
+    return target
+
+
+def test_restamp_v14_below_grazing_threshold(tmp_path):
+    from restamp_fit_version import apply_changes, plan_target
+    target = _v14_target(tmp_path, [0.3, 0.69])
+    plan = plan_target(target)
+    assert plan["status"] == "restamp" and plan["max_b"] == pytest.approx(0.69)
+    apply_changes(plan["changes"])
+
+    summary = json.loads((target / "patchwork_summary.json").read_text())
+    assert summary["fit_version"] == "1.5"
+    fit = summary["visits"]["o002"]["fits"]["NRS1"]
+    assert fit["fit_version"] == "1.5" and fit["ld_fixed_per_channel"] is False
+    assert fit["impact_parameter"] == pytest.approx(0.69)
+    assert summary["resolution"] == 100
+    assert summary["fit_restamps"][0]["from"] == "1.4"
+    fit_dir = target / "fits" / "o001" / "nrs1"
+    pass1 = json.loads((fit_dir / "pass1" / "white_fit_summary.json").read_text())
+    assert pass1["fit_version"] == "1.5-noscan"
+
+    # CSV: only the header changes, CRLF endings and data kept byte for byte.
+    csv_path = fit_dir / "spectro" / "transmission_spectrum.csv"
+    old = (csv_path.with_name(csv_path.name + ".pre-restamp")).read_bytes()
+    new = csv_path.read_bytes()
+    assert b"fit v1.5 (restamped from v1.4)" in new.split(b"\r\n")[0]
+    assert old.split(b"\r\n")[1:] == new.split(b"\r\n")[1:]
+    combined = (target / "combined" / "combined_nrs1_transmission_spectrum.csv").read_text()
+    assert "Patchwork v1.5 (restamped from v1.4)" in combined
+
+    # DAT: half width -> full width, as v1.5 writes it.
+    dat = (fit_dir / "spectro" / "transmission_spectrum.dat").read_text().splitlines()
+    assert "bin_width_um" in dat[0] and "half" not in dat[0]
+    assert dat[2].split()[3] == "0.030000"
+
+    # Idempotent: a second pass finds nothing to do.
+    assert plan_target(target)["status"] == "current"
+
+
+def test_restamp_refuses_grazing_target_whole(tmp_path):
+    from restamp_fit_version import Refused, main, plan_target
+    target = _v14_target(tmp_path, [0.3, 0.94])
+    with pytest.raises(Refused, match="b = 0.94"):
+        plan_target(target)
+    main([str(tmp_path), "--write"])
+    assert not list(target.rglob("*.pre-restamp"))
+    assert json.loads((target / "patchwork_summary.json").read_text())["fit_version"] == "1.4"
+
+
+def test_restamp_leaves_native_v15_grazing_fit_alone(tmp_path):
+    from restamp_fit_version import plan_target
+    target = _v14_target(tmp_path, [0.94], version="1.5")
+    summary = json.loads((target / "patchwork_summary.json").read_text())
+    summary["resolution"] = 100.0
+    fit = summary["visits"]["o001"]["fits"]["NRS1"]
+    fit.update(ld_fixed_per_channel=True, impact_parameter=0.94)
+    (target / "patchwork_summary.json").write_text(json.dumps(summary))
+    assert plan_target(target)["status"] == "current"

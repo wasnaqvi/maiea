@@ -321,9 +321,9 @@ and never mix old and new products in one analysis.
 | constant | value | module |
 |---|---|---|
 | `PATCHWORK_CONFIG_VERSION` | 1.1 | `exotedrf.py` |
-| `PATCHWORK_STAGE4_VERSION` | 1.2 | `lightcurves.py` |
-| `PATCHWORK_FIT_VERSION` | 1.3 | `juliet.py` |
-| `PATCHWORK_CONTAM_VERSION` | 1.0 | `contamination.py` |
+| `PATCHWORK_STAGE4_VERSION` | 1.3 | `lightcurves.py` |
+| `PATCHWORK_FIT_VERSION` | 1.5 | `juliet.py` |
+| `PATCHWORK_CONTAM_VERSION` | 1.1 | `contamination.py` |
 | `PATCHWORK_OPTIMIZER_VERSION` | 1.0 | `optimize.py` |
 | `DEFAULT_RESOLUTION` | 100 | `lightcurves.py` |
 | `CRDS_CONTEXT` | `jwst_1322.pmap` | `exotedrf.py` |
@@ -337,6 +337,20 @@ spot scan did not run is stamped `-noscan`. The stamps compose, so
 `1.3-nopca-noscan` is possible and is **not** a survey fit. "Scan ran and
 found nothing" and "scan never ran" are different states — do not treat
 an unstamped and a `-noscan` fit as equivalent.
+
+Fit **v1.4** turned the Stage 5.5 steps into fitted erf-ramp regressors
+(break time and width fitted, not taken from the flagged span's centre)
+and modelled occulted crossings as Gaussians instead of masking them.
+Fit **v1.5** changed one number-producing thing: per-channel limb
+darkening is fixed to ExoTiC-LD when the white-fit impact parameter
+exceeds `LD_FIX_IMPACT_PARAM = 0.80`. Near grazing, a free limb
+darkening trades against depth (L 98-59 d moved 5%, with errors 2.5x
+larger). Below 0.80, v1.5 runs the v1.4 code path, so v1.4 fits there were
+**restamped, not refit** (`scripts/patchwork/restamp_fit_version.py`;
+2026-10-20, 13 targets). A restamped fit carries a `fit_restamps` record
+in its summary and `v1.5 (restamped from v1.4)` in its CSV/DAT headers,
+and it counts as a survey fit. A v1.4 fit with b > 0.80 is not uniform
+and must be refit; the script refuses those targets whole.
 
 `-nopca` now carries a second meaning worth knowing: no PCA components
 means no Stage 2 calints, which means no trace diagnostics, which means
@@ -523,7 +537,7 @@ band — that is the prior-returning fit, and it is bandpass-independent.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/scripts/test_data_reduction.py -q
 ```
 
-111 tests, no network and no exoTEDRF/juliet environment required. They
+184 tests, no network and no exoTEDRF/juliet environment required. They
 cover the transit-in-window and force-refit guards, MJD→BJD conversion,
 constant-R binning, tilt detection (including that a real transit is not
 flagged), planet resolution, staging deduplication, the frozen-config

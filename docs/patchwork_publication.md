@@ -33,6 +33,21 @@ This change set preserves preexisting identity guards and summary-merge work.
   nonpositive physical parameters are reported; absolute-depth plots retain
   those targets. A dated JSON records normalization parameters and omissions.
 
+## Fit v1.5 Restamp (2026-10-20)
+
+v1.5 changed one numerical thing relative to v1.4: per-channel limb
+darkening is fixed to ExoTiC-LD above white-fit b = 0.80. Every other v1.5 change
+is metadata or the DAT full-width column. So the 13 v1.4 targets with
+every white fit at b <= 0.80 were restamped, not refit, by
+`scripts/patchwork/restamp_fit_version.py`. A refit would differ only by
+sampler noise. GJ 9827 d (b 0.85-0.89), LTT 3780 c (0.82-0.83) and
+L 98-59 d (0.94) are refit at v1.5. The script refuses any v1.4 target
+with a fit above 0.80, records a `fit_restamps` entry (rule, max b, files)
+in the summary, keeps `.pre-restamp` copies, and rewrites v1.4 DAT half
+widths as full widths. This is the one deliberate exception to "a current
+code version does not retroactively update old fits" below. It holds only
+because the two code paths are identical for these fits.
+
 ## Reproduce
 
 ```sh
