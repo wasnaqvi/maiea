@@ -368,9 +368,18 @@ Two changes:
   white fit and every channel (channels fit `GP_sigma`, `GP_rho` frozen to
   the white posterior like the orbit). Pass 1, which feeds the Stage 5.5
   scan, stays GP-free on purpose — a GP would absorb the spot bumps the
-  scan must find. `rednoise` is now measured after the GP (~1 = adequate
-  noise model); `rednoise_before_gp` is the pre-v1.6-comparable beta.
-  celerite is required; the fit step refuses to start without it.
+  scan must find. `rednoise` is measured without the GP term (comparable
+  with every earlier version); `rednoise_after_gp` also removes the GP's
+  conditional mean, which follows short-timescale noise, so it sits below
+  1 by construction and only a value > ~1.5 means anything. celerite is
+  required; the fit step refuses to start without it.
+- **The GP never sees absolute BJD** (`gp_time_input`, origin = predicted
+  mid-transit, recorded as `noise_model.gp_time_origin`). On 2026-10-20
+  the first v1.6 run fed it BJD ~2.46e6; celerite's Matern approximation
+  lost the precision to resolve a few-second cadence and failed to
+  factorize (`LinAlgError`) on 15 of 22 targets. The 5 that finished are
+  not trusted either and were refit; `gate_fits.py` STOPs any GP fit
+  without `gp_time_origin`, and the channels refuse to reuse one.
 
 New stamps: `-1det` (only one detector had Stage 3 products) and `-nogp`.
 Neither is a survey fit.

@@ -681,7 +681,7 @@ def run_patchwork_target(
                     "priors_source": prep["priors_source"],
                     "priors_override_used": prep.get("priors_override_used"),
                     "rednoise": white.get("rednoise"),
-                    "rednoise_before_gp": white.get("rednoise_before_gp"),
+                    "rednoise_after_gp": white.get("rednoise_after_gp"),
                     "rednoise_pass1": pass1[det].get("rednoise"),
                     "depth_check": white.get("depth_check"),
                     "n_channels": spec["n_bins"],
@@ -703,12 +703,11 @@ def run_patchwork_target(
                 # Corrections are only worth their integrations if they
                 # actually improve the noise. Record the comparison so a
                 # target where they did not can be spotted without a
-                # rerun. Compare like with like: pass 1 has no GP, so its
-                # beta is set against pass 2's beta BEFORE the GP term.
+                # rerun. Compare like with like: pass 1 has no GP, and
+                # rednoise is always measured without the GP term.
                 b1 = (pass1[det].get("rednoise") or {}).get("beta_median")
-                b2 = ((white.get("rednoise_before_gp") or white.get("rednoise")
-                       or {}).get("beta_median"))
-                bgp = (white.get("rednoise") or {}).get("beta_median")
+                b2 = (white.get("rednoise") or {}).get("beta_median")
+                bgp = (white.get("rednoise_after_gp") or {}).get("beta_median")
                 d1 = pass1[det]["depth_ppm"]["median"]
                 d2 = white["depth_ppm"]["median"]
                 log(f"[{slug}] {vname} {det}: pass 2 moved the depth "

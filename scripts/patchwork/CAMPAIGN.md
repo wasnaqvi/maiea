@@ -239,11 +239,13 @@ most of this list and exits 1 on a STOP):
       a few hours. A rho railing at the visit span means the GP is doing
       the baseline's job — look at the white figure
 - [ ] `median_depth_err_ppm` << depth (tens of ppm, not ~1500)
-- [ ] white rms hundreds of ppm; record `rednoise.beta_median` (after the
-      GP — should now sit near 1) and `rednoise_before_gp.beta_median` (the
-      v1.5-comparable number: how much correlated noise the GP took). A
-      post-GP beta still > ~1.5 means structure the GP cannot describe
-      (a missed step, a spot crossing) — read the residual panel
+- [ ] white rms hundreds of ppm; record `rednoise.beta_median` (without
+      the GP term — comparable with v1.5) and `rednoise_after_gp` (below 1
+      by construction). An after-GP beta > ~1.5 means structure the GP
+      cannot describe (a missed step, a spot crossing) — read the residual
+      panel
+- [ ] `noise_model.gp_time_origin` present. Absent = a pre-fix v1.6 fit
+      whose GP ran on absolute BJD; refit it
 - [ ] `ld_source: "exotic-ld"`, `priors_source: "archive"` (cache
       fallback means the node was offline — fine, but note it)
 - [ ] ~29 (NRS1) + ~24 (NRS2) channels at R=100;

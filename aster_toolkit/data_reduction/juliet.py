@@ -204,6 +204,24 @@ GP_SIGMA_BOUNDS = [1e-6, 1e-2]        # amplitude, relative flux (1-10000 ppm)
 # trade against each other.
 GP_RHO_MIN_DAYS = 2.0 / 1440.0
 
+
+def gp_time_input(time: np.ndarray, origin: float) -> np.ndarray:
+    """The GP's input coordinate: time in days from ``origin``.
+
+    NEVER absolute BJD. celerite's Matern-3/2 term is a semiseparable
+    approximation, and at t ~ 2.46e6 d it loses the precision to resolve
+    a 2-20 s cadence: factorizing the covariance failed with
+    ``celerite.solver.LinAlgError`` on 15 of the 22 first v1.6 fits
+    (2026-10-20), and on 38 of 44 survey lightcurves when replayed
+    offline, while the same data shifted to a near-zero origin
+    factorized on all 44. The kernel is stationary, so the shift changes
+    nothing in the model. Where it did not crash, the absolute-time
+    likelihood could still fail at some parameter values and silently
+    reject them, so fits made before this fix are not trusted either
+    (they carry no ``gp_time_origin`` in ``noise_model``).
+    """
+    return np.asarray(time, dtype=float) - float(origin)
+
 # Back-compat alias (pre-Stage4 name).
 load_extracted_spectra = load_stage3_spectra
 
@@ -852,6 +870,9 @@ def fit_white_lightcurve_joint(
     # Both detectors are propagated from the same ephemeris, so their
     # t0_obs agree; the mean only guards against rounding.
     t0_obs = float(np.mean([lcs[d]["t0_obs"] for d in dets]))
+    # The GP sees time from the predicted mid-transit, never absolute BJD
+    # (see gp_time_input). One origin for both detectors.
+    gp_origin = t0_obs
     prior_dict = _joint_white_priors(priors, t0_obs, {
         det: {"n_regressors": regs[det].shape[1], "ld": ld.get(det),
               "gp_time": times[det][keeps[det]] if gp else None}
@@ -863,7 +884,8 @@ def fit_white_lightcurve_joint(
         y_lc={d: lcs[d]["wl_flux"][keeps[d]] for d in dets},
         yerr_lc={d: lcs[d]["wl_err"][keeps[d]] for d in dets},
         linear_regressors_lc={d: regs[d][keeps[d]] for d in dets},
-        GP_regressors_lc=({d: times[d][keeps[d]] for d in dets} if gp else None),
+        GP_regressors_lc=({d: gp_time_input(times[d][keeps[d]], gp_origin)
+                           for d in dets} if gp else None),
         out_folder=str(jdir),
     )
     results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
@@ -880,7 +902,8 @@ def fit_white_lightcurve_joint(
             results, posterior, det, lcs[det], priors,
             Path(output_dirs[det]),
             keep=keeps[det], regressor_names=names[det], ld=ld.get(det),
-            gp=gp, n_detectors=len(dets), joint_record=joint_record,
+            gp=gp, gp_origin=gp_origin, n_detectors=len(dets),
+            joint_record=joint_record,
             program=program, visit=visit,
             anomaly_scan=anomaly_scan, tilt_report=tilt_reports.get(det),
             n_spot_masked=int(n_spot_masked.get(det, 0)),
@@ -910,6 +933,7 @@ def _summarize_white_detector(
     ld: dict[str, float] | None,
     gp: bool,
     n_detectors: int,
+    gp_origin: float | None = None,
     joint_record: dict[str, Any],
     program: str,
     visit: str,
@@ -1019,6 +1043,9 @@ def _summarize_white_detector(
         summary["noise_model"].update({
             "GP_sigma_ppm": summary[f"GP_sigma_{instrument}"]["median"] * 1e6,
             "GP_rho_min": summary[f"GP_rho_{instrument}"]["median"] * 1440.0,
+            # The channels must use the same GP input coordinate. Its
+            # presence also marks a fit made after the absolute-time fix.
+            "gp_time_origin": float(gp_origin),
         })
 
     flux = lc["wl_flux"][keep]
@@ -1067,14 +1094,19 @@ def _summarize_white_detector(
     # by accident. The moment a step got masked (7 integrations per
     # event) it raised IndexError mid-fit, after the sampling was
     # already done.
-    # With the GP on, this beta is AFTER the GP, so ~1 means the noise
-    # model is adequate (the depth errors already carry the correlated
-    # noise). rednoise_before_gp is the same statistic without the GP
-    # term: how much correlated noise there was to model.
-    summary["rednoise"] = rednoise_beta(residual, times[keep])
+    # rednoise is measured WITHOUT the GP term (data - transit - linear
+    # model): how much correlated noise there was, the number every
+    # version since v1.2 has reported. With a GP the depth error already
+    # carries that noise, so beta here is a description, not a reason to
+    # inflate anything.
+    # rednoise_after_gp subtracts the GP's conditional mean as well. That
+    # mean follows short-timescale noise, so the binned residual shrinks
+    # and this beta sits BELOW 1 by construction (0.2-0.8 on the first
+    # v1.6 fits). It is only informative on the high side: > ~1.5 means
+    # structure even the GP could not describe.
+    summary["rednoise"] = rednoise_beta(residual + gp_component, times[keep])
     if gp:
-        summary["rednoise_before_gp"] = rednoise_beta(
-            residual + gp_component, times[keep])
+        summary["rednoise_after_gp"] = rednoise_beta(residual, times[keep])
 
     # Sanity check against the best available reference depth. Prefers a
     # published same-band (G395H) value; falls back to the archive
@@ -1399,10 +1431,17 @@ def fit_transmission_spectrum(
     # property of the visit's systematics, not of the channel, so it is
     # frozen to the white posterior like the orbit; only the amplitude is
     # free per channel.
-    gp_rho = None
-    if (white_summary.get("noise_model") or {}).get("kind") == GP_KERNEL:
+    gp_rho = gp_origin = None
+    noise = white_summary.get("noise_model") or {}
+    if noise.get("kind") == GP_KERNEL:
         _require_celerite()
         gp_rho = float(white_summary[f"GP_rho_{instrument}"]["median"])
+        if noise.get("gp_time_origin") is None:
+            raise ValueError(
+                "This white-light fit used a GP on absolute BJD (made before the "
+                "gp_time_input fix) — refit the white light; its GP posterior "
+                "is not trusted and the channels cannot reuse it.")
+        gp_origin = float(noise["gp_time_origin"])
 
     use_ld = stellar is not None and white_summary.get("ld_source") == "exotic-ld"
     # Near-grazing geometry: fix (q1, q2) per channel rather than fit them.
@@ -1471,7 +1510,7 @@ def fit_transmission_spectrum(
             y_lc={instrument: f[good]},
             yerr_lc={instrument: e[good]},
             linear_regressors_lc={instrument: regressors[good]},
-            GP_regressors_lc=({instrument: times[good]}
+            GP_regressors_lc=({instrument: gp_time_input(times[good], gp_origin)}
                               if gp_rho is not None else None),
             out_folder=str(out / f"bin{i:03d}"),
         )

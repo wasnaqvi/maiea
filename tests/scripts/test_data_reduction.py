@@ -2337,7 +2337,11 @@ class TestJointWhiteFitPlumbing:
         assert out["NRS2"]["depth_ppm"]["median"] > out["NRS1"]["depth_ppm"]["median"]
         assert out["NRS1"]["fit_version"] == J_VERSION()
         assert out["NRS1"]["noise_model"]["kind"] == "celerite-matern32"
-        assert "rednoise_before_gp" in out["NRS1"]
+        assert "rednoise_after_gp" in out["NRS1"]
+        # The GP never sees absolute BJD (see gp_time_input).
+        for det, x in call["GP_regressors_lc"].items():
+            assert np.max(np.abs(x)) < 1.0
+        assert out["NRS1"]["noise_model"]["gp_time_origin"] == pytest.approx(0.0)
         assert (tmp_path / "joint" / "joint_white_fit_summary.json").is_file()
         npz = np.load(tmp_path / "nrs2" / "white_lightcurve_residuals.npz")
         assert "gp" in npz.files and np.ptp(npz["gp"]) > 0
@@ -2349,7 +2353,7 @@ class TestJointWhiteFitPlumbing:
         assert one["NRS1"]["fit_version"].endswith("-1det")
         _, nogp = self._run(monkeypatch, tmp_path / "b", gp=False)
         assert nogp["NRS1"]["fit_version"].endswith("-nogp")
-        assert "rednoise_before_gp" not in nogp["NRS1"]
+        assert "rednoise_after_gp" not in nogp["NRS1"]
         _, noscan = self._run(monkeypatch, tmp_path / "c", scan=False)
         assert "-noscan" in noscan["NRS1"]["fit_version"]
 
@@ -2366,7 +2370,7 @@ class TestJointWhiteFitPlumbing:
         white = {"P_p1": {"median": 5.0}, "t0_p1": {"median": 0.0},
                  "b_p1": {"median": 0.3}, "a_p1": {"median": 15.0},
                  "ld_source": "uniform", "fit_version": J.PATCHWORK_FIT_VERSION,
-                 "noise_model": {"kind": J.GP_KERNEL},
+                 "noise_model": {"kind": J.GP_KERNEL, "gp_time_origin": -0.5},
                  "GP_rho_NRS1": {"median": 0.01}, "regressor_names": ["time"]}
         J.fit_transmission_spectrum(lc, white, tmp_path, instrument="NRS1",
                                     regressors=np.ones((n, 1)))
@@ -2375,7 +2379,8 @@ class TestJointWhiteFitPlumbing:
             assert call["priors"]["GP_rho_NRS1"] == {"distribution": "fixed",
                                                      "hyperparameters": 0.01}
             assert call["priors"]["GP_sigma_NRS1"]["distribution"] == "loguniform"
-            assert "NRS1" in call["GP_regressors_lc"]
+            # Same origin as the white fit, so the frozen rho means the same.
+            assert call["GP_regressors_lc"]["NRS1"] == pytest.approx(lc["time"] + 0.5)
         header = (tmp_path / "transmission_spectrum.csv").read_text().splitlines()[0]
         assert "noise=celerite-matern32" in header
 
@@ -2441,3 +2446,46 @@ class TestJointWhiteFitRealJuliet:
         for det, rp in (("NRS1", 0.030), ("NRS2", 0.032)):
             p = out[det]["p_p1"]
             assert abs(p["median"] - rp) < 4 * max(p["plus"], p["minus"])
+
+
+class TestGpTimeInput:
+    """The first v1.6 survey run crashed on 15 of 22 targets with
+    celerite.solver.LinAlgError: the GP was fed absolute BJD."""
+
+    def test_channels_refuse_a_white_fit_made_on_absolute_bjd(self, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        lc = _synthetic_joint_lcs()["NRS1"]
+        lc.update(wave=np.array([3.0]), wave_err=np.array([0.01]),
+                  sp_flux=lc["wl_flux"][:, None], sp_err=lc["wl_err"][:, None])
+        white = {"P_p1": {"median": 5.0}, "t0_p1": {"median": 0.0},
+                 "b_p1": {"median": 0.3}, "a_p1": {"median": 15.0},
+                 "ld_source": "uniform", "noise_model": {"kind": J.GP_KERNEL},
+                 "GP_rho_NRS1": {"median": 0.01}}
+        with pytest.raises(ValueError, match="absolute BJD"):
+            J.fit_transmission_spectrum(lc, white, tmp_path, instrument="NRS1",
+                                        regressors=np.ones((lc["time"].size, 1)))
+
+    def test_celerite_factorizes_relative_but_not_absolute_time(self):
+        celerite = pytest.importorskip("celerite")
+        from celerite import terms
+        import aster_toolkit.data_reduction.juliet as J
+        # GJ 357 b o007 NRS1 as fitted: 4401 integrations, 3.6 s cadence,
+        # 106 ppm errors, at BJD ~2460000. juliet starts its Matern term at
+        # sigma = rho = 10, which is where the survey run died.
+        t = 2460123.4 + np.arange(4401) * 3.6 / 86400
+        yerr = np.full(t.size, 106e-6)
+
+        def factorizes(x):
+            gp = celerite.GP(terms.Matern32Term(log_sigma=np.log(10.0),
+                                                log_rho=np.log(10.0), eps=0.01))
+            try:
+                gp.compute(x, yerr=yerr)
+                return True
+            except celerite.solver.LinAlgError:
+                return False
+
+        assert factorizes(J.gp_time_input(t, t[t.size // 2]))
+        # Documents why the shift exists. If celerite ever stops failing
+        # here the guard is merely redundant, not wrong.
+        if factorizes(t):
+            pytest.skip("this celerite build copes with absolute BJD")

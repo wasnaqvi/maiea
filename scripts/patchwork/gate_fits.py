@@ -58,8 +58,11 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
             depth = w.get("median") or 0.0
             err = max(w.get("plus") or 0.0, w.get("minus") or 0.0)
             dc = f.get("depth_check") or {}
-            beta = (f.get("rednoise") or {}).get("beta_median")
-            beta_pre = (f.get("rednoise_before_gp") or {}).get("beta_median")
+            # rednoise: without the GP term (the correlated noise there was).
+            # rednoise_after_gp: sits below 1 by construction; only > 1.5
+            # means anything (structure the GP could not describe).
+            beta_pre = (f.get("rednoise") or {}).get("beta_median")
+            beta = (f.get("rednoise_after_gp") or {}).get("beta_median")
             noise = f.get("noise_model") or {}
             joint = f.get("joint_fit") or {}
             th = f.get("tilt_handling") or {}
@@ -79,6 +82,10 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
                 notes.append("not a joint fit")
             if noise.get("kind") != GP_KERNEL:
                 notes.append(f"noise model {noise.get('kind')}")
+            elif noise.get("gp_time_origin") is None:
+                # First v1.6 runs (2026-10-20) fed the GP absolute BJD; the
+                # likelihood was numerically unreliable. Refit.
+                stops.append("GP on absolute BJD (pre-fix v1.6) — refit")
             rho_min = noise.get("GP_rho_min")
             if rho_min is not None and rho_min < 1.5 * GP_RHO_MIN_DAYS * 1440:
                 notes.append(f"GP rho {rho_min:.1f} min at its lower bound")
