@@ -325,9 +325,9 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
     n = len(items)
     cols = _rank_colors(n)
     top = n * spacing                       # rows at 0, spacing, ... (n-1)*spacing
-    LABEL_X, XMAX = 5.17, 5.95
+    LABEL_X, XMAX = 5.15, 5.80
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(9.4, 0.62 * n + 2.4))
+        fig, ax = plt.subplots(figsize=(13.0, 0.95 * n + 2.2))
         for i, it in enumerate(items):           # items sorted hot -> cool
             base = (n - 1 - i) * spacing
             col = cols[i]
@@ -338,13 +338,13 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
             for det, r in it["alt"].items():
                 k = r["show"]
                 ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k], xerr=r["wave_err"][k],
-                            fmt="none", ecolor="#374151", elinewidth=0.9, capsize=0,
+                            fmt="none", ecolor="#374151", elinewidth=1.2, capsize=0,
                             alpha=0.85 * a, zorder=2)
-                ax.plot(r["wave"][k], base + r[key][k], "o", ms=6.0, mfc=col, mec="#111827",
-                        mew=0.7, alpha=a, zorder=3)
+                ax.plot(r["wave"][k], base + r[key][k], "o", ms=8.0, mfc=col, mec="#111827",
+                        mew=0.8, alpha=a, zorder=3)
             # name inside the frame, right end, just above the row (as Sing)
             # name in a gutter inside the frame, past the last data (~5.1 um)
-            ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=10.5,
+            ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=15,
                     fontweight="bold", ha="left", va="center",
                     alpha=1.0 if not faded else 0.6, zorder=4)
             if unit == "H":
@@ -352,14 +352,12 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
                 sub = f"{it['p']['teq']:.0f} K · H {it['p']['H_km']:.0f} km ±{100 * sh:.0f}%"
             else:
                 sub = f"{it['p']['teq']:.0f} K · {it['p']['rp_re']:.2f} R⊕"
-            ax.text(LABEL_X, base - 0.12 * spacing, sub, color=col, fontsize=7.8, ha="left",
+            ax.text(LABEL_X, base - 0.12 * spacing, sub, color=col, fontsize=11, ha="left",
                     va="center", alpha=0.95 if not faded else 0.6, zorder=4)
         ax.axvspan(*GAP_UM, color="#E5E7EB", lw=0, zorder=0)
-        ax.text(np.mean(GAP_UM), top - 0.12 * spacing, "detector\ngap", ha="center", va="top",
-                fontsize=7, color="#9CA3AF", linespacing=1.0)
         for label, w in FEATURES.items():
             ax.axvline(w, color="#6B7280", lw=0.9, ls=(0, (5, 4)), zorder=0)
-            ax.text(w, top - 0.12 * spacing, label, ha="center", va="top", fontsize=10.5,
+            ax.text(w, top - 0.12 * spacing, label, ha="center", va="top", fontsize=15,
                     color="#374151", zorder=4,
                     bbox=dict(boxstyle="square,pad=0.15", fc="white", ec="none"))
         ax.set_xlim(2.80, XMAX)
@@ -372,27 +370,18 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
         ax.xaxis.set_minor_locator(MultipleLocator(0.1))
         ax.xaxis.set_minor_formatter(NullFormatter())
         ax.tick_params(which="both", direction="in", top=True, right=True)
-        ax.tick_params(which="major", length=6)
-        ax.tick_params(which="minor", length=3)
-        ax.set_xlabel(r"Wavelength ($\mu$m)", fontsize=11.5)
+        ax.tick_params(which="major", length=8, width=1.2, labelsize=14)
+        ax.tick_params(which="minor", length=4, width=1.0)
+        ax.set_xlabel(r"Wavelength ($\mu$m)", fontsize=16)
         if unit == "H":
             ax.set_ylabel(r"Relative altitude in H$_2$/He scale heights,  $\Delta R_p / H$"
                           "\n" r"($H = k_B T_{\rm eq}/\mu m_u g$,  $\mu$ = 2.3 reference; rows offset)",
-                          fontsize=10.5)
+                          fontsize=15)
         else:
-            ax.set_ylabel(r"Relative altitude,  $\Delta R_p$  (km;  rows offset)", fontsize=10.5)
+            ax.set_ylabel(r"Relative altitude,  $\Delta R_p$  (km;  rows offset)", fontsize=15)
         for side in ("top", "right", "bottom", "left"):
-            ax.spines[side].set_linewidth(1.1)
-        cap = ("Patchwork G395H transmission spectra. Spectra offset by "
-               f"{spacing:g} {'H' if unit == 'H' else 'km'}, ordered by T$_{{\\rm eq}}$ (hot at top); "
-               "dotted lines mark each planet's mean. Error bars: 1σ (vertical), bin width "
-               f"(horizontal), R ≈ {resolution:g}. As measured; no NRS1–NRS2 offset applied.")
-        if unit == "H":
-            cap += (" T$_{\\rm eq}$ = T$_{\\rm eff}\\sqrt{R_\\star/2a}$ for every planet; g from archive "
-                    f"M$_p$, R$_p$; faded rows have σ(g) > {100 * FADE_SIGMA_G:.0f}%.")
-        fig.text(0.5, 0.005, cap, ha="center", va="bottom", fontsize=7.6, color="#4B5563",
-                 wrap=True)
-        fig.subplots_adjust(left=0.13, right=0.97, top=0.985, bottom=0.085)
+            ax.spines[side].set_linewidth(1.4)
+        fig.subplots_adjust(left=0.085, right=0.985, top=0.99, bottom=0.045)
         paths = _save(fig, out, "patchwork_library_stack" + ("" if unit == "H" else "_km"))
         plt.close(fig)
     return paths
