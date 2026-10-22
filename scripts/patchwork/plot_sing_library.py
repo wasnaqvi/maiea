@@ -375,17 +375,11 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
                     fontweight="bold", ha="left", va="center", zorder=4)
             ax.text(LABEL_X, base - 0.14 * spacing, f"{it['p']['teq']:.0f} K", color=col,
                     fontsize=11.5, ha="left", va="center", zorder=4)
-        # group headers and separators
+        # separators between temperature groups (no labels)
         for gi, (gname, lo, hi) in enumerate(TEMP_GROUPS):
             members = [it for it in rows if group_of(it["p"]["teq"]) == gi]
             if not members:
                 continue
-            upper = max(bases[it["slug"]] for it in members)
-            rng = (f"T$_{{\\rm eq}}$ < {hi:.0f} K" if lo == 0 else
-                   f"T$_{{\\rm eq}}$ > {lo:.0f} K" if not np.isfinite(hi) else
-                   f"{lo:.0f}–{hi:.0f} K")
-            ax.text(LABEL_X, upper + 0.58 * spacing, f"{gname}  ·  {rng}", fontsize=12.5,
-                    fontstyle="italic", color="#4B5563", ha="left", va="center", zorder=4)
             lower = min(bases[it["slug"]] for it in members)
             if lower > 0:
                 ax.axhline(lower - 0.5 * (spacing + group_gap), color="#D1D5DB", lw=1.0, zorder=0)
