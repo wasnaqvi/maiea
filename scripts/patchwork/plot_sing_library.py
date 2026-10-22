@@ -10,9 +10,11 @@ decision of 2026-10-20: models come with the paper).
     python scripts/patchwork/plot_sing_library.py ~/Patchwork_v16 -o figs \\
         --hold TOI_125_b TOI_270_c
 
-Writes ``patchwork_library_stack{,_km}.{pdf,svg,png}``,
-``patchwork_literature_comparison.{pdf,svg,png}`` and
-``patchwork_library_table.csv``.
+Writes ``patchwork_library_stack{,_km}``, ``patchwork_band_indices``
+(CH4 / CO2 band contrasts against T_eq) and ``patchwork_mu_landscape``
+(published JWST mu constraints against T_eq and mass; data in
+literature_subneptunes.json), each as pdf/svg/png, plus
+``patchwork_library_table.csv``. See docs/patchwork_science_case.md.
 
 Conventions
 -----------
@@ -277,9 +279,9 @@ def white_depths(root: Path, slug: str) -> dict[str, tuple[float, float]]:
     return out
 
 
-def load_literature() -> dict:
+def load_literature(filename: str = "literature_g395h.json") -> dict:
     import json
-    path = HERE / "literature_g395h.json"
+    path = HERE / filename
     if not path.is_file():
         return {}
     with path.open() as handle:
@@ -387,112 +389,247 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
     return paths
 
 
-def plot_comparison(items, lit, out: Path) -> list[str]:
-    """Patchwork against the published JWST results, one row per planet.
+def _repel_labels(ax, xs, ys, labels, color="#374151", fontsize=9.0):
+    """Label points, nudged apart vertically in display space so none overlap.
+    Call after the axis limits and scales are final."""
+    if not len(labels):
+        return
+    fig = ax.figure
+    fig.canvas.draw()
+    trans = ax.transData
+    pts = trans.transform(np.column_stack([xs, ys]))
+    pos = pts.copy()
+    pos[:, 0] += 10
+    gap = fontsize * 1.6
+    order = np.argsort(pts[:, 1])
+    for _ in range(80):
+        moved = False
+        for i in range(len(order)):
+            for j in range(i + 1, len(order)):
+                a, b = order[i], order[j]
+                if abs(pos[a, 0] - pos[b, 0]) < 95 and abs(pos[a, 1] - pos[b, 1]) < gap:
+                    shift = (gap - abs(pos[a, 1] - pos[b, 1])) / 2 + 0.3
+                    lo, hi = (a, b) if pos[a, 1] <= pos[b, 1] else (b, a)
+                    pos[lo, 1] -= shift
+                    pos[hi, 1] += shift
+                    moved = True
+        if not moved:
+            break
+    inv = trans.inverted()
+    for k, lab in enumerate(labels):
+        tx, ty = inv.transform(pos[k])
+        ax.annotate(lab, (xs[k], ys[k]), xytext=(tx, ty), textcoords="data", fontsize=fontsize,
+                    color=color, va="center", ha="left", zorder=6,
+                    arrowprops=dict(arrowstyle="-", color="#9CA3AF", lw=0.6, shrinkA=0, shrinkB=5))
 
-    Left: Patchwork white-light depth / published depth, per detector.
-    Right: Patchwork's cloud-free mu floor (bar, for the assumed clear-
-    atmosphere bracket) against the published mu constraint (black).
+
+# Single-detector band indices: band minus neighbouring windows on the SAME
+# detector, so the NRS1-NRS2 offset cannot enter. Windows avoid the band
+# wings (CH4 3.15-3.55 um) and the SO2 4.0 / CO 4.6 um bands as far as
+# G395H allows.
+BAND_INDICES = {
+    "CH4": {"band": (3.20, 3.45), "windows": [(2.87, 3.05), (3.58, 3.72)], "det": "NRS1",
+            "label": r"CH$_4$ 3.3 $\mu$m"},
+    "CO2": {"band": (4.20, 4.40), "windows": [(3.85, 4.10), (4.45, 4.55)], "det": "NRS2",
+            "label": r"CO$_2$ 4.3 $\mu$m"},
+}
+# Regimes named in the literature, drawn on the T_eq axes.
+COLD_TRAP_K = 350.0          # H2O cold trap, T_crit >~ 350 K (sub-Neptune review, arXiv:2509.19247)
+AEROSOL_WINDOW_K = (500.0, 800.0)   # strongest muting (Brande et al. 2024, ApJL 961, L23)
+NO_HAZE_K = 850.0            # no CH4 to photolyse into haze (Davenport et al. 2025)
+
+
+def band_index(spec, p, name):
+    """Band contrast in reference scale heights, with its 1-sigma."""
+    cfg = BAND_INDICES[name]
+    sp = spec.get(cfg["det"])
+    if sp is None:
+        return np.nan, np.nan
+    w = np.asarray(sp["wave"], float)
+    d = np.clip(np.asarray(sp["depth_ppm"], float) * 1e-6, 1e-9, None)
+    e = np.asarray(sp["depth_err_ppm"], float) * 1e-6
+    h = p["H_km"] * 1e3
+    z = p["rs_m"] * np.sqrt(d) / h
+    ze = p["rs_m"] * e / (2 * np.sqrt(d)) / h
+    mb = (w >= cfg["band"][0]) & (w <= cfg["band"][1])
+    mc = np.zeros_like(mb)
+    for lo, hi in cfg["windows"]:
+        mc |= (w >= lo) & (w <= hi)
+    ok = np.isfinite(z) & np.isfinite(ze) & (ze > 0)
+    mb, mc = mb & ok, mc & ok
+    if mb.sum() < 2 or mc.sum() < 2:
+        return np.nan, np.nan
+
+    def wmean(m):
+        wt = 1 / ze[m] ** 2
+        return np.sum(z[m] * wt) / np.sum(wt), 1 / np.sqrt(np.sum(wt))
+
+    (zb, eb), (zc, ec) = wmean(mb), wmean(mc)
+    return float(zb - zc), float(np.hypot(eb, ec))
+
+
+def _regimes(ax, ymax_text, fontsize=9.5):
+    ax.axvspan(*AEROSOL_WINDOW_K, color="#FDE68A", alpha=0.35, lw=0, zorder=0)
+    ax.axvspan(NO_HAZE_K, 2000, color="#E0E7FF", alpha=0.45, lw=0, zorder=0)
+    ax.axvline(COLD_TRAP_K, color="#2563EB", lw=1.2, ls=(0, (6, 3)), zorder=1)
+    kw = dict(transform=ax.get_xaxis_transform(), fontsize=fontsize, va="top")
+    ax.text(COLD_TRAP_K - 8, ymax_text, "H$_2$O cold trap\n$T_{\\rm crit}\\gtrsim$350 K", ha="right",
+            color="#1D4ED8", **kw)
+    ax.text(np.mean(AEROSOL_WINDOW_K), ymax_text, "aerosol muting\nstrongest (Brande+24)",
+            ha="center", color="#92400E", **kw)
+    ax.text(NO_HAZE_K + 10, ymax_text, "no CH$_4$ haze\n(Davenport+25)", ha="left",
+            color="#3730A3", **kw)
+
+
+def plot_band_indices(items, lit_mu, out: Path) -> list[str]:
+    """Patchwork's measured CH4 and CO2 band contrasts against T_eq.
+
+    Each point is a measurement from the uniform v1.6 spectra, not a model.
+    Planets whose published spectra detect the molecule are ringed, which
+    is the check that the index measures what it says.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
-    colors, cmap, norm = _colors(items)
-    rows = list(items)                         # hot at the top
-    n = len(rows)
     with plt.rc_context(_style()):
-        fig, (axd, axm) = plt.subplots(1, 2, figsize=(13.5, 0.55 * n + 2.0), sharey=True,
-                                       gridspec_kw={"width_ratios": [1, 1.6], "wspace": 0.05})
-        ys = np.arange(n)[::-1]
-        for y, it in zip(ys, rows):
-            col = colors[it["slug"]]
-            ref = lit.get(it["name"], {})
-            held = it.get("held", False)
-            # -- depth ratio ---------------------------------------------
-            pub = ref.get("depth_ppm")
-            wd = it.get("white", {})
-            if pub:
-                for k, det in enumerate(("NRS1", "NRS2")):
-                    if det not in wd:
-                        continue
-                    pd = pub[k] if len(pub) > 1 else pub[0]
-                    ratio = wd[det][0] / pd
-                    err = wd[det][1] / pd
-                    axd.errorbar(ratio, y + (0.12 if k == 0 else -0.12), xerr=err,
-                                 fmt="o" if det == "NRS1" else "s", ms=6.5,
-                                 mfc="white" if held else col, mec="#1F2937", mew=0.8,
-                                 ecolor="#6B7280", elinewidth=1.0, capsize=0, zorder=3)
+        fig, axes = plt.subplots(1, 2, figsize=(15.5, 6.6), sharex=True)
+        for ax, name in zip(axes, ("CH4", "CO2")):
+            xs, ys, labels = [], [], []
+            for it in items:
+                v, e = it["index"][name]
+                if not np.isfinite(v):
+                    continue
+                x = it["p"]["teq"]
+                snr = v / e if e > 0 else 0
+                filled = snr >= 3
+                col = "#B91C1C" if snr >= 3 else ("#1E3A8A" if snr >= 2 else "#6B7280")
+                ax.errorbar(x, v, yerr=e, fmt="none", ecolor=col, elinewidth=1.6, capsize=3,
+                            capthick=1.2, zorder=3)
+                ax.plot(x, v, "o", ms=10, mfc=col if filled else "white", mec=col, mew=2.0,
+                        zorder=4)
+                if (lit_mu.get(it["name"]) or {}).get(name.lower()):
+                    ax.plot(x, v, "o", ms=19, mfc="none", mec="#D97706", mew=2.2, zorder=5)
+                xs.append(x); ys.append(v); labels.append(it["name"])
+            ax.axhline(0, color="#111827", lw=1.0, zorder=2)
+            _regimes(ax, 0.985)
+            ax.set_xlim(280, 1080)
+            ax.set_xlabel(r"Equilibrium temperature  $T_{\rm eq}$  (K)", fontsize=13.5)
+            ax.set_ylabel(f"{BAND_INDICES[name]['label']} band contrast\n"
+                          r"(H$_2$/He scale heights, $\mu$ = 2.3)", fontsize=13.5)
+            ax.tick_params(labelsize=12, which="both", direction="in", top=True, right=True)
+            lo = min(-1.8, min(ys) - 1.2) if ys else -2
+            hi = max(5.0, max(ys) + 2.6) if ys else 5
+            ax.set_ylim(lo, hi)
+            _repel_labels(ax, np.array(xs), np.array(ys), labels, fontsize=9.5)
+        axes[0].legend(handles=[
+            Line2D([], [], marker="o", ls="", ms=10, mfc="#B91C1C", mec="#B91C1C", label="≥ 3σ"),
+            Line2D([], [], marker="o", ls="", ms=10, mfc="white", mec="#1E3A8A", mew=2, label="2–3σ"),
+            Line2D([], [], marker="o", ls="", ms=10, mfc="white", mec="#6B7280", mew=2, label="< 2σ"),
+            Line2D([], [], marker="o", ls="", ms=17, mfc="none", mec="#D97706", mew=2.2,
+                   label="published detection")],
+            loc="center right", fontsize=10.5, frameon=True, framealpha=0.95, edgecolor="#E5E7EB")
+        fig.tight_layout(w_pad=3)
+        paths = _save(fig, out, "patchwork_band_indices")
+        plt.close(fig)
+    return paths
+
+
+def plot_mu_landscape(lit_mu, params, patchwork_names, new_targets, out: Path) -> list[str]:
+    """Published JWST mean-molecular-weight constraints for sub-Neptunes.
+
+    Left against T_eq with the regimes the literature proposes, right
+    against planet mass (the mass-metallicity question). Patchwork targets
+    are dark; Patchwork targets with no published spectrum yet are marked
+    along the bottom of the T_eq panel.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.ticker import FixedLocator, NullFormatter
+
+    in_pw, out_pw = "#1E3A8A", "#9CA3AF"
+    with plt.rc_context(_style()):
+        fig, axes = plt.subplots(1, 2, figsize=(17.5, 8.4), sharey=True,
+                                 gridspec_kw={"width_ratios": [1.25, 1], "wspace": 0.06})
+        for ax, key in zip(axes, ("teq", "mp_me")):
+            xs, ys, labels = [], [], []
+            for name, ref in lit_mu.items():
+                p = params.get(name)
+                if not p:
+                    continue
+                x = p[key]
+                col = in_pw if name in patchwork_names else out_pw
+                mu, kind = ref["mu"], ref["kind"]
+                if "lower" in mu:
+                    y = mu["lower"]
+                    open_ = kind == "lower_cloudfree"
+                    ax.annotate("", xy=(x, y * 1.9), xytext=(x, y),
+                                arrowprops=dict(arrowstyle="-|>", color=col, lw=2.0,
+                                                ls="--" if open_ else "-"), zorder=3)
+                    ax.plot(x, y, "^", ms=11, mfc="white" if open_ else col, mec=col, mew=2, zorder=4)
+                elif "low" in mu:
+                    y = float(np.sqrt(mu["low"] * mu["high"]))
+                    ax.plot([x, x], [mu["low"], mu["high"]], color=col, lw=3.0, solid_capstyle="butt",
+                            zorder=3)
+                    ax.plot(x, y, "o", ms=10, mfc=col, mec="#111827", mew=0.8, zorder=4)
+                else:
+                    y = mu["value"]
+                    ax.errorbar(x, y, yerr=[[mu["minus"]], [mu["plus"]]], fmt="o", ms=10, mfc=col,
+                                mec="#111827", mew=0.8, ecolor=col, elinewidth=2.2, capsize=0, zorder=4)
+                if ref.get("ch4"):
+                    ax.plot(x, y, "o", ms=18, mfc="none", mec="#D97706", mew=2.0, zorder=5)
+                xs.append(x); ys.append(y); labels.append(name)
+            for mu, ls, lab in ((MU_H2HE, "--", "H$_2$/He  μ = 2.3"), (18.0, ":", "H$_2$O  μ = 18"),
+                                (44.0, "-.", "CO$_2$  μ = 44")):
+                ax.axhline(mu, color="#4B5563", lw=1.1, ls=ls, zorder=1)
+                ax.text(0.47 if key == "teq" else 0.40, mu * 1.05, lab,
+                        transform=ax.get_yaxis_transform(), ha="center", va="bottom",
+                        fontsize=10, color="#4B5563")
+            ax.set_yscale("log")
+            ax.set_ylim(1.7, 90)
+            ax.yaxis.set_major_locator(FixedLocator([2, 3, 5, 10, 20, 50]))
+            ax.yaxis.set_minor_formatter(NullFormatter())
+            ax.set_yticklabels(["2", "3", "5", "10", "20", "50"])
+            ax.tick_params(labelsize=12.5, which="both", direction="in", top=True, right=True)
+            if key == "teq":
+                _regimes(ax, 0.99)
+                ax.set_xlim(220, 1080)
+                ax.set_xlabel(r"Equilibrium temperature  $T_{\rm eq}$  (K)", fontsize=14)
+                # Patchwork targets with no published spectrum: first G395H spectra
+                for name in new_targets:
+                    p = params.get(name)
+                    if p:
+                        ax.plot(p["teq"], 1.85, "D", ms=9, mfc="#F59E0B", mec="#111827", mew=0.8,
+                                zorder=4, clip_on=False)
+                        xs.append(p["teq"]); ys.append(1.85); labels.append(name)
             else:
-                axd.text(1.0, y, "no published G395H depth", ha="center", va="center",
-                         fontsize=8, color="#9CA3AF")
-            # -- mu ------------------------------------------------------
-            m = it["mod"]
-            lo, hi = (mu_floor(m["amp_H_2sig"], a) for a in A_CLEAR_RMS_H)
-            if np.isfinite(lo) and hi > MU_H2HE * 1.02 and not held:
-                axm.plot([lo, hi], [y + 0.1, y + 0.1], color=col, lw=7, alpha=0.9,
-                         solid_capstyle="butt", zorder=3)
-                axm.annotate("", xy=(hi * 1.35, y + 0.1), xytext=(hi, y + 0.1),
-                             arrowprops=dict(arrowstyle="-|>", color=col, lw=2), zorder=3)
-            elif not held:
-                axm.plot(MU_H2HE, y + 0.1, "o", mfc="white", mec=col, mew=2, ms=8, zorder=3)
-            pm = ref.get("mu") or {}
-            if "lower" in pm:
-                axm.annotate("", xy=(pm["lower"] * 1.6, y - 0.18), xytext=(pm["lower"], y - 0.18),
-                             arrowprops=dict(arrowstyle="-|>", color="#111827", lw=1.6), zorder=4)
-                axm.plot(pm["lower"], y - 0.18, "|", color="#111827", ms=11, mew=2, zorder=4)
-            elif "low" in pm:
-                axm.plot([pm["low"], pm["high"]], [y - 0.18, y - 0.18], color="#111827", lw=2.4,
-                         solid_capstyle="butt", zorder=4)
-                axm.plot([pm["low"], pm["high"]], [y - 0.18, y - 0.18], "|", color="#111827",
-                         ms=11, mew=2, zorder=4)
-            label = ref.get("verdict", "no published JWST spectrum")
-            if held:
-                label = "HELD in Patchwork (GP absorbs depth) · " + label
-            axm.text(75, y, label, fontsize=7.8, va="center", ha="left",
-                     color="#374151" if ref else "#9CA3AF")
-        # reference lines
-        axd.axvline(1.0, color="#111827", lw=1)
-        axd.axvspan(0.95, 1.05, color="#E5E7EB", lw=0, zorder=0)
-        axd.set_xlim(0.6, 1.25)
-        axd.set_xlabel("Patchwork ÷ published white-light depth", fontsize=10.5)
-        from matplotlib.lines import Line2D
-        axd.legend(handles=[
-            Line2D([], [], marker="o", ls="", mfc="#9CA3AF", mec="#1F2937", ms=7, label="NRS1"),
-            Line2D([], [], marker="s", ls="", mfc="#9CA3AF", mec="#1F2937", ms=7, label="NRS2"),
-            Line2D([], [], marker="o", ls="", mfc="white", mec="#1F2937", ms=7, label="held")],
-            loc="lower left", fontsize=8.5, frameon=False, handletextpad=0.3)
-        axd.set_yticks(ys)
-        axd.set_yticklabels([it["name"] for it in rows], fontsize=10.5)
-        for t, it in zip(axd.get_yticklabels(), rows):
-            t.set_color(colors[it["slug"]]); t.set_fontweight("bold")
-        for mu, ls, lab in ((MU_H2HE, "--", "H$_2$/He\n2.3"), (18.0, ":", "H$_2$O\n18"),
-                            (44.0, "-.", "CO$_2$\n44")):
-            axm.axvline(mu, color="#6B7280", lw=1.0, ls=ls, zorder=1)
-            axm.text(mu, n - 0.35, lab, ha="center", va="bottom", fontsize=8.5, color="#4B5563")
-        axm.set_xscale("log")
-        axm.set_xlim(1.9, 70)
-        axm.set_xticks([2, 3, 5, 10, 20, 50])
-        axm.set_xticklabels(["2", "3", "5", "10", "20", "50"])
-        axm.set_xlabel("Mean molecular weight  μ  (amu)", fontsize=10.5)
-        axm.legend(handles=[
-            Line2D([], [], color="#7A3F99", lw=6, label="Patchwork cloud-free floor"),
-            Line2D([], [], marker="o", ls="", mfc="white", mec="#7A3F99", mew=2, ms=7,
-                   label="Patchwork: no constraint beyond H$_2$/He"),
-            Line2D([], [], color="#111827", lw=2, marker="|", ms=10, mew=2,
-                   label="published constraint")],
-            loc="upper right", bbox_to_anchor=(1.0, 0.94), fontsize=8.5, frameon=True,
-            framealpha=0.95, edgecolor="#E5E7EB")
-        axm.set_ylim(-0.7, n + 0.4)
-        fig.suptitle("Patchwork v1.6 against the published JWST results", fontsize=13.5, y=0.995)
-        fig.text(0.01, -0.01,
-                 "Depth ratio: same detector where the paper gives both. Patchwork floor: 2σ modulation limit "
-                 f"for an assumed clear-atmosphere rms of {A_CLEAR_RMS_H[0]}–{A_CLEAR_RMS_H[1]} H (bar spans the bracket; "
-                 "arrow = floor). Published μ: quoted, or converted from metallicity for a solar-scaled gas "
-                 "(scripts/patchwork/literature_g395h.json lists which). Both are floors on 'μ or aerosols'.",
-                 fontsize=7.6, color="#6B7280", wrap=True)
-        fig.subplots_adjust(right=0.62, top=0.93)
-        paths = _save(fig, out, "patchwork_literature_comparison")
+                ax.set_xscale("log")
+                ax.set_xlim(1.2, 25)
+                ax.xaxis.set_major_locator(FixedLocator([1.5, 2, 3, 5, 10, 20]))
+                ax.xaxis.set_minor_formatter(NullFormatter())
+                ax.set_xticklabels(["1.5", "2", "3", "5", "10", "20"])
+                ax.set_xlabel(r"Planet mass  ($M_\oplus$)", fontsize=14)
+                for nm, m in (("Uranus", 14.5), ("Neptune", 17.1)):
+                    ax.plot(m, 2.5, "s", ms=9, mfc="#D1D5DB", mec="#4B5563", zorder=3)
+                    xs.append(m); ys.append(2.5); labels.append(nm)
+            _repel_labels(ax, np.array(xs), np.array(ys), labels, fontsize=9.5)
+        axes[0].set_ylabel("Mean molecular weight  μ  (amu)", fontsize=14)
+        fig.legend(handles=[
+            Line2D([], [], marker="o", ls="", ms=10, mfc=in_pw, mec="#111827", label="Patchwork target"),
+            Line2D([], [], marker="o", ls="", ms=10, mfc=out_pw, mec="#111827", label="other JWST sub-Neptune"),
+            Line2D([], [], color="#4B5563", lw=3, label="measured / H$_2$-rich range"),
+            Line2D([], [], marker="^", ls="", ms=10, mfc="#4B5563", mec="#4B5563", label="lower limit, aerosols modelled"),
+            Line2D([], [], marker="^", ls="", ms=10, mfc="white", mec="#4B5563", mew=2,
+                   label="lower limit only if cloud-free"),
+            Line2D([], [], marker="o", ls="", ms=16, mfc="none", mec="#D97706", mew=2, label="CH$_4$ detected"),
+            Line2D([], [], marker="D", ls="", ms=9, mfc="#F59E0B", mec="#111827",
+                   label="Patchwork: no published spectrum")],
+            loc="lower center", ncol=4, fontsize=11, frameon=False, bbox_to_anchor=(0.5, -0.005))
+        fig.subplots_adjust(left=0.06, right=0.99, top=0.97, bottom=0.2)
+        paths = _save(fig, out, "patchwork_mu_landscape")
         plt.close(fig)
     return paths
 
@@ -527,6 +664,7 @@ def main(argv=None) -> int:
         alt, mean_ppm = to_altitude(spec, p, args.resolution)
         items.append({"slug": slug, "name": name, "p": p, "alt": alt, "mean_ppm": mean_ppm,
                       "mod": modulation(spec, p), "white": white_depths(root, slug),
+                      "index": {k: band_index(spec, p, k) for k in BAND_INDICES},
                       "held": slug in args.hold})
     items.sort(key=lambda it: -it["p"]["teq"])
     if not items:
@@ -567,9 +705,15 @@ def main(argv=None) -> int:
     # one significant figure, so the numbered axis reads 0, 1000, 2000 km
     mag = 10 ** np.floor(np.log10(km_spacing))
     km_spacing = float(np.ceil(km_spacing / mag) * mag)
+    lit_mu = load_literature("literature_subneptunes.json")
+    lit_params = fetch_params(list(lit_mu))
+    lit_params.update({it["name"]: it["p"] for it in items})
+    patchwork_names = {it["name"] for it in items}
+    new_targets = [it["name"] for it in items if it["name"] not in lit_mu and it["name"] not in lit]
     for path in (plot_stack(shown, out, args.resolution, args.spacing, unit="H")
                  + plot_stack(shown, out, args.resolution, km_spacing, unit="km")
-                 + plot_comparison(items, lit, out)):
+                 + plot_band_indices(shown, lit_mu, out)
+                 + plot_mu_landscape(lit_mu, lit_params, patchwork_names, new_targets, out)):
         print(path)
     if missing:
         print("No archive parameters or spectra (left out): " + ", ".join(missing))
