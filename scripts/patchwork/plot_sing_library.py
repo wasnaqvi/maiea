@@ -93,6 +93,11 @@ FADE_SIGMA_G = 0.30
 AU_M = 1.495978707e11
 # Hot (top) -> cool (bottom), after Sing et al. 2016.
 SING_COLORS = ["#F08A3C", "#D4425A", "#B2387E", "#7A3F99", "#4B53A8", "#3C7CC0"]
+# Row colours for the stack, hot (first) -> cool (last), after Sing et al.
+# 2016 but saturated enough that neighbouring rows stay distinguishable.
+# Sampled by RANK, not by T_eq, so two planets 10 K apart still differ.
+STACK_COLORS = ["#F59E0B", "#F97316", "#EF4444", "#E11D48", "#DB2777", "#C026D3",
+                "#9333EA", "#7C3AED", "#4F46E5", "#2563EB", "#0284C7", "#0891B2"]
 
 
 def planet_name(root: Path, slug: str) -> str:
@@ -290,102 +295,104 @@ def _colors(items):
     return {it["slug"]: cmap(norm(it["p"]["teq"])) for it in items}, cmap, norm
 
 
+def _rank_colors(n):
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("stack", STACK_COLORS)
+    return [cmap(x) for x in (np.linspace(0, 1, n) if n > 1 else [0.0])]
+
+
 def plot_stack(items, out: Path, resolution: float, spacing: float,
                unit: str = "H") -> list[str]:
-    """Sing et al. (2016) style: one row per planet, hot at the top.
+    """Sing et al. (2016) Figure 1 layout: one row per planet, hot at the top.
 
-    ``unit="H"``: dR_p in units of the reference H2/He scale height, with
-    each row's normalisation uncertainty stated and poorly constrained rows
-    faded. ``unit="km"``: dR_p in km -- no atmospheric assumption at all.
+    Every row is offset by the same ``spacing`` and the y axis is numbered,
+    as in the original, so a feature's size reads off the axis directly.
+    Points are filled in the planet's colour with dark outlines and dark
+    error bars (vertical: 1 sigma; horizontal: bin width); names sit inside
+    the frame at the right end of each row.
 
-    Points only. Each row is its own zero (dotted). Rows are at least
-    ``spacing`` (in the plotted unit) apart and further where a row's own
-    points need the room. No cumulative tick numbers -- a scale bar gives
-    the vertical size instead.
+    ``unit="H"``: dR_p in units of the reference H2/He scale height; each
+    row also states H and its 1-sigma, and rows with sigma(g)/g >
+    FADE_SIGMA_G are faded. ``unit="km"``: dR_p in km, no atmospheric
+    assumption.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator, FixedLocator, NullFormatter
 
     key, ekey = ("z", "z_err") if unit == "H" else ("km", "km_err")
-    colors, _, _ = _colors(items)
     n = len(items)
-
-    def extent(it):
-        """(below, above) the row's zero that its drawn points occupy."""
-        lo, hi = [0.0], [0.0]
-        for r in it["alt"].values():
-            k = r["show"]
-            lo += list(r[key][k] - r[ekey][k]); hi += list(r[key][k] + r[ekey][k])
-        return -np.percentile(lo, 10), np.percentile(hi, 90)
-
-    ext = [extent(it) for it in items]
-    pad = 0.2 * spacing
-    bases = np.zeros(n)
-    for i in range(n - 2, -1, -1):            # bottom row (index n-1) at 0
-        bases[i] = bases[i + 1] + max(spacing, ext[i + 1][1] + ext[i][0] + pad)
-    bar = 2.0 if unit == "H" else float(np.round(spacing / 2, -1) or spacing / 2)
-    height_units = (bases[0] + ext[0][1] + ext[-1][0]) / spacing + 1.5
+    cols = _rank_colors(n)
+    top = n * spacing                       # rows at 0, spacing, ... (n-1)*spacing
+    LABEL_X, XMAX = 5.17, 5.95
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(9.6, 0.78 * height_units + 1.2))
+        fig, ax = plt.subplots(figsize=(9.4, 0.62 * n + 2.4))
         for i, it in enumerate(items):           # items sorted hot -> cool
-            base = bases[i]
-            col = colors[it["slug"]]
+            base = (n - 1 - i) * spacing
+            col = cols[i]
             sg = it["p"].get("sigma_g_frac", np.nan)
             faded = unit == "H" and np.isfinite(sg) and sg > FADE_SIGMA_G
-            alpha = 0.35 if faded else 1.0
-            ax.axhline(base, color=col, lw=0.8, ls=":", alpha=0.7 * alpha, zorder=1)
+            a = 0.4 if faded else 1.0
+            ax.axhline(base, color=col, lw=0.7, ls=(0, (1, 2)), alpha=0.6 * a, zorder=1)
             for det, r in it["alt"].items():
                 k = r["show"]
-                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k],
-                            fmt="o", ms=5.2, mfc=col, mec="#1F2937", mew=0.6,
-                            ecolor=col, elinewidth=1.1, capsize=0, zorder=3, alpha=alpha)
-            ax.text(5.18, base, it["name"], color=col, fontsize=11, fontweight="bold",
-                    va="bottom", alpha=1.0 if not faded else 0.55)
+                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k], xerr=r["wave_err"][k],
+                            fmt="none", ecolor="#374151", elinewidth=0.9, capsize=0,
+                            alpha=0.85 * a, zorder=2)
+                ax.plot(r["wave"][k], base + r[key][k], "o", ms=6.0, mfc=col, mec="#111827",
+                        mew=0.7, alpha=a, zorder=3)
+            # name inside the frame, right end, just above the row (as Sing)
+            # name in a gutter inside the frame, past the last data (~5.1 um)
+            ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=10.5,
+                    fontweight="bold", ha="left", va="center",
+                    alpha=1.0 if not faded else 0.6, zorder=4)
             if unit == "H":
                 sh = it["p"].get("sigma_H_frac", np.nan)
-                note = (f"{it['p']['teq']:.0f} K · H = {it['p']['H_km']:.0f} km ± "
-                        f"{100 * sh:.0f}%" if np.isfinite(sh) else f"{it['p']['teq']:.0f} K")
-                if faded:
-                    note += f"\nσ(g) = {100 * sg:.0f}%: scale uncertain"
+                sub = f"{it['p']['teq']:.0f} K · H {it['p']['H_km']:.0f} km ±{100 * sh:.0f}%"
             else:
-                note = f"{it['p']['teq']:.0f} K · {it['p']['rp_re']:.2f} R⊕"
-            ax.text(5.18, base, note, color=col, fontsize=8, va="top",
-                    alpha=1.0 if not faded else 0.7, linespacing=1.15)
-        ax.axvspan(*GAP_UM, color="#D5D9E0", alpha=0.6, lw=0, zorder=0)
+                sub = f"{it['p']['teq']:.0f} K · {it['p']['rp_re']:.2f} R⊕"
+            ax.text(LABEL_X, base - 0.12 * spacing, sub, color=col, fontsize=7.8, ha="left",
+                    va="center", alpha=0.95 if not faded else 0.6, zorder=4)
+        ax.axvspan(*GAP_UM, color="#E5E7EB", lw=0, zorder=0)
+        ax.text(np.mean(GAP_UM), top - 0.12 * spacing, "detector\ngap", ha="center", va="top",
+                fontsize=7, color="#9CA3AF", linespacing=1.0)
         for label, w in FEATURES.items():
-            ax.axvline(w, color="#9CA3AF", lw=0.8, ls=(0, (4, 4)), zorder=0)
-            ax.text(w, 1.005, label, ha="center", va="bottom", fontsize=10.5, color="#4B5563",
-                    transform=ax.get_xaxis_transform())
-        x0, y0 = 2.86, -ext[-1][0] - 0.4 * spacing
-        ax.plot([x0, x0], [y0, y0 + bar], color="#111827", lw=2.2, solid_capstyle="butt")
-        ax.text(x0 + 0.03, y0 + bar / 2, f"{bar:g} {'H' if unit == 'H' else 'km'}",
-                fontsize=9.5, va="center", color="#111827")
-        ax.set_xlim(2.8, 5.15)
-        ax.set_ylim(y0 - 0.15 * spacing, bases[0] + ext[0][1] + 0.15 * spacing)
-        ax.set_yticks([])
-        ax.set_xlabel(r"Wavelength  ($\mu$m)", fontsize=11.5)
+            ax.axvline(w, color="#6B7280", lw=0.9, ls=(0, (5, 4)), zorder=0)
+            ax.text(w, top - 0.12 * spacing, label, ha="center", va="top", fontsize=10.5,
+                    color="#374151", zorder=4,
+                    bbox=dict(boxstyle="square,pad=0.15", fc="white", ec="none"))
+        ax.set_xlim(2.80, XMAX)
+        ax.set_ylim(-0.75 * spacing, top + 0.15 * spacing)
+        ax.yaxis.set_major_locator(MultipleLocator(spacing))
+        minor = spacing / 5 if unit == "H" else spacing / 2
+        ax.yaxis.set_minor_locator(MultipleLocator(minor))
+        ax.xaxis.set_major_locator(FixedLocator([3.0, 3.5, 4.0, 4.5, 5.0]))
+        ax.axvline(LABEL_X - 0.04, color="#E5E7EB", lw=0.8, zorder=0)
+        ax.xaxis.set_minor_locator(MultipleLocator(0.1))
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        ax.tick_params(which="both", direction="in", top=True, right=True)
+        ax.tick_params(which="major", length=6)
+        ax.tick_params(which="minor", length=3)
+        ax.set_xlabel(r"Wavelength ($\mu$m)", fontsize=11.5)
         if unit == "H":
-            ax.set_ylabel("ΔR$_p$ in units of an H$_2$/He scale height\n"
-                          r"$H = k_B T_{\rm eq} / (\mu\, m_u\, g)$,  μ = 2.3 (reference, not measured)",
-                          fontsize=11)
+            ax.set_ylabel(r"Relative altitude in H$_2$/He scale heights,  $\Delta R_p / H$"
+                          "\n" r"($H = k_B T_{\rm eq}/\mu m_u g$,  $\mu$ = 2.3 reference; rows offset)",
+                          fontsize=10.5)
         else:
-            ax.set_ylabel("ΔR$_p$  (km)\nmeasured; needs only the depths and R$_\\star$",
-                          fontsize=11)
-        title = ("Patchwork — JWST NIRSpec/G395H transmission spectra in H$_2$/He scale heights"
-                 if unit == "H" else
-                 "Patchwork — JWST NIRSpec/G395H transmission spectra, radius change in km")
-        ax.set_title(f"{title}  (R ≈ {resolution:g})", fontsize=12, pad=24)
-        foot = (f"Uniform Patchwork fit v1.6. Each dotted line is that planet's mean; rows ≥{spacing:g} "
-                f"{'H' if unit == 'H' else 'km'} apart. As measured (no NRS1–NRS2 offset applied). "
-                "Grey band: detector gap. ")
+            ax.set_ylabel(r"Relative altitude,  $\Delta R_p$  (km;  rows offset)", fontsize=10.5)
+        for side in ("top", "right", "bottom", "left"):
+            ax.spines[side].set_linewidth(1.1)
+        cap = ("Patchwork G395H transmission spectra. Spectra offset by "
+               f"{spacing:g} {'H' if unit == 'H' else 'km'}, ordered by T$_{{\\rm eq}}$ (hot at top); "
+               "dotted lines mark each planet's mean. Error bars: 1σ (vertical), bin width "
+               f"(horizontal), R ≈ {resolution:g}. As measured; no NRS1–NRS2 offset applied.")
         if unit == "H":
-            foot += ("T$_{\\rm eq}$ = T$_{\\rm eff}\\sqrt{R_\\star/2a}$ for every planet; g from archive "
-                     "M$_p$, R$_p$. ±% = 1σ on H from archive errors (not the T$_{\\rm eq}$ idealisation). "
-                     f"Faded: σ(g) > {100 * FADE_SIGMA_G:.0f}%.")
-        ax.text(0.0, -0.045, foot, transform=ax.transAxes, fontsize=7.6, color="#6B7280",
-                va="top", wrap=True)
-        fig.subplots_adjust(right=0.78)
+            cap += (" T$_{\\rm eq}$ = T$_{\\rm eff}\\sqrt{R_\\star/2a}$ for every planet; g from archive "
+                    f"M$_p$, R$_p$; faded rows have σ(g) > {100 * FADE_SIGMA_G:.0f}%.")
+        fig.text(0.5, 0.005, cap, ha="center", va="bottom", fontsize=7.6, color="#4B5563",
+                 wrap=True)
+        fig.subplots_adjust(left=0.13, right=0.97, top=0.985, bottom=0.085)
         paths = _save(fig, out, "patchwork_library_stack" + ("" if unit == "H" else "_km"))
         plt.close(fig)
     return paths
@@ -509,8 +516,8 @@ def main(argv=None) -> int:
                     help="Target slugs kept out of the stack (shown as held in the comparison).")
     ap.add_argument("--resolution", type=float, default=30.0,
                     help="Display resolution for the stacked figure (R=100 input).")
-    ap.add_argument("--spacing", type=float, default=4.0,
-                    help="Row offset in scale heights for the stacked figure.")
+    ap.add_argument("--spacing", type=float, default=5.0,
+                    help="Constant row offset in scale heights for the stacked figure.")
     args = ap.parse_args(argv)
 
     root = Path(os.path.expanduser(args.root))
@@ -567,8 +574,10 @@ def main(argv=None) -> int:
                         m["median_err_H"], m["chi2_red"], m["nrs2_offset_ppm"], m["amp_H_2sig"], lo, hi,
                         json_dumps(ref.get("mu")), ref.get("ref", "")])
     shown = [it for it in items if not it["held"]]
-    km_spacing = 4.0 * float(np.median([it["p"]["H_km"] for it in shown]))
-    km_spacing = float(np.round(km_spacing, -2)) or km_spacing
+    km_spacing = args.spacing * float(np.median([it["p"]["H_km"] for it in shown]))
+    # one significant figure, so the numbered axis reads 0, 1000, 2000 km
+    mag = 10 ** np.floor(np.log10(km_spacing))
+    km_spacing = float(np.ceil(km_spacing / mag) * mag)
     for path in (plot_stack(shown, out, args.resolution, args.spacing, unit="H")
                  + plot_stack(shown, out, args.resolution, km_spacing, unit="km")
                  + plot_comparison(items, lit, out)):
