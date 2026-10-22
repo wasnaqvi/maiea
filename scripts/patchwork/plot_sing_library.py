@@ -329,7 +329,7 @@ def teq_color(teq):
 
 
 def plot_stack(items, out: Path, resolution: float, spacing: float,
-               unit: str = "H") -> list[str]:
+               unit: str = "H", alt_key: str = "alt") -> list[str]:
     """Sing et al. (2016) Figure 1 layout, planets in ascending T_eq from the
     top, grouped into temperate / warm / hot and coloured by T_eq.
 
@@ -368,28 +368,21 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
     cmap = LinearSegmentedColormap.from_list("teq", TEQ_COLORS)
     colour = {it["slug"]: cmap(k / max(1, n - 1)) for k, it in enumerate(rows)}
     with plt.rc_context(_style()):
-        # vertical room is what makes ~1 H features visible
-        fig, ax = plt.subplots(figsize=(14.0, 0.25 * (top + spacing) + 1.4))
+        # vertical room is what makes ~1 H features visible: ~1.5 in per row,
+        # in rows (top / spacing), never in axis units (km would explode it)
+        fig, ax = plt.subplots(figsize=(14.0, 1.5 * (top / spacing + 1) + 1.4))
         for it in rows:
             base = bases[it["slug"]]
             col = colour[it["slug"]]
             ax.axhline(base, color=col, lw=0.7, ls=(0, (1, 2)), alpha=0.6, zorder=1)
-            # R=100 fitted channels: the data, drawn light
-            for det, r in it["alt"].items():
-                k = r["show"]
-                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k],
-                            fmt="none", ecolor=col, elinewidth=0.8, capsize=0,
-                            alpha=0.28, zorder=2)
-                ax.plot(r["wave"][k], base + r[key][k], "o", ms=3.6, mfc=col, mec="none",
-                        alpha=0.45, zorder=2)
-            # the same channels averaged to a coarser R, bold: the guide for the eye
-            for det, r in (it.get("alt_bin") or {}).items():
+            fine = resolution >= 90
+            for det, r in it[alt_key].items():
                 k = r["show"]
                 ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k], xerr=r["wave_err"][k],
-                            fmt="none", ecolor="#1F2937", elinewidth=1.3, capsize=0,
-                            alpha=0.9, zorder=3)
-                ax.plot(r["wave"][k], base + r[key][k], "o", ms=8.0, mfc=col, mec="#111827",
-                        mew=0.9, zorder=4)
+                            fmt="none", ecolor="#374151", elinewidth=0.9 if fine else 1.2,
+                            capsize=0, alpha=0.8, zorder=2)
+                ax.plot(r["wave"][k], base + r[key][k], "o", ms=5.6 if fine else 7.4, mfc=col,
+                        mec="#111827", mew=0.6 if fine else 0.8, zorder=3)
             ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=15,
                     fontweight="bold", ha="left", va="center", zorder=4)
             ax.text(LABEL_X, base - 0.14 * spacing, f"{it['p']['teq']:.0f} K", color=col,
@@ -427,7 +420,8 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
         for side in ("top", "right", "bottom", "left"):
             ax.spines[side].set_linewidth(1.4)
         fig.subplots_adjust(left=0.075, right=0.985, top=0.99, bottom=0.045)
-        paths = _save(fig, out, "patchwork_library_stack" + ("" if unit == "H" else "_km"))
+        paths = _save(fig, out, f"patchwork_library_stack_R{resolution:g}"
+                      + ("" if unit == "H" else "_km"))
         plt.close(fig)
     return paths
 
@@ -683,18 +677,17 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out-dir", default=".")
     ap.add_argument("--hold", nargs="*", default=[],
                     help="Target slugs kept out of the stack (shown as held in the comparison).")
-    ap.add_argument("--bin-resolution", type=float, default=30.0,
-                    help="Bold overlay of the same channels averaged to this R (0: none).")
-    ap.add_argument("--resolution", type=float, default=100.0,
-                    help="Display resolution for the stacked figure; 100 (default) draws the "
-                         "fitted R=100 channels themselves, lower values rebin.")
-    ap.add_argument("--spacing", type=float, default=6.0,
-                    help="Constant row offset in scale heights for the stacked figure.")
+    ap.add_argument("--resolutions", default="100:6,50:5",
+                    help="Stacked figures to draw, as R:row-offset-in-H pairs. R=100 draws the "
+                         "fitted channels themselves; lower R rebins them. One figure per R, "
+                         "never overlaid.")
     args = ap.parse_args(argv)
 
     root = Path(os.path.expanduser(args.root))
     out = Path(os.path.expanduser(args.out_dir))
     out.mkdir(parents=True, exist_ok=True)
+    stack_res = [(float(a), float(b)) for a, b in
+                 (pair.split(":") for pair in args.resolutions.split(","))]
     slugs = sorted(p.name for p in root.iterdir() if (p / "combined").is_dir())
     names = {s: planet_name(root, s) for s in slugs}
     params = fetch_params(list(names.values()))
@@ -707,10 +700,10 @@ def main(argv=None) -> int:
             missing.append(slug)
             continue
         p = params[name]
-        alt, mean_ppm = to_altitude(spec, p, args.resolution)
-        alt_bin = (to_altitude(spec, p, args.bin_resolution)[0]
-                   if 0 < args.bin_resolution < args.resolution else None)
-        items.append({"slug": slug, "name": name, "p": p, "alt": alt, "alt_bin": alt_bin,
+        alts = {r: to_altitude(spec, p, r)[0] for r, _ in stack_res}
+        alt, mean_ppm = to_altitude(spec, p, stack_res[0][0])
+        items.append({"slug": slug, "name": name, "p": p, "alt": alt,
+                      **{f"alt_R{r:g}": a for r, a in alts.items()},
                       "mean_ppm": mean_ppm,
                       "mod": modulation(spec, p), "white": white_depths(root, slug),
                       "index": {k: band_index(spec, p, k) for k in BAND_INDICES},
@@ -750,17 +743,21 @@ def main(argv=None) -> int:
                         m["median_err_H"], m["chi2_red"], m["nrs2_offset_ppm"], m["amp_H_2sig"], lo, hi,
                         json_dumps(ref.get("mu")), ref.get("ref", "")])
     shown = [it for it in items if not it["held"]]
-    km_spacing = args.spacing * float(np.median([it["p"]["H_km"] for it in shown]))
-    # one significant figure, so the numbered axis reads 0, 1000, 2000 km
-    mag = 10 ** np.floor(np.log10(km_spacing))
-    km_spacing = float(np.ceil(km_spacing / mag) * mag)
+    # km row offsets: the H offset times the median scale height, rounded to
+    # one significant figure so the axis reads in round kilometres
+    med_h = float(np.median([it["p"]["H_km"] for it in shown]))
+    km_mag = 10 ** np.floor(np.log10(med_h * stack_res[0][1]))
     lit_mu = load_literature("literature_subneptunes.json")
     lit_params = fetch_params(list(lit_mu))
     lit_params.update({it["name"]: it["p"] for it in items})
     patchwork_names = {it["name"] for it in items}
     new_targets = [it["name"] for it in items if it["name"] not in lit_mu and it["name"] not in lit]
-    for path in (plot_stack(shown, out, args.resolution, args.spacing, unit="H")
-                 + plot_stack(shown, out, args.resolution, km_spacing, unit="km")
+    stacks = []
+    for res, spacing in stack_res:
+        km_sp = float(np.ceil(spacing * med_h / km_mag) * km_mag)
+        stacks += plot_stack(shown, out, res, spacing, unit="H", alt_key=f"alt_R{res:g}")
+        stacks += plot_stack(shown, out, res, km_sp, unit="km", alt_key=f"alt_R{res:g}")
+    for path in (stacks
                  + plot_band_indices(shown, lit_mu, out)
                  + plot_mu_landscape(lit_mu, lit_params, patchwork_names, new_targets, out)):
         print(path)
