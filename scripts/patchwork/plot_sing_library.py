@@ -303,20 +303,33 @@ def _rank_colors(n):
     return [cmap(x) for x in (np.linspace(0, 1, n) if n > 1 else [0.0])]
 
 
+# Temperature groups for the stack, at the regime boundaries the literature
+# proposes: clear/cold-trap temperate planets, the 500-800 K aerosol window
+# (Brande et al. 2024), and planets too hot for CH4 haze (Davenport et al. 2025).
+TEMP_GROUPS = [("Temperate", 0.0, 450.0), ("Warm", 450.0, 800.0), ("Hot", 800.0, np.inf)]
+# Cool blue -> hot orange. Colours step along this gradient by T_eq RANK:
+# a linear T_eq scale left the five 309-415 K planets one shade of blue.
+TEQ_COLORS = ["#1D4ED8", "#4F46E5", "#7C3AED", "#C026D3", "#DB2777", "#EF4444", "#F97316"]
+TEQ_RANGE = (300.0, 1000.0)
+
+
+def teq_color(teq):
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("teq", TEQ_COLORS)
+    return cmap(np.clip((teq - TEQ_RANGE[0]) / (TEQ_RANGE[1] - TEQ_RANGE[0]), 0, 1))
+
+
 def plot_stack(items, out: Path, resolution: float, spacing: float,
                unit: str = "H") -> list[str]:
-    """Sing et al. (2016) Figure 1 layout: one row per planet, hot at the top.
+    """Sing et al. (2016) Figure 1 layout, planets in ascending T_eq from the
+    top, grouped into temperate / warm / hot and coloured by T_eq.
 
-    Every row is offset by the same ``spacing`` and the y axis is numbered,
-    as in the original, so a feature's size reads off the axis directly.
-    Points are filled in the planet's colour with dark outlines and dark
-    error bars (vertical: 1 sigma; horizontal: bin width); names sit inside
-    the frame at the right end of each row.
-
-    ``unit="H"``: dR_p in units of the reference H2/He scale height; each
-    row also states H and its 1-sigma, and rows with sigma(g)/g >
-    FADE_SIGMA_G are faded. ``unit="km"``: dR_p in km, no atmospheric
-    assumption.
+    Every row is offset by the same ``spacing`` (plus a gap between groups)
+    and the y axis is numbered, as in the original. Points are filled in the
+    planet's colour with dark outlines and dark error bars (vertical: 1 sigma;
+    horizontal: bin width). ``unit="H"``: z(lambda)/H_eq with H_eq from
+    T_eq and g at mu = 2.3, as Sing et al. defined it. ``unit="km"``: the
+    radius change in km, no atmospheric assumption.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -324,49 +337,68 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
     from matplotlib.ticker import MultipleLocator, FixedLocator, NullFormatter
 
     key, ekey = ("z", "z_err") if unit == "H" else ("km", "km_err")
-    n = len(items)
-    cols = _rank_colors(n)
-    top = n * spacing                       # rows at 0, spacing, ... (n-1)*spacing
+    rows = sorted(items, key=lambda it: it["p"]["teq"])        # coolest first = top
+
+    def group_of(teq):
+        return next(i for i, (_, lo, hi) in enumerate(TEMP_GROUPS) if lo <= teq < hi)
+
+    # positions: hottest row at 0, climbing; an extra gap between groups
+    group_gap = 0.6 * spacing
+    bases, y = {}, 0.0
+    prev = None
+    for it in reversed(rows):
+        g = group_of(it["p"]["teq"])
+        if prev is not None:
+            y += spacing + (group_gap if g != prev else 0.0)
+        bases[it["slug"]] = y
+        prev = g
+    top = y + spacing
     LABEL_X, XMAX = 5.15, 5.80
+    n = len(rows)
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("teq", TEQ_COLORS)
+    colour = {it["slug"]: cmap(k / max(1, n - 1)) for k, it in enumerate(rows)}
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(13.0, 0.95 * n + 2.2))
-        for i, it in enumerate(items):           # items sorted hot -> cool
-            base = (n - 1 - i) * spacing
-            col = cols[i]
-            sg = it["p"].get("sigma_g_frac", np.nan)
-            faded = unit == "H" and np.isfinite(sg) and sg > FADE_SIGMA_G
-            a = 0.4 if faded else 1.0
-            ax.axhline(base, color=col, lw=0.7, ls=(0, (1, 2)), alpha=0.6 * a, zorder=1)
+        fig, ax = plt.subplots(figsize=(13.0, 0.95 * n + 2.6))
+        for it in rows:
+            base = bases[it["slug"]]
+            col = colour[it["slug"]]
+            ax.axhline(base, color=col, lw=0.7, ls=(0, (1, 2)), alpha=0.6, zorder=1)
             for det, r in it["alt"].items():
                 k = r["show"]
                 ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k], xerr=r["wave_err"][k],
                             fmt="none", ecolor="#374151", elinewidth=1.2, capsize=0,
-                            alpha=0.85 * a, zorder=2)
+                            alpha=0.85, zorder=2)
                 ax.plot(r["wave"][k], base + r[key][k], "o", ms=8.0, mfc=col, mec="#111827",
-                        mew=0.8, alpha=a, zorder=3)
-            # name inside the frame, right end, just above the row (as Sing)
-            # name in a gutter inside the frame, past the last data (~5.1 um)
+                        mew=0.8, zorder=3)
             ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=15,
-                    fontweight="bold", ha="left", va="center",
-                    alpha=1.0 if not faded else 0.6, zorder=4)
-            if unit == "H":
-                sh = it["p"].get("sigma_H_frac", np.nan)
-                sub = f"{it['p']['teq']:.0f} K · H {it['p']['H_km']:.0f} km ±{100 * sh:.0f}%"
-            else:
-                sub = f"{it['p']['teq']:.0f} K · {it['p']['rp_re']:.2f} R⊕"
-            ax.text(LABEL_X, base - 0.12 * spacing, sub, color=col, fontsize=11, ha="left",
-                    va="center", alpha=0.95 if not faded else 0.6, zorder=4)
+                    fontweight="bold", ha="left", va="center", zorder=4)
+            ax.text(LABEL_X, base - 0.14 * spacing, f"{it['p']['teq']:.0f} K", color=col,
+                    fontsize=11.5, ha="left", va="center", zorder=4)
+        # group headers and separators
+        for gi, (gname, lo, hi) in enumerate(TEMP_GROUPS):
+            members = [it for it in rows if group_of(it["p"]["teq"]) == gi]
+            if not members:
+                continue
+            upper = max(bases[it["slug"]] for it in members)
+            rng = (f"T$_{{\\rm eq}}$ < {hi:.0f} K" if lo == 0 else
+                   f"T$_{{\\rm eq}}$ > {lo:.0f} K" if not np.isfinite(hi) else
+                   f"{lo:.0f}–{hi:.0f} K")
+            ax.text(LABEL_X, upper + 0.58 * spacing, f"{gname}  ·  {rng}", fontsize=12.5,
+                    fontstyle="italic", color="#4B5563", ha="left", va="center", zorder=4)
+            lower = min(bases[it["slug"]] for it in members)
+            if lower > 0:
+                ax.axhline(lower - 0.5 * (spacing + group_gap), color="#D1D5DB", lw=1.0, zorder=0)
         ax.axvspan(*GAP_UM, color="#E5E7EB", lw=0, zorder=0)
         for label, w in FEATURES.items():
             ax.axvline(w, color="#6B7280", lw=0.9, ls=(0, (5, 4)), zorder=0)
-            ax.text(w, top - 0.12 * spacing, label, ha="center", va="top", fontsize=15,
+            ax.text(w, top + 0.05 * spacing, label, ha="center", va="top", fontsize=15,
                     color="#374151", zorder=4,
                     bbox=dict(boxstyle="square,pad=0.15", fc="white", ec="none"))
         ax.set_xlim(2.80, XMAX)
-        ax.set_ylim(-0.75 * spacing, top + 0.15 * spacing)
+        ax.set_ylim(-0.75 * spacing, top + 0.3 * spacing)
         ax.yaxis.set_major_locator(MultipleLocator(spacing))
-        minor = spacing / 5 if unit == "H" else spacing / 2
-        ax.yaxis.set_minor_locator(MultipleLocator(minor))
+        ax.yaxis.set_minor_locator(MultipleLocator(spacing / 5 if unit == "H" else spacing / 2))
         ax.xaxis.set_major_locator(FixedLocator([3.0, 3.5, 4.0, 4.5, 5.0]))
         ax.axvline(LABEL_X - 0.04, color="#E5E7EB", lw=0.8, zorder=0)
         ax.xaxis.set_minor_locator(MultipleLocator(0.1))
@@ -376,14 +408,12 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
         ax.tick_params(which="minor", length=4, width=1.0)
         ax.set_xlabel(r"Wavelength ($\mu$m)", fontsize=16)
         if unit == "H":
-            ax.set_ylabel(r"Relative altitude in H$_2$/He scale heights,  $\Delta R_p / H$"
-                          "\n" r"($H = k_B T_{\rm eq}/\mu m_u g$,  $\mu$ = 2.3 reference; rows offset)",
-                          fontsize=15)
+            ax.set_ylabel(r"Relative altitude in scale heights, $z(\lambda)/H_{\rm eq}$", fontsize=16)
         else:
-            ax.set_ylabel(r"Relative altitude,  $\Delta R_p$  (km;  rows offset)", fontsize=15)
+            ax.set_ylabel(r"Relative altitude, $\Delta R_p$ (km)", fontsize=16)
         for side in ("top", "right", "bottom", "left"):
             ax.spines[side].set_linewidth(1.4)
-        fig.subplots_adjust(left=0.085, right=0.985, top=0.99, bottom=0.045)
+        fig.subplots_adjust(left=0.075, right=0.985, top=0.99, bottom=0.045)
         paths = _save(fig, out, "patchwork_library_stack" + ("" if unit == "H" else "_km"))
         plt.close(fig)
     return paths
