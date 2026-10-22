@@ -187,6 +187,15 @@ def to_altitude(spec, p, resolution):
     """Rebin each detector and convert to z/H about the planet's mean depth."""
     rows = {}
     for det, s in spec.items():
+        w = np.asarray(s["wave"], float); we = np.asarray(s["wave_err"], float)
+        native_r = float(np.nanmedian(w / (2 * we)))
+        if resolution >= 0.98 * native_r:
+            # the fitted channels themselves (R=100 survey grid): no rebinning
+            ok = np.isfinite(w) & np.isfinite(np.asarray(s["depth_ppm"], float))
+            rows[det] = {"wave": w[ok], "wave_err": we[ok],
+                         "depth": np.asarray(s["depth_ppm"], float)[ok],
+                         "depth_err": np.asarray(s["depth_err_ppm"], float)[ok]}
+            continue
         rb = rebin(s["wave"], s["wave_err"], s["depth_ppm"], s["depth_err_ppm"],
                    np.full(len(s["wave"]), np.nan), resolution=resolution)
         rows[det] = {k: np.array([r[k] for r in rb]) for k in ("wave", "wave_err", "depth", "depth_err")}
@@ -359,18 +368,28 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
     cmap = LinearSegmentedColormap.from_list("teq", TEQ_COLORS)
     colour = {it["slug"]: cmap(k / max(1, n - 1)) for k, it in enumerate(rows)}
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(13.0, 0.95 * n + 2.6))
+        # vertical room is what makes ~1 H features visible
+        fig, ax = plt.subplots(figsize=(14.0, 0.25 * (top + spacing) + 1.4))
         for it in rows:
             base = bases[it["slug"]]
             col = colour[it["slug"]]
             ax.axhline(base, color=col, lw=0.7, ls=(0, (1, 2)), alpha=0.6, zorder=1)
+            # R=100 fitted channels: the data, drawn light
             for det, r in it["alt"].items():
                 k = r["show"]
+                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k],
+                            fmt="none", ecolor=col, elinewidth=0.8, capsize=0,
+                            alpha=0.28, zorder=2)
+                ax.plot(r["wave"][k], base + r[key][k], "o", ms=3.6, mfc=col, mec="none",
+                        alpha=0.45, zorder=2)
+            # the same channels averaged to a coarser R, bold: the guide for the eye
+            for det, r in (it.get("alt_bin") or {}).items():
+                k = r["show"]
                 ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k], xerr=r["wave_err"][k],
-                            fmt="none", ecolor="#374151", elinewidth=1.2, capsize=0,
-                            alpha=0.85, zorder=2)
+                            fmt="none", ecolor="#1F2937", elinewidth=1.3, capsize=0,
+                            alpha=0.9, zorder=3)
                 ax.plot(r["wave"][k], base + r[key][k], "o", ms=8.0, mfc=col, mec="#111827",
-                        mew=0.8, zorder=3)
+                        mew=0.9, zorder=4)
             ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=15,
                     fontweight="bold", ha="left", va="center", zorder=4)
             ax.text(LABEL_X, base - 0.14 * spacing, f"{it['p']['teq']:.0f} K", color=col,
@@ -664,9 +683,12 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out-dir", default=".")
     ap.add_argument("--hold", nargs="*", default=[],
                     help="Target slugs kept out of the stack (shown as held in the comparison).")
-    ap.add_argument("--resolution", type=float, default=30.0,
-                    help="Display resolution for the stacked figure (R=100 input).")
-    ap.add_argument("--spacing", type=float, default=5.0,
+    ap.add_argument("--bin-resolution", type=float, default=30.0,
+                    help="Bold overlay of the same channels averaged to this R (0: none).")
+    ap.add_argument("--resolution", type=float, default=100.0,
+                    help="Display resolution for the stacked figure; 100 (default) draws the "
+                         "fitted R=100 channels themselves, lower values rebin.")
+    ap.add_argument("--spacing", type=float, default=6.0,
                     help="Constant row offset in scale heights for the stacked figure.")
     args = ap.parse_args(argv)
 
@@ -686,7 +708,10 @@ def main(argv=None) -> int:
             continue
         p = params[name]
         alt, mean_ppm = to_altitude(spec, p, args.resolution)
-        items.append({"slug": slug, "name": name, "p": p, "alt": alt, "mean_ppm": mean_ppm,
+        alt_bin = (to_altitude(spec, p, args.bin_resolution)[0]
+                   if 0 < args.bin_resolution < args.resolution else None)
+        items.append({"slug": slug, "name": name, "p": p, "alt": alt, "alt_bin": alt_bin,
+                      "mean_ppm": mean_ppm,
                       "mod": modulation(spec, p), "white": white_depths(root, slug),
                       "index": {k: band_index(spec, p, k) for k in BAND_INDICES},
                       "held": slug in args.hold})
