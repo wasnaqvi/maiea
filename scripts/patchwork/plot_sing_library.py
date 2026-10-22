@@ -353,14 +353,29 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
 
     # positions: hottest row at 0, climbing; an extra gap between groups
     group_gap = 0.6 * spacing
+
+    def extent(it):
+        """(below, above) the row's zero spanned by its drawn points and error
+        bars, 5th-95th percentile, so one stray edge bin does not decide it."""
+        lo, hi = [0.0], [0.0]
+        for r in it[alt_key].values():
+            k = r["show"]
+            lo += list(r[key][k] - r[ekey][k]); hi += list(r[key][k] + r[ekey][k])
+        return -np.percentile(lo, 5), np.percentile(hi, 95)
+
+    ext = {it["slug"]: extent(it) for it in rows}
+    pad = 0.15 * spacing
     bases, y = {}, 0.0
-    prev = None
-    for it in reversed(rows):
+    prev = prev_slug = None
+    for it in reversed(rows):                 # hottest row at 0, climbing
         g = group_of(it["p"]["teq"])
         if prev is not None:
-            y += spacing + (group_gap if g != prev else 0.0)
+            step = spacing + (group_gap if g != prev else 0.0)
+            # constant offset, widened only where two rows would collide
+            need = ext[prev_slug][1] + ext[it["slug"]][0] + pad
+            y += max(step, need)
         bases[it["slug"]] = y
-        prev = g
+        prev, prev_slug = g, it["slug"]
     top = y + spacing
     LABEL_X, XMAX = 5.15, 5.80
     n = len(rows)
@@ -378,11 +393,17 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
             fine = resolution >= 90
             for det, r in it[alt_key].items():
                 k = r["show"]
-                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k], xerr=r["wave_err"][k],
+                # horizontal bars are the channel width (lambda/R), not an
+                # uncertainty; at R=100 they are about a marker wide, so the
+                # marker is kept small enough for them to show
+                ax.errorbar(r["wave"][k], base + r[key][k], xerr=r["wave_err"][k],
+                            fmt="none", ecolor="#111827", elinewidth=1.4 if fine else 1.3,
+                            capsize=0, alpha=0.9, zorder=2)
+                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k],
                             fmt="none", ecolor="#374151", elinewidth=0.9 if fine else 1.2,
                             capsize=0, alpha=0.8, zorder=2)
-                ax.plot(r["wave"][k], base + r[key][k], "o", ms=5.6 if fine else 7.4, mfc=col,
-                        mec="#111827", mew=0.6 if fine else 0.8, zorder=3)
+                ax.plot(r["wave"][k], base + r[key][k], "o", ms=4.2 if fine else 7.4, mfc=col,
+                        mec="#111827", mew=0.5 if fine else 0.8, zorder=3)
             ax.text(LABEL_X, base + 0.16 * spacing, it["name"], color=col, fontsize=15,
                     fontweight="bold", ha="left", va="center", zorder=4)
             ax.text(LABEL_X, base - 0.14 * spacing, f"{it['p']['teq']:.0f} K", color=col,
@@ -402,7 +423,7 @@ def plot_stack(items, out: Path, resolution: float, spacing: float,
                     color="#374151", zorder=4,
                     bbox=dict(boxstyle="square,pad=0.15", fc="white", ec="none"))
         ax.set_xlim(2.80, XMAX)
-        ax.set_ylim(-0.75 * spacing, top + 0.3 * spacing)
+        ax.set_ylim(-max(0.75 * spacing, ext[rows[-1]["slug"]][0] + 0.25 * spacing), top + 0.3 * spacing)
         ax.yaxis.set_major_locator(MultipleLocator(spacing))
         ax.yaxis.set_minor_locator(MultipleLocator(spacing / 5 if unit == "H" else spacing / 2))
         ax.xaxis.set_major_locator(FixedLocator([3.0, 3.5, 4.0, 4.5, 5.0]))
