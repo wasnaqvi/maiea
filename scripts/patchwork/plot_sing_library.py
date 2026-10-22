@@ -10,15 +10,29 @@ decision of 2026-10-20: models come with the paper).
     python scripts/patchwork/plot_sing_library.py ~/Patchwork_v16 -o figs \\
         --hold TOI_125_b TOI_270_c
 
-Writes ``patchwork_library_stack.{pdf,svg,png}``,
-``patchwork_mmw_trend.{pdf,svg,png}`` and ``patchwork_library_table.csv``.
+Writes ``patchwork_library_stack{,_km}.{pdf,svg,png}``,
+``patchwork_literature_comparison.{pdf,svg,png}`` and
+``patchwork_library_table.csv``.
 
 Conventions
 -----------
-* Altitude: z(lambda) = R* (sqrt(D) - sqrt(<D>)) / H, with H = k Teq / (mu m_u g)
-  at mu = 2.3 (solar H2/He) -- the normalisation Sing et al. used, so a
-  feature's height reads directly against a clear hydrogen atmosphere.
-  <D> is each planet's inverse-variance mean over both detectors.
+* The measured quantity is the change in apparent radius,
+  dR_p(lambda) = R* (sqrt(D(lambda)) - sqrt(<D>)), with <D> each planet's
+  inverse-variance mean over both detectors. ``_km`` plots it as is: it
+  needs only the depths and R*.
+* The main stack divides it by a REFERENCE scale height,
+  H_ref = k T_eq / (mu m_u g) with mu = 2.3 (solar H2/He). That is not the
+  planet's scale height -- several of these planets are known not to be
+  H2/He -- but the unit in which a clear hydrogen atmosphere's features
+  span ~2-5, so a muted row reads directly as "not a clear H2/He
+  atmosphere". It is labelled as a reference unit, not an altitude.
+* T_eq is computed uniformly, T_eq = T_eff sqrt(R*/2a) (zero albedo, full
+  redistribution), not taken from each discovery paper's own convention.
+  g = G M_p / R_p^2 from the archive. sigma(H)/H propagates the archive
+  errors on M_p, R_p, T_eff and a/R*; the idealisation in T_eq itself
+  (albedo, redistribution) is not included. Rows with sigma(g)/g >
+  ``FADE_SIGMA_G`` are drawn faded: their vertical scale is uncertain by
+  more than the features they show.
 * Spectra are shown as measured: no NRS1-NRS2 offset is applied. The
   fitted offset is listed in the table and printed by each row.
 * Modulation: the wavelength-independent intrinsic scatter beyond the
@@ -49,9 +63,14 @@ sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE))
 
 from plot_survey_scale_heights import (  # noqa: E402
+    AMU,
+    G_SI,
+    K_B,
+    M_EARTH,
     MU_H2HE,
+    R_EARTH,
+    R_SUN,
     _profile_intrinsic_scatter,
-    planet_params,
     pretty,
 )
 from rebin_spectra import rebin  # noqa: E402
@@ -68,6 +87,10 @@ GAP_UM = (3.72, 3.82)
 DISPLAY_ERR_CLIP = 3.0
 DISPLAY_ERR_MAX_H = 3.0     # and never draw a bin whose error exceeds this many H
 FEATURES = {r"CH$_4$": 3.32, r"SO$_2$": 4.05, r"CO$_2$": 4.30, "CO": 4.65}
+# A row whose surface gravity is uncertain by more than this has an uncertain
+# vertical scale (in H units); it is drawn faded.
+FADE_SIGMA_G = 0.30
+AU_M = 1.495978707e11
 # Hot (top) -> cool (bottom), after Sing et al. 2016.
 SING_COLORS = ["#F08A3C", "#D4425A", "#B2387E", "#7A3F99", "#4B53A8", "#3C7CC0"]
 
@@ -83,6 +106,64 @@ def planet_name(root: Path, slug: str) -> str:
         if name:
             return str(name)
     return pretty(slug)
+
+
+def fetch_params(names: list[str]) -> dict[str, dict]:
+    """Archive parameters with errors, T_eq computed uniformly.
+
+    Every planet gets the same T_eq definition (zero albedo, full
+    redistribution) from its host's T_eff and a/R*, so the scale-height
+    unit differs between planets only through physics, not through each
+    discovery paper's convention.
+    """
+    from aster_toolkit.data_acquisition.mast import archive_tap_query
+
+    rows = archive_tap_query(
+        ["pl_name in (" + ",".join("'" + n.replace("'", "''") + "'" for n in names) + ")"],
+        columns=["pl_name", "pl_rade", "pl_radeerr1", "pl_radeerr2", "pl_bmasse",
+                 "pl_bmasseerr1", "pl_bmasseerr2", "st_rad", "st_teff", "st_tefferr1",
+                 "pl_ratdor", "pl_ratdorerr1", "pl_orbsmax", "pl_eqt"],
+    )
+
+    def f(r, k):
+        try:
+            v = float(r.get(k))
+            return v if np.isfinite(v) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+
+    def half(r, k):
+        a, b = f(r, k + "err1"), f(r, k + "err2")
+        vals = [abs(x) for x in (a, b) if np.isfinite(x)]
+        return float(np.mean(vals)) if vals else np.nan
+
+    out = {}
+    for r in rows:
+        rp_re, mp_me, rs = f(r, "pl_rade"), f(r, "pl_bmasse"), f(r, "st_rad")
+        teff = f(r, "st_teff")
+        ars = f(r, "pl_ratdor")
+        ars_err = half(r, "pl_ratdor")
+        if not np.isfinite(ars):
+            ars = f(r, "pl_orbsmax") * AU_M / (rs * R_SUN)
+            ars_err = np.nan
+        if not all(np.isfinite(x) and x > 0 for x in (rp_re, mp_me, rs, teff, ars)):
+            continue
+        rp, mp = rp_re * R_EARTH, mp_me * M_EARTH
+        teq = teff * np.sqrt(1.0 / (2.0 * ars))
+        g = G_SI * mp / rp**2
+        h = K_B * teq / (MU_H2HE * AMU * g)
+        sg = np.hypot(half(r, "pl_bmasse") / mp_me, 2 * half(r, "pl_rade") / rp_re)
+        st = np.hypot(f(r, "st_tefferr1") / teff if np.isfinite(f(r, "st_tefferr1")) else 0.0,
+                      0.5 * ars_err / ars if np.isfinite(ars_err) else 0.0)
+        out[r["pl_name"]] = {
+            "archive_name": r["pl_name"], "rp_m": rp, "mp_kg": mp, "rs_m": rs * R_SUN,
+            "rp_re": rp_re, "mp_me": mp_me, "teq": float(teq),
+            "teq_archive": f(r, "pl_eqt"), "g": float(g), "H_km": float(h / 1e3),
+            "delta_ppm": float(2 * rp * h / (rs * R_SUN) ** 2 * 1e6),
+            "sigma_g_frac": float(sg) if np.isfinite(sg) else np.nan,
+            "sigma_H_frac": float(np.hypot(sg, st)) if np.isfinite(sg) else np.nan,
+        }
+    return out
 
 
 def load_combined(root: Path, slug: str) -> dict[str, dict[str, np.ndarray]]:
@@ -111,8 +192,10 @@ def to_altitude(spec, p, resolution):
     h_m = p["H_km"] * 1e3
     for r in rows.values():
         depth = np.clip(r["depth"], 1e-3, None) * 1e-6
-        r["z"] = p["rs_m"] * (np.sqrt(depth) - np.sqrt(mean_ppm * 1e-6)) / h_m
-        r["z_err"] = p["rs_m"] * (r["depth_err"] * 1e-6) / (2 * np.sqrt(depth)) / h_m
+        r["km"] = p["rs_m"] * (np.sqrt(depth) - np.sqrt(mean_ppm * 1e-6)) / 1e3
+        r["km_err"] = p["rs_m"] * (r["depth_err"] * 1e-6) / (2 * np.sqrt(depth)) / 1e3
+        r["z"] = r["km"] * 1e3 / h_m
+        r["z_err"] = r["km_err"] * 1e3 / h_m
     med = float(np.median(np.concatenate([r["z_err"] for r in rows.values()])))
     for r in rows.values():
         r["show"] = (r["z_err"] <= DISPLAY_ERR_CLIP * med) & (r["z_err"] <= DISPLAY_ERR_MAX_H)
@@ -207,19 +290,24 @@ def _colors(items):
     return {it["slug"]: cmap(norm(it["p"]["teq"])) for it in items}, cmap, norm
 
 
-def plot_stack(items, out: Path, resolution: float, spacing: float) -> list[str]:
+def plot_stack(items, out: Path, resolution: float, spacing: float,
+               unit: str = "H") -> list[str]:
     """Sing et al. (2016) style: one row per planet, hot at the top.
 
+    ``unit="H"``: dR_p in units of the reference H2/He scale height, with
+    each row's normalisation uncertainty stated and poorly constrained rows
+    faded. ``unit="km"``: dR_p in km -- no atmospheric assumption at all.
+
     Points only. Each row is its own zero (dotted). Rows are at least
-    ``spacing`` scale heights apart and further where a row's own points
-    and error bars need the room (a low-precision planet would otherwise
-    run through its neighbours). No cumulative tick numbers -- a scale bar
-    gives the vertical size instead.
+    ``spacing`` (in the plotted unit) apart and further where a row's own
+    points need the room. No cumulative tick numbers -- a scale bar gives
+    the vertical size instead.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    key, ekey = ("z", "z_err") if unit == "H" else ("km", "km_err")
     colors, _, _ = _colors(items)
     n = len(items)
 
@@ -228,52 +316,77 @@ def plot_stack(items, out: Path, resolution: float, spacing: float) -> list[str]
         lo, hi = [0.0], [0.0]
         for r in it["alt"].values():
             k = r["show"]
-            lo += list(r["z"][k] - r["z_err"][k]); hi += list(r["z"][k] + r["z_err"][k])
+            lo += list(r[key][k] - r[ekey][k]); hi += list(r[key][k] + r[ekey][k])
         return -np.percentile(lo, 10), np.percentile(hi, 90)
 
     ext = [extent(it) for it in items]
+    pad = 0.2 * spacing
     bases = np.zeros(n)
     for i in range(n - 2, -1, -1):            # bottom row (index n-1) at 0
-        gap = max(spacing, ext[i + 1][1] + ext[i][0] + 0.8)
-        bases[i] = bases[i + 1] + gap
-    height = bases[0] + ext[0][1] + ext[-1][0] + 2
+        bases[i] = bases[i + 1] + max(spacing, ext[i + 1][1] + ext[i][0] + pad)
+    bar = 2.0 if unit == "H" else float(np.round(spacing / 2, -1) or spacing / 2)
+    height_units = (bases[0] + ext[0][1] + ext[-1][0]) / spacing + 1.5
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(9.0, 0.19 * height + 1.2))
+        fig, ax = plt.subplots(figsize=(9.6, 0.78 * height_units + 1.2))
         for i, it in enumerate(items):           # items sorted hot -> cool
             base = bases[i]
             col = colors[it["slug"]]
-            ax.axhline(base, color=col, lw=0.8, ls=":", alpha=0.7, zorder=1)
+            sg = it["p"].get("sigma_g_frac", np.nan)
+            faded = unit == "H" and np.isfinite(sg) and sg > FADE_SIGMA_G
+            alpha = 0.35 if faded else 1.0
+            ax.axhline(base, color=col, lw=0.8, ls=":", alpha=0.7 * alpha, zorder=1)
             for det, r in it["alt"].items():
                 k = r["show"]
-                ax.errorbar(r["wave"][k], base + r["z"][k], yerr=r["z_err"][k],
+                ax.errorbar(r["wave"][k], base + r[key][k], yerr=r[ekey][k],
                             fmt="o", ms=5.2, mfc=col, mec="#1F2937", mew=0.6,
-                            ecolor=col, elinewidth=1.1, capsize=0, zorder=3)
+                            ecolor=col, elinewidth=1.1, capsize=0, zorder=3, alpha=alpha)
             ax.text(5.18, base, it["name"], color=col, fontsize=11, fontweight="bold",
-                    va="bottom")
-            ax.text(5.18, base, f"{it['p']['teq']:.0f} K", color=col, fontsize=8.5, va="top")
+                    va="bottom", alpha=1.0 if not faded else 0.55)
+            if unit == "H":
+                sh = it["p"].get("sigma_H_frac", np.nan)
+                note = (f"{it['p']['teq']:.0f} K · H = {it['p']['H_km']:.0f} km ± "
+                        f"{100 * sh:.0f}%" if np.isfinite(sh) else f"{it['p']['teq']:.0f} K")
+                if faded:
+                    note += f"\nσ(g) = {100 * sg:.0f}%: scale uncertain"
+            else:
+                note = f"{it['p']['teq']:.0f} K · {it['p']['rp_re']:.2f} R⊕"
+            ax.text(5.18, base, note, color=col, fontsize=8, va="top",
+                    alpha=1.0 if not faded else 0.7, linespacing=1.15)
         ax.axvspan(*GAP_UM, color="#D5D9E0", alpha=0.6, lw=0, zorder=0)
         for label, w in FEATURES.items():
             ax.axvline(w, color="#9CA3AF", lw=0.8, ls=(0, (4, 4)), zorder=0)
             ax.text(w, 1.005, label, ha="center", va="bottom", fontsize=10.5, color="#4B5563",
                     transform=ax.get_xaxis_transform())
-        # vertical scale bar: 2 scale heights
-        x0, y0 = 2.86, -ext[-1][0] - 1.6
-        ax.plot([x0, x0], [y0, y0 + 2], color="#111827", lw=2.2, solid_capstyle="butt")
-        ax.text(x0 + 0.03, y0 + 1, "2 H", fontsize=9.5, va="center", color="#111827")
+        x0, y0 = 2.86, -ext[-1][0] - 0.4 * spacing
+        ax.plot([x0, x0], [y0, y0 + bar], color="#111827", lw=2.2, solid_capstyle="butt")
+        ax.text(x0 + 0.03, y0 + bar / 2, f"{bar:g} {'H' if unit == 'H' else 'km'}",
+                fontsize=9.5, va="center", color="#111827")
         ax.set_xlim(2.8, 5.15)
-        ax.set_ylim(-ext[-1][0] - 2.0, bases[0] + ext[0][1] + 0.6)
+        ax.set_ylim(y0 - 0.15 * spacing, bases[0] + ext[0][1] + 0.15 * spacing)
         ax.set_yticks([])
         ax.set_xlabel(r"Wavelength  ($\mu$m)", fontsize=11.5)
-        ax.set_ylabel(r"Relative altitude  $z(\lambda)/H_{\rm eq}$   ($\mu$ = 2.3)", fontsize=11.5)
-        ax.set_title(f"Patchwork — JWST NIRSpec/G395H transmission spectra  (R ≈ {resolution:g})",
-                     fontsize=12.5, pad=24)
-        ax.text(0.0, -0.045,
-                f"Uniform Patchwork fit v1.6. Rows ≥{spacing:g} H apart; dotted line = each planet's mean. "
-                "As measured (no NRS1–NRS2 offset applied). Grey band: detector gap. "
-                f"Bins with errors >{DISPLAY_ERR_CLIP:g}× the planet's median or >{DISPLAY_ERR_MAX_H:g} H not drawn.",
-                transform=ax.transAxes, fontsize=7.8, color="#6B7280", va="top")
-        fig.subplots_adjust(right=0.82)
-        paths = _save(fig, out, "patchwork_library_stack")
+        if unit == "H":
+            ax.set_ylabel("ΔR$_p$ in units of an H$_2$/He scale height\n"
+                          r"$H = k_B T_{\rm eq} / (\mu\, m_u\, g)$,  μ = 2.3 (reference, not measured)",
+                          fontsize=11)
+        else:
+            ax.set_ylabel("ΔR$_p$  (km)\nmeasured; needs only the depths and R$_\\star$",
+                          fontsize=11)
+        title = ("Patchwork — JWST NIRSpec/G395H transmission spectra in H$_2$/He scale heights"
+                 if unit == "H" else
+                 "Patchwork — JWST NIRSpec/G395H transmission spectra, radius change in km")
+        ax.set_title(f"{title}  (R ≈ {resolution:g})", fontsize=12, pad=24)
+        foot = (f"Uniform Patchwork fit v1.6. Each dotted line is that planet's mean; rows ≥{spacing:g} "
+                f"{'H' if unit == 'H' else 'km'} apart. As measured (no NRS1–NRS2 offset applied). "
+                "Grey band: detector gap. ")
+        if unit == "H":
+            foot += ("T$_{\\rm eq}$ = T$_{\\rm eff}\\sqrt{R_\\star/2a}$ for every planet; g from archive "
+                     "M$_p$, R$_p$. ±% = 1σ on H from archive errors (not the T$_{\\rm eq}$ idealisation). "
+                     f"Faded: σ(g) > {100 * FADE_SIGMA_G:.0f}%.")
+        ax.text(0.0, -0.045, foot, transform=ax.transAxes, fontsize=7.6, color="#6B7280",
+                va="top", wrap=True)
+        fig.subplots_adjust(right=0.78)
+        paths = _save(fig, out, "patchwork_library_stack" + ("" if unit == "H" else "_km"))
         plt.close(fig)
     return paths
 
@@ -405,10 +518,7 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     slugs = sorted(p.name for p in root.iterdir() if (p / "combined").is_dir())
     names = {s: planet_name(root, s) for s in slugs}
-    params = planet_params(list(names.values()))
-    # planet_params keys some planets by a display alias (TOI-836.01 ->
-    # "TOI-836 c"); look them up by the archive name as well.
-    params.update({v["archive_name"]: v for v in list(params.values())})
+    params = fetch_params(list(names.values()))
     lit = load_literature()
     items, missing = [], []
     for slug in slugs:
@@ -431,7 +541,8 @@ def main(argv=None) -> int:
           f"{'white NRS1/NRS2':>17s}  {'published':>15s}  ratio")
     with (out / "patchwork_library_table.csv").open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["planet", "held", "teq_K", "mass_Mearth", "radius_Rearth", "ppm_per_H",
+        w.writerow(["planet", "held", "teq_K_uniform", "teq_K_archive", "mass_Mearth", "radius_Rearth",
+                    "g_ms2", "sigma_g_frac", "H_km", "sigma_H_frac", "ppm_per_H",
                     "white_nrs1_ppm", "white_nrs1_err", "white_nrs2_ppm", "white_nrs2_err",
                     "published_depth_ppm", "median_err_H", "chi2_red_flat", "nrs2_offset_ppm",
                     "modulation_H_2sig", f"mu_floor_clear{A_CLEAR_RMS_H[0]}",
@@ -450,12 +561,17 @@ def main(argv=None) -> int:
                   f"{m['amp_H_2sig']:7.2f} {lo:5.1f}-{hi:5.1f}  {n1[0]:7.0f}/{n2[0]:<7.0f}  "
                   f"{'/'.join(f'{x:.0f}' for x in pub) if pub else '-':>15s}  {ratio}"
                   + ("  HELD" if it["held"] else ""))
-            w.writerow([it["name"], it["held"], p["teq"], p["mp_me"], p["rp_re"], p["delta_ppm"],
+            w.writerow([it["name"], it["held"], p["teq"], p["teq_archive"], p["mp_me"], p["rp_re"],
+                        p["g"], p["sigma_g_frac"], p["H_km"], p["sigma_H_frac"], p["delta_ppm"],
                         n1[0], n1[1], n2[0], n2[1], "/".join(f"{x:g}" for x in pub) if pub else "",
                         m["median_err_H"], m["chi2_red"], m["nrs2_offset_ppm"], m["amp_H_2sig"], lo, hi,
                         json_dumps(ref.get("mu")), ref.get("ref", "")])
     shown = [it for it in items if not it["held"]]
-    for path in plot_stack(shown, out, args.resolution, args.spacing) + plot_comparison(items, lit, out):
+    km_spacing = 4.0 * float(np.median([it["p"]["H_km"] for it in shown]))
+    km_spacing = float(np.round(km_spacing, -2)) or km_spacing
+    for path in (plot_stack(shown, out, args.resolution, args.spacing, unit="H")
+                 + plot_stack(shown, out, args.resolution, km_spacing, unit="km")
+                 + plot_comparison(items, lit, out)):
         print(path)
     if missing:
         print("No archive parameters or spectra (left out): " + ", ".join(missing))
