@@ -65,7 +65,8 @@ GAP_UM = (3.72, 3.82)
 # median is an under-filled edge bin; it is drawn as nothing rather than as an
 # error bar crossing three rows. It stays in the modulation statistic (which
 # weights it by 1/sigma^2 anyway) and in the table.
-DISPLAY_ERR_CLIP = 4.0
+DISPLAY_ERR_CLIP = 3.0
+DISPLAY_ERR_MAX_H = 3.0     # and never draw a bin whose error exceeds this many H
 FEATURES = {r"CH$_4$": 3.32, r"SO$_2$": 4.05, r"CO$_2$": 4.30, "CO": 4.65}
 # Hot (top) -> cool (bottom), after Sing et al. 2016.
 SING_COLORS = ["#F08A3C", "#D4425A", "#B2387E", "#7A3F99", "#4B53A8", "#3C7CC0"]
@@ -114,7 +115,7 @@ def to_altitude(spec, p, resolution):
         r["z_err"] = p["rs_m"] * (r["depth_err"] * 1e-6) / (2 * np.sqrt(depth)) / h_m
     med = float(np.median(np.concatenate([r["z_err"] for r in rows.values()])))
     for r in rows.values():
-        r["show"] = r["z_err"] <= DISPLAY_ERR_CLIP * med
+        r["show"] = (r["z_err"] <= DISPLAY_ERR_CLIP * med) & (r["z_err"] <= DISPLAY_ERR_MAX_H)
     return rows, mean_ppm
 
 
@@ -164,182 +165,225 @@ def _save(fig, out: Path, stem: str) -> list[str]:
     return paths
 
 
-def plot_stack(items, out: Path, resolution: float, spacing: float) -> list[str]:
-    import matplotlib
-    matplotlib.use("Agg")
+def white_depths(root: Path, slug: str) -> dict[str, tuple[float, float]]:
+    """Patchwork white-light depth per detector, inverse-variance over visits."""
+    import json
+    path = root / slug / "patchwork_summary.json"
+    if not path.is_file():
+        return {}
+    with path.open() as handle:
+        visits = json.load(handle).get("visits") or {}
+    acc: dict[str, list[tuple[float, float]]] = {}
+    for v in visits.values():
+        for det, f in (v.get("fits") or {}).items():
+            w = f.get("white_depth_ppm") or {}
+            if w.get("median") is None:
+                continue
+            acc.setdefault(det, []).append(
+                (float(w["median"]), max(float(w.get("plus", 0)), float(w.get("minus", 0)), 1e-9)))
+    out = {}
+    for det, vals in acc.items():
+        d = np.array([x[0] for x in vals]); e = np.array([x[1] for x in vals])
+        wts = 1 / e**2
+        out[det] = (float(np.sum(d * wts) / np.sum(wts)), float(1 / np.sqrt(np.sum(wts))))
+    return out
+
+
+def load_literature() -> dict:
+    import json
+    path = HERE / "literature_g395h.json"
+    if not path.is_file():
+        return {}
+    with path.open() as handle:
+        return {k: v for k, v in json.load(handle).items() if not k.startswith("_")}
+
+
+def _colors(items):
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap
-
     cmap = LinearSegmentedColormap.from_list("sing", SING_COLORS[::-1])
     teqs = np.array([it["p"]["teq"] for it in items])
     norm = plt.Normalize(teqs.min(), teqs.max())
+    return {it["slug"]: cmap(norm(it["p"]["teq"])) for it in items}, cmap, norm
+
+
+def plot_stack(items, out: Path, resolution: float, spacing: float) -> list[str]:
+    """Sing et al. (2016) style: one row per planet, hot at the top.
+
+    Points only. Each row is its own zero (dotted). Rows are at least
+    ``spacing`` scale heights apart and further where a row's own points
+    and error bars need the room (a low-precision planet would otherwise
+    run through its neighbours). No cumulative tick numbers -- a scale bar
+    gives the vertical size instead.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    colors, _, _ = _colors(items)
     n = len(items)
+
+    def extent(it):
+        """(below, above) the row's zero that its drawn points occupy."""
+        lo, hi = [0.0], [0.0]
+        for r in it["alt"].values():
+            k = r["show"]
+            lo += list(r["z"][k] - r["z_err"][k]); hi += list(r["z"][k] + r["z_err"][k])
+        return -np.percentile(lo, 10), np.percentile(hi, 90)
+
+    ext = [extent(it) for it in items]
+    bases = np.zeros(n)
+    for i in range(n - 2, -1, -1):            # bottom row (index n-1) at 0
+        gap = max(spacing, ext[i + 1][1] + ext[i][0] + 0.8)
+        bases[i] = bases[i + 1] + gap
+    height = bases[0] + ext[0][1] + ext[-1][0] + 2
     with plt.rc_context(_style()):
-        fig, ax = plt.subplots(figsize=(8.6, 1.05 * n + 1.6))
+        fig, ax = plt.subplots(figsize=(9.0, 0.19 * height + 1.2))
         for i, it in enumerate(items):           # items sorted hot -> cool
-            base = (n - 1 - i) * spacing
-            col = cmap(norm(it["p"]["teq"]))
+            base = bases[i]
+            col = colors[it["slug"]]
+            ax.axhline(base, color=col, lw=0.8, ls=":", alpha=0.7, zorder=1)
             for det, r in it["alt"].items():
                 k = r["show"]
-                ax.errorbar(r["wave"][k], base + r["z"][k], yerr=r["z_err"][k], xerr=r["wave_err"][k],
-                            fmt="o", ms=3.6, mfc="#3A3A3A", mec="#1E1E1E", mew=0.5,
-                            ecolor=col, elinewidth=1.0, capsize=0, zorder=3)
-                ax.plot(r["wave"][k], base + r["z"][k], "-", color=col, lw=1.6, alpha=0.75, zorder=2)
-            ax.axhline(base, color=col, lw=0.6, ls=":", alpha=0.6, zorder=1)
-            m = it["mod"]
-            ax.text(5.22, base + 0.25 * spacing, it["name"], color=col, fontsize=10.5,
-                    fontweight="bold", va="center")
-            ax.text(5.22, base - 0.12 * spacing,
-                    f"{it['p']['teq']:.0f} K · {it['p']['delta_ppm']:.0f} ppm/H",
-                    color=col, fontsize=8, va="center")
-        ax.axvspan(*GAP_UM, color="#C9CED6", alpha=0.45, lw=0, zorder=0)
-        top = (n - 1) * spacing + 0.7 * spacing
+                ax.errorbar(r["wave"][k], base + r["z"][k], yerr=r["z_err"][k],
+                            fmt="o", ms=5.2, mfc=col, mec="#1F2937", mew=0.6,
+                            ecolor=col, elinewidth=1.1, capsize=0, zorder=3)
+            ax.text(5.18, base, it["name"], color=col, fontsize=11, fontweight="bold",
+                    va="bottom")
+            ax.text(5.18, base, f"{it['p']['teq']:.0f} K", color=col, fontsize=8.5, va="top")
+        ax.axvspan(*GAP_UM, color="#D5D9E0", alpha=0.6, lw=0, zorder=0)
         for label, w in FEATURES.items():
-            ax.axvline(w, color="#8A8F99", lw=0.8, ls=(0, (3, 3)), zorder=0)
-            ax.text(w, 1.005, label, ha="center", va="bottom", fontsize=10, color="#555B66",
+            ax.axvline(w, color="#9CA3AF", lw=0.8, ls=(0, (4, 4)), zorder=0)
+            ax.text(w, 1.005, label, ha="center", va="bottom", fontsize=10.5, color="#4B5563",
                     transform=ax.get_xaxis_transform())
-        ax.set_xlim(2.8, 5.2)
-        ax.set_ylim(-0.8 * spacing, top)
-        ax.set_xlabel(r"Wavelength  ($\mu$m)")
-        ax.set_ylabel(r"Relative altitude in scale heights  $z(\lambda)/H_{\rm eq}$"
-                      "\n" r"($\mu$ = 2.3, rows offset by " f"{spacing:g})")
-        ax.set_yticks(np.arange(0, n) * spacing)
-        ax.set_yticklabels([f"{k * spacing:g}" for k in range(n)])
-        ax.set_title(f"Patchwork — JWST NIRSpec/G395H transmission spectra (R≈{resolution:g})",
-                     fontsize=12, pad=26)
-        fig.text(0.01, 0.005,
-                 "Uniform Patchwork fit v1.6. Spectra as measured (no NRS1–NRS2 offset applied); "
-                 f"shaded band: detector gap; bins with errors >{DISPLAY_ERR_CLIP:g}× the planet's median "
-                 "not drawn.", fontsize=7.5, color="#6B7280")
-        fig.subplots_adjust(right=0.80)
+        # vertical scale bar: 2 scale heights
+        x0, y0 = 2.86, -ext[-1][0] - 1.6
+        ax.plot([x0, x0], [y0, y0 + 2], color="#111827", lw=2.2, solid_capstyle="butt")
+        ax.text(x0 + 0.03, y0 + 1, "2 H", fontsize=9.5, va="center", color="#111827")
+        ax.set_xlim(2.8, 5.15)
+        ax.set_ylim(-ext[-1][0] - 2.0, bases[0] + ext[0][1] + 0.6)
+        ax.set_yticks([])
+        ax.set_xlabel(r"Wavelength  ($\mu$m)", fontsize=11.5)
+        ax.set_ylabel(r"Relative altitude  $z(\lambda)/H_{\rm eq}$   ($\mu$ = 2.3)", fontsize=11.5)
+        ax.set_title(f"Patchwork — JWST NIRSpec/G395H transmission spectra  (R ≈ {resolution:g})",
+                     fontsize=12.5, pad=24)
+        ax.text(0.0, -0.045,
+                f"Uniform Patchwork fit v1.6. Rows ≥{spacing:g} H apart; dotted line = each planet's mean. "
+                "As measured (no NRS1–NRS2 offset applied). Grey band: detector gap. "
+                f"Bins with errors >{DISPLAY_ERR_CLIP:g}× the planet's median or >{DISPLAY_ERR_MAX_H:g} H not drawn.",
+                transform=ax.transAxes, fontsize=7.8, color="#6B7280", va="top")
+        fig.subplots_adjust(right=0.82)
         paths = _save(fig, out, "patchwork_library_stack")
         plt.close(fig)
     return paths
 
 
-def _repel_labels(ax, xs, ys, labels, color="#4B5563", fontsize=7.5):
-    """Place labels beside points, nudged apart vertically so none overlap.
-    A few lines of greedy repulsion in display space -- enough for ~20 points
-    without pulling in adjustText."""
-    if not labels:
-        return
-    trans = ax.transData
-    pts = trans.transform(np.column_stack([xs, ys]))
-    order = np.argsort(pts[:, 1])
-    pos = pts.copy()
-    pos[:, 0] += 6
-    min_gap = fontsize * 1.35
-    for _ in range(60):
-        moved = False
-        for i in range(len(order)):
-            for j in range(i + 1, len(order)):
-                a, b = order[i], order[j]
-                if abs(pos[a, 0] - pos[b, 0]) < 70 and abs(pos[a, 1] - pos[b, 1]) < min_gap:
-                    shift = (min_gap - abs(pos[a, 1] - pos[b, 1])) / 2 + 0.2
-                    lo, hi = (a, b) if pos[a, 1] <= pos[b, 1] else (b, a)
-                    pos[lo, 1] -= shift
-                    pos[hi, 1] += shift
-                    moved = True
-        if not moved:
-            break
-    inv = trans.inverted()
-    for k, lab in enumerate(labels):
-        tx, ty = inv.transform(pos[k])
-        ax.annotate(lab, (xs[k], ys[k]), xytext=(tx, ty), textcoords="data",
-                    fontsize=fontsize, color=color, va="center",
-                    arrowprops=dict(arrowstyle="-", color="#C4C9D1", lw=0.5,
-                                    shrinkA=0, shrinkB=3))
+def plot_comparison(items, lit, out: Path) -> list[str]:
+    """Patchwork against the published JWST results, one row per planet.
 
-
-def plot_trend(items, held, out: Path) -> list[str]:
-    """(a) modulation limit vs precision, (b) mu floor vs mass, (c) vs Teq.
-
-    Panel (a) is there because the limits track precision (log-log
-    correlation ~0.8 on the v1.6 set): a planet sitting on the precision
-    line has been measured, not constrained. Read (b) and (c) through it.
+    Left: Patchwork white-light depth / published depth, per detector.
+    Right: Patchwork's cloud-free mu floor (bar, for the assumed clear-
+    atmosphere bracket) against the published mu constraint (black).
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import LinearSegmentedColormap
-    from matplotlib.ticker import FixedLocator, NullFormatter
 
-    cmap = LinearSegmentedColormap.from_list("sing", SING_COLORS[::-1])
-    teqs = np.array([it["p"]["teq"] for it in items])
-    norm = plt.Normalize(teqs.min(), teqs.max())
-    names = [it["name"] for it in items]
-    prec = np.array([it["mod"]["median_err_H"] for it in items])
-    a2 = np.array([it["mod"]["amp_H_2sig"] for it in items])
-    det = np.array([it["mod"]["detected"] for it in items])
-    mass = np.array([it["p"]["mp_me"] for it in items])
-    flo = np.array([mu_floor(a, A_CLEAR_RMS_H[0]) for a in a2])
-    fhi = np.array([mu_floor(a, A_CLEAR_RMS_H[1]) for a in a2])
-    cols = [cmap(norm(t)) for t in teqs]
-
+    colors, cmap, norm = _colors(items)
+    rows = list(items)                         # hot at the top
+    n = len(rows)
     with plt.rc_context(_style()):
-        fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.4),
-                                 gridspec_kw={"width_ratios": [1, 1.15, 1.15]})
-        ax = axes[0]
-        for x, y, c, d in zip(prec, a2, cols, det):
-            ax.plot(x, y, "o" if d else "v", ms=8, color=c, mec="#1E1E1E", mew=0.6, zorder=3)
-        lim = np.array([0.1, 6])
-        ax.plot(lim, lim, color="#9CA3AF", lw=1, ls="--")
-        ax.text(1.5, 1.25, "limit = channel precision", rotation=40, fontsize=8, color="#6B7280")
-        ax.axhspan(*A_CLEAR_RMS_H, color="#F08A3C", alpha=0.15, lw=0)
-        ax.text(0.12, 0.72, "clear H$_2$/He bracket (assumed)", fontsize=8, color="#B45309")
-        ax.set_xscale("log"); ax.set_yscale("log")
-        ax.set_xlim(0.15, 5); ax.set_ylim(0.15, 5)
-        for axis in (ax.xaxis, ax.yaxis):
-            axis.set_major_locator(FixedLocator([0.2, 0.3, 0.5, 1, 2, 3, 5]))
-            axis.set_minor_formatter(NullFormatter())
-            axis.set_major_formatter(matplotlib.ticker.FormatStrFormatter("%g"))
-        ax.set_xlabel("Channel precision  (median σ, scale heights)")
-        ax.set_ylabel("Spectral modulation, 2σ limit  (rms, scale heights)")
-        ax.set_title("(a) what each spectrum can rule out", fontsize=10.5, loc="left")
-        _repel_labels(ax, prec, a2, names)
-
-        for ax, x, xlabel, title, logx in (
-                (axes[1], mass, r"Planet mass  ($M_\oplus$)", "(b) μ floor vs mass", True),
-                (axes[2], teqs, r"Equilibrium temperature  (K)", "(c) μ floor vs temperature", False)):
-            for xi, lo, hi, c in zip(x, flo, fhi, cols):
-                if np.isfinite(lo) and hi > MU_H2HE * 1.02:
-                    ax.vlines(xi, lo, hi, color=c, lw=5, alpha=0.85, zorder=3)
-                    ax.plot(xi, hi, "^", color=c, mec="#1E1E1E", mew=0.5, ms=8, zorder=4)
-                else:
-                    ax.plot(xi, MU_H2HE, "o", mfc="white", mec=c, mew=1.6, ms=7, zorder=4)
-            for mu, ls, lab in ((MU_H2HE, "--", r"H$_2$/He  μ = 2.3"),
-                                (18.0, ":", "H$_2$O steam  μ = 18"),
-                                (44.0, "-.", r"CO$_2$  μ = 44")):
-                ax.axhline(mu, color="#6B7280", lw=1.0, ls=ls)
-                ax.text(0.98, mu * 1.07, lab, transform=ax.get_yaxis_transform(),
-                        ha="right", fontsize=8, color="#6B7280")
-            ax.set_yscale("log"); ax.set_ylim(1.8, 70)
-            ax.yaxis.set_major_locator(FixedLocator([2, 3, 5, 10, 20, 50]))
-            ax.yaxis.set_minor_formatter(NullFormatter())
-            ax.set_yticklabels(["2", "3", "5", "10", "20", "50"])
-            if logx:
-                ax.set_xscale("log")
-                ax.xaxis.set_major_locator(FixedLocator([1, 2, 3, 5, 10, 20]))
-                ax.xaxis.set_minor_formatter(NullFormatter())
-                ax.set_xticklabels(["1", "2", "3", "5", "10", "20"])
-                ax.set_xlim(1.2, 22)
-            ax.set_xlabel(xlabel)
-            ax.set_title(title, fontsize=10.5, loc="left")
-            _repel_labels(ax, x, np.where(np.isfinite(fhi), np.maximum(fhi, MU_H2HE), MU_H2HE), names)
-        axes[1].set_ylabel("Cloud-free mean molecular weight floor  μ  (amu)")
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        cb = fig.colorbar(sm, ax=axes[2], pad=0.02, fraction=0.05)
-        cb.set_label(r"$T_{\rm eq}$ (K)")
-        fig.suptitle("Patchwork — muted spectra and mean molecular weight", fontsize=13)
-        note = ("Bars: μ floor for a clear-atmosphere rms of "
-                f"{A_CLEAR_RMS_H[0]}–{A_CLEAR_RMS_H[1]} H (an assumption, not a model fit); open circle: "
-                "no constraint beyond H$_2$/He. A floor is on 'μ or aerosols' — clouds mute features "
-                "exactly as a heavier atmosphere does. Limits track precision (panel a).")
-        if held:
-            note += "  Held (GP absorbs transit depth): " + ", ".join(held) + "."
-        fig.text(0.01, -0.02, note, fontsize=7.5, color="#6B7280", wrap=True)
-        fig.tight_layout(rect=(0, 0.02, 1, 0.95))
-        paths = _save(fig, out, "patchwork_mmw_trend")
+        fig, (axd, axm) = plt.subplots(1, 2, figsize=(13.5, 0.55 * n + 2.0), sharey=True,
+                                       gridspec_kw={"width_ratios": [1, 1.6], "wspace": 0.05})
+        ys = np.arange(n)[::-1]
+        for y, it in zip(ys, rows):
+            col = colors[it["slug"]]
+            ref = lit.get(it["name"], {})
+            held = it.get("held", False)
+            # -- depth ratio ---------------------------------------------
+            pub = ref.get("depth_ppm")
+            wd = it.get("white", {})
+            if pub:
+                for k, det in enumerate(("NRS1", "NRS2")):
+                    if det not in wd:
+                        continue
+                    pd = pub[k] if len(pub) > 1 else pub[0]
+                    ratio = wd[det][0] / pd
+                    err = wd[det][1] / pd
+                    axd.errorbar(ratio, y + (0.12 if k == 0 else -0.12), xerr=err,
+                                 fmt="o" if det == "NRS1" else "s", ms=6.5,
+                                 mfc="white" if held else col, mec="#1F2937", mew=0.8,
+                                 ecolor="#6B7280", elinewidth=1.0, capsize=0, zorder=3)
+            else:
+                axd.text(1.0, y, "no published G395H depth", ha="center", va="center",
+                         fontsize=8, color="#9CA3AF")
+            # -- mu ------------------------------------------------------
+            m = it["mod"]
+            lo, hi = (mu_floor(m["amp_H_2sig"], a) for a in A_CLEAR_RMS_H)
+            if np.isfinite(lo) and hi > MU_H2HE * 1.02 and not held:
+                axm.plot([lo, hi], [y + 0.1, y + 0.1], color=col, lw=7, alpha=0.9,
+                         solid_capstyle="butt", zorder=3)
+                axm.annotate("", xy=(hi * 1.35, y + 0.1), xytext=(hi, y + 0.1),
+                             arrowprops=dict(arrowstyle="-|>", color=col, lw=2), zorder=3)
+            elif not held:
+                axm.plot(MU_H2HE, y + 0.1, "o", mfc="white", mec=col, mew=2, ms=8, zorder=3)
+            pm = ref.get("mu") or {}
+            if "lower" in pm:
+                axm.annotate("", xy=(pm["lower"] * 1.6, y - 0.18), xytext=(pm["lower"], y - 0.18),
+                             arrowprops=dict(arrowstyle="-|>", color="#111827", lw=1.6), zorder=4)
+                axm.plot(pm["lower"], y - 0.18, "|", color="#111827", ms=11, mew=2, zorder=4)
+            elif "low" in pm:
+                axm.plot([pm["low"], pm["high"]], [y - 0.18, y - 0.18], color="#111827", lw=2.4,
+                         solid_capstyle="butt", zorder=4)
+                axm.plot([pm["low"], pm["high"]], [y - 0.18, y - 0.18], "|", color="#111827",
+                         ms=11, mew=2, zorder=4)
+            label = ref.get("verdict", "no published JWST spectrum")
+            if held:
+                label = "HELD in Patchwork (GP absorbs depth) · " + label
+            axm.text(75, y, label, fontsize=7.8, va="center", ha="left",
+                     color="#374151" if ref else "#9CA3AF")
+        # reference lines
+        axd.axvline(1.0, color="#111827", lw=1)
+        axd.axvspan(0.95, 1.05, color="#E5E7EB", lw=0, zorder=0)
+        axd.set_xlim(0.6, 1.25)
+        axd.set_xlabel("Patchwork ÷ published white-light depth", fontsize=10.5)
+        from matplotlib.lines import Line2D
+        axd.legend(handles=[
+            Line2D([], [], marker="o", ls="", mfc="#9CA3AF", mec="#1F2937", ms=7, label="NRS1"),
+            Line2D([], [], marker="s", ls="", mfc="#9CA3AF", mec="#1F2937", ms=7, label="NRS2"),
+            Line2D([], [], marker="o", ls="", mfc="white", mec="#1F2937", ms=7, label="held")],
+            loc="lower left", fontsize=8.5, frameon=False, handletextpad=0.3)
+        axd.set_yticks(ys)
+        axd.set_yticklabels([it["name"] for it in rows], fontsize=10.5)
+        for t, it in zip(axd.get_yticklabels(), rows):
+            t.set_color(colors[it["slug"]]); t.set_fontweight("bold")
+        for mu, ls, lab in ((MU_H2HE, "--", "H$_2$/He\n2.3"), (18.0, ":", "H$_2$O\n18"),
+                            (44.0, "-.", "CO$_2$\n44")):
+            axm.axvline(mu, color="#6B7280", lw=1.0, ls=ls, zorder=1)
+            axm.text(mu, n - 0.35, lab, ha="center", va="bottom", fontsize=8.5, color="#4B5563")
+        axm.set_xscale("log")
+        axm.set_xlim(1.9, 70)
+        axm.set_xticks([2, 3, 5, 10, 20, 50])
+        axm.set_xticklabels(["2", "3", "5", "10", "20", "50"])
+        axm.set_xlabel("Mean molecular weight  μ  (amu)", fontsize=10.5)
+        axm.legend(handles=[
+            Line2D([], [], color="#7A3F99", lw=6, label="Patchwork cloud-free floor"),
+            Line2D([], [], marker="o", ls="", mfc="white", mec="#7A3F99", mew=2, ms=7,
+                   label="Patchwork: no constraint beyond H$_2$/He"),
+            Line2D([], [], color="#111827", lw=2, marker="|", ms=10, mew=2,
+                   label="published constraint")],
+            loc="upper right", bbox_to_anchor=(1.0, 0.94), fontsize=8.5, frameon=True,
+            framealpha=0.95, edgecolor="#E5E7EB")
+        axm.set_ylim(-0.7, n + 0.4)
+        fig.suptitle("Patchwork v1.6 against the published JWST results", fontsize=13.5, y=0.995)
+        fig.text(0.01, -0.01,
+                 "Depth ratio: same detector where the paper gives both. Patchwork floor: 2σ modulation limit "
+                 f"for an assumed clear-atmosphere rms of {A_CLEAR_RMS_H[0]}–{A_CLEAR_RMS_H[1]} H (bar spans the bracket; "
+                 "arrow = floor). Published μ: quoted, or converted from metallicity for a solar-scaled gas "
+                 "(scripts/patchwork/literature_g395h.json lists which). Both are floors on 'μ or aerosols'.",
+                 fontsize=7.6, color="#6B7280", wrap=True)
+        fig.subplots_adjust(right=0.62, top=0.93)
+        paths = _save(fig, out, "patchwork_literature_comparison")
         plt.close(fig)
     return paths
 
@@ -349,69 +393,78 @@ def main(argv=None) -> int:
     ap.add_argument("root", help="Directory of per-target Patchwork outputs.")
     ap.add_argument("-o", "--out-dir", default=".")
     ap.add_argument("--hold", nargs="*", default=[],
-                    help="Target slugs to leave out (listed on the figure).")
-    ap.add_argument("--resolution", type=float, default=40.0,
+                    help="Target slugs kept out of the stack (shown as held in the comparison).")
+    ap.add_argument("--resolution", type=float, default=30.0,
                     help="Display resolution for the stacked figure (R=100 input).")
-    ap.add_argument("--spacing", type=float, default=0.0,
-                    help="Row offset in scale heights (default: from the data).")
+    ap.add_argument("--spacing", type=float, default=4.0,
+                    help="Row offset in scale heights for the stacked figure.")
     args = ap.parse_args(argv)
 
     root = Path(os.path.expanduser(args.root))
     out = Path(os.path.expanduser(args.out_dir))
-    slugs = sorted(p.name for p in root.iterdir()
-                   if (p / "combined").is_dir() and p.name not in args.hold)
+    out.mkdir(parents=True, exist_ok=True)
+    slugs = sorted(p.name for p in root.iterdir() if (p / "combined").is_dir())
     names = {s: planet_name(root, s) for s in slugs}
     params = planet_params(list(names.values()))
     # planet_params keys some planets by a display alias (TOI-836.01 ->
     # "TOI-836 c"); look them up by the archive name as well.
     params.update({v["archive_name"]: v for v in list(params.values())})
+    lit = load_literature()
     items, missing = [], []
     for slug in slugs:
         name = names[slug]
-        if name not in params:
-            missing.append(slug)
-            continue
         spec = load_combined(root, slug)
-        if not spec:
+        if name not in params or not spec:
+            missing.append(slug)
             continue
         p = params[name]
         alt, mean_ppm = to_altitude(spec, p, args.resolution)
-        items.append({"slug": slug, "name": name, "p": p, "alt": alt,
-                      "mean_ppm": mean_ppm, "mod": modulation(spec, p)})
+        items.append({"slug": slug, "name": name, "p": p, "alt": alt, "mean_ppm": mean_ppm,
+                      "mod": modulation(spec, p), "white": white_depths(root, slug),
+                      "held": slug in args.hold})
     items.sort(key=lambda it: -it["p"]["teq"])
     if not items:
         print("No spectra found.")
         return 1
-    # Row gap from the TYPICAL planet, not the noisiest: one low-precision
-    # row should overlap its neighbours a little (as in Sing et al.) rather
-    # than flatten every other spectrum.
-    spacing = args.spacing or float(max(5.0, np.ceil(6 * np.nanmedian([
-        np.nanmedian(np.concatenate([r["z_err"] for r in it["alt"].values()]))
-        for it in items]))))
 
-    print(f"{'planet':13s} {'Teq':>5s} {'Mp':>5s} {'ppm/H':>6s} {'err/H':>6s} {'chi2':>5s} "
-          f"{'NRS2off':>7s} {'A_H':>6s} {'A_H<2s':>7s} {'mu floor':>11s}")
-    with (out.mkdir(parents=True, exist_ok=True) or (out / "patchwork_library_table.csv").open("w", newline="")) as fh:
+    print(f"{'planet':13s} {'Teq':>5s} {'ppm/H':>6s} {'err/H':>6s} {'A_H<2s':>7s} {'mu floor':>11s}  "
+          f"{'white NRS1/NRS2':>17s}  {'published':>15s}  ratio")
+    with (out / "patchwork_library_table.csv").open("w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["planet", "teq_K", "mass_Mearth", "radius_Rearth", "ppm_per_H", "mean_depth_ppm",
-                    "median_err_H", "chi2_red_flat", "nrs2_offset_ppm", "modulation_H",
-                    "modulation_H_2sig", "modulation_detected",
-                    f"mu_floor_clear{A_CLEAR_RMS_H[0]}", f"mu_floor_clear{A_CLEAR_RMS_H[1]}"])
+        w.writerow(["planet", "held", "teq_K", "mass_Mearth", "radius_Rearth", "ppm_per_H",
+                    "white_nrs1_ppm", "white_nrs1_err", "white_nrs2_ppm", "white_nrs2_err",
+                    "published_depth_ppm", "median_err_H", "chi2_red_flat", "nrs2_offset_ppm",
+                    "modulation_H_2sig", f"mu_floor_clear{A_CLEAR_RMS_H[0]}",
+                    f"mu_floor_clear{A_CLEAR_RMS_H[1]}", "published_mu", "published_ref"])
         for it in sorted(items, key=lambda it: it["p"]["teq"]):
-            p, m = it["p"], it["mod"]
+            p, m, wd = it["p"], it["mod"], it["white"]
+            ref = lit.get(it["name"], {})
             lo, hi = (mu_floor(m["amp_H_2sig"], a) for a in A_CLEAR_RMS_H)
-            print(f"{it['name']:13s} {p['teq']:5.0f} {p['mp_me']:5.1f} {p['delta_ppm']:6.0f} "
-                  f"{m['median_err_H']:6.2f} {m['chi2_red']:5.2f} {m['nrs2_offset_ppm']:+7.0f} "
-                  f"{m['amp_H']:6.2f} {m['amp_H_2sig']:7.2f} {lo:5.1f}-{hi:5.1f}")
-            w.writerow([it["name"], p["teq"], p["mp_me"], p["rp_re"], p["delta_ppm"], it["mean_ppm"],
-                        m["median_err_H"], m["chi2_red"], m["nrs2_offset_ppm"], m["amp_H"],
-                        m["amp_H_2sig"], m["detected"], lo, hi])
-    held = [planet_name(root, s) for s in args.hold]
-    for path in plot_stack(items, out, args.resolution, spacing) + plot_trend(items, held, out):
+            n1 = wd.get("NRS1", (np.nan, np.nan)); n2 = wd.get("NRS2", (np.nan, np.nan))
+            pub = ref.get("depth_ppm")
+            ratio = ""
+            if pub:
+                p1, p2 = pub[0], pub[-1]
+                ratio = f"{n1[0] / p1:.3f}/{n2[0] / p2:.3f}"
+            print(f"{it['name']:13s} {p['teq']:5.0f} {p['delta_ppm']:6.0f} {m['median_err_H']:6.2f} "
+                  f"{m['amp_H_2sig']:7.2f} {lo:5.1f}-{hi:5.1f}  {n1[0]:7.0f}/{n2[0]:<7.0f}  "
+                  f"{'/'.join(f'{x:.0f}' for x in pub) if pub else '-':>15s}  {ratio}"
+                  + ("  HELD" if it["held"] else ""))
+            w.writerow([it["name"], it["held"], p["teq"], p["mp_me"], p["rp_re"], p["delta_ppm"],
+                        n1[0], n1[1], n2[0], n2[1], "/".join(f"{x:g}" for x in pub) if pub else "",
+                        m["median_err_H"], m["chi2_red"], m["nrs2_offset_ppm"], m["amp_H_2sig"], lo, hi,
+                        json_dumps(ref.get("mu")), ref.get("ref", "")])
+    shown = [it for it in items if not it["held"]]
+    for path in plot_stack(shown, out, args.resolution, args.spacing) + plot_comparison(items, lit, out):
         print(path)
     if missing:
-        print("No archive parameters (left out): " + ", ".join(missing))
+        print("No archive parameters or spectra (left out): " + ", ".join(missing))
     return 0
+
+
+def json_dumps(x) -> str:
+    import json
+    return json.dumps(x) if x else ""
 
 
 if __name__ == "__main__":

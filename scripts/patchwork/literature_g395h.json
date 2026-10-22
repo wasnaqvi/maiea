@@ -1,0 +1,83 @@
+{
+  "_about": "Published JWST results for Patchwork planets, for comparison with the uniform reduction. depth_ppm: published white-light (Rp/R*)^2 per detector [NRS1, NRS2] (or a single same-band value), computed from the quoted Rp/R* where that is what the paper gives. mu: published mean-molecular-weight constraint in amu -- {lower} or {low, high}; mu_from says whether it was quoted as mu or converted from a metallicity (solar-scaled H/He gas, metals as H2O/CH4/CO: 100x ~ mu 4.2-4.6, 300x ~ 7.6-10, 1000x ~ 16). Compiled 2026-10-22; every entry needs a citation.",
+  "GJ 1214 b": {
+    "ref": "Ohno et al. 2025, ApJL 979, L7 (arXiv:2410.10186); data Schlawin et al. 2024",
+    "verdict": "Thick aerosols over a metal-dominated atmosphere, [M/H] ~ 3.5; tentative CO2",
+    "mu": {"lower": 15}, "mu_from": "converted from [M/H] ~ 3.5 (> 1000x solar)"
+  },
+  "GJ 357 b": {
+    "ref": "Adams Redai et al. 2025, AJ (arXiv:2507.07165)",
+    "verdict": "Featureless; mu < 8 and Z < 300x solar excluded at 3 sigma; high-mu secondary atmosphere or bare rock",
+    "mu": {"lower": 8}, "mu_from": "quoted"
+  },
+  "GJ 9827 d": {
+    "ref": "Piaulet-Ghorayeb et al. 2024, ApJL (arXiv:2410.03527), NIRISS/SOSS + HST",
+    "verdict": "Steam world: H2O is the background gas, VMR > 31%",
+    "mu": {"lower": 7.2}, "mu_from": "converted from H2O VMR > 31% in H2/He"
+  },
+  "L 98-59 d": {
+    "ref": "Banerjee et al. 2024, ApJL 975, L11 (arXiv:2408.15707)",
+    "verdict": "High-mu secondary atmosphere favoured; tentative H2S and SO2; unocculted faculae",
+    "mu": {"low": 10, "high": 32}, "mu_from": "quoted (retrieval range across models)"
+  },
+  "TOI-836.01": {
+    "ref": "Wallack et al. 2024, AJ 168, 77 (arXiv:2404.01264)",
+    "verdict": "Featureless; Z < 175x solar excluded unless aerosols sit above ~1 mbar",
+    "depth_ppm": [1227.9, 1177.7], "depth_note": "Eureka! Rp/R* 0.035041 / 0.034317",
+    "mu": {"lower": 5.5}, "mu_from": "converted from Z > 175x solar (cloud-free)"
+  },
+  "HD 15337 b": {
+    "ref": "COMPASS (TOI-402.01) draft 2026-05-05, NTRS 20260005584",
+    "verdict": "Flat once an NRS1-NRS2 offset is allowed; Z < 50x solar excluded",
+    "depth_ppm": [398.0, 365.2], "depth_note": "ExoTiC-JEDI linear-systematics Rp/R* 0.01995 / 0.01911",
+    "mu": {"lower": 3.3}, "mu_from": "converted from Z > 50x solar"
+  },
+  "LTT 3780 c": {
+    "ref": "Rigby et al. 2025, ApJL 995, L70 (arXiv:2512.15844), as TOI-732 c",
+    "verdict": "CH4 (~1% VMR) in an H2-rich atmosphere; extra absorption from hydrocarbons or S species",
+    "depth_ppm": [3434.0], "depth_note": "G395H, as in juliet.PUBLISHED_G395H_DEPTHS",
+    "mu": {"low": 2.3, "high": 2.6}, "mu_from": "converted from H2-rich + 1% CH4"
+  },
+  "TOI-1231 b": {
+    "ref": "Sarkar et al. 2026 (arXiv:2607.00973), NIRISS/SOSS + G395H",
+    "verdict": "Spot crossings in both white-light curves",
+    "depth_ppm": [5571.0], "depth_note": "G395H, as in juliet.PUBLISHED_G395H_DEPTHS"
+  },
+  "TOI-125 b": {
+    "ref": "arXiv:2609.35607 (TOI-125 b and c, GO 4126)",
+    "verdict": "Muted: clear Z >= 150x solar, or clouds above ~3 mbar (2 sigma)",
+    "depth_ppm": [852.6, 882.1], "depth_note": "global-fit Rp/R* 0.0292 / 0.0297",
+    "mu": {"lower": 5.1}, "mu_from": "converted from Z >= 150x solar (cloud-free)"
+  },
+  "TOI-125 c": {
+    "ref": "arXiv:2609.35607 (TOI-125 b and c, GO 4126)",
+    "verdict": "Only ~70% of the transit observed (TTVs); clear Z > 100x solar or clouds ~10 mbar",
+    "depth_ppm": [948.6, 948.6], "depth_note": "global-fit Rp/R* 0.0308 / 0.0308"
+  },
+  "GJ 3090 b": {
+    "ref": "Ahrer et al. 2025, ApJL (arXiv:2504.20428)",
+    "verdict": "Highly muted G395H spectrum, no CH4; Z > 100x solar for clouds at ~ubar; He escape detected",
+    "mu": {"lower": 4.2}, "mu_from": "converted from Z > 100x solar"
+  },
+  "TOI-776 c": {
+    "ref": "Teske et al. 2025 (arXiv:2502.20501)",
+    "verdict": "No strong features; Z < 180-240x solar excluded for clouds deeper than 1 mbar",
+    "mu": {"lower": 5.6}, "mu_from": "converted from Z > 180x solar"
+  },
+  "TOI-776 b": {
+    "ref": "Alderson et al. 2025, AJ (arXiv:2501.14596)",
+    "verdict": "Muted; low-metallicity clear atmospheres excluded (limits differ by reduction and visit)"
+  },
+  "TOI-836 b": {
+    "ref": "Alderson et al. 2024, AJ 167, 216 (arXiv:2404.00093)",
+    "verdict": "Featureless in two visits; not an H2-dominated atmosphere"
+  },
+  "HD 15337 c": {
+    "ref": "COMPASS 2026, AJ (doi:10.3847/1538-3881/ae2d12)",
+    "verdict": "Mostly featureless"
+  },
+  "K2-18 b": {
+    "ref": "Madhusudhan et al. 2023, ApJL; Schmidt et al. 2025 reanalysis",
+    "verdict": "CH4 and CO2 detected"
+  }
+}
