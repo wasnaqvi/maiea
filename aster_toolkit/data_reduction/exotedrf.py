@@ -72,7 +72,7 @@ DEFAULT_CRDS_CACHE = str(Path.home() / "crds_cache")
 CRDS_CONTEXT = "jwst_1322.pmap"
 NIRSPEC_DETECTORS = ("NRS1", "NRS2")
 
-# Frozen Patchwork reduction settings for NIRSpec/G395H BOTS (SUB2048,
+# Patchwork reduction settings for NIRSpec/G395H BOTS (SUB2048,
 # NRSRAPID). Changing any value here changes the survey definition — bump
 # ``PATCHWORK_CONFIG_VERSION`` if you do, so old and new reductions are
 # never silently mixed in one population analysis.
@@ -221,8 +221,8 @@ def _subprocess_env(crds: str, crds_context: str | None = None) -> dict[str, str
     return env
 
 
-# Checks run inside the exoTEDRF environment. Each entry hard-won from a
-# real failure on DRAC Fir; see scripts/patchwork/patch_exotedrf_env.py.
+# Checks run inside the exoTEDRF environment. Each entry is a result of hellish hours spent debugging failure on DRAC Fir; 
+# see scripts/patchwork/patch_exotedrf_env.py.
 _ENV_CHECK_SCRIPT = r"""
 import json, os, sys
 report = {"python": sys.executable,
