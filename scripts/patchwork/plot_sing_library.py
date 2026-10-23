@@ -698,9 +698,12 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--out-dir", default=".")
     ap.add_argument("--hold", nargs="*", default=[],
                     help="Target slugs kept out of the stack (shown as held in the comparison).")
-    ap.add_argument("--resolutions", default="100:6,50:5",
-                    help="Stacked figures to draw, as R:row-offset-in-H pairs. R=100 draws the "
-                         "fitted channels themselves; lower R rebins them. One figure per R, "
+    ap.add_argument("--resolutions", default="25:4",
+                    help="Stacked figures to draw, as R:row-offset-in-H pairs (default R~25: "
+                         "errors ~2x below R=100 while the CH4/CO2 band shapes survive). Each "
+                         "detector is rebinned on its own grid, so no bin crosses the NRS1/NRS2 "
+                         "gap and no detector offset is applied or averaged away. R=100 draws "
+                         "the fitted channels themselves, e.g. '100:6,50:5'. One figure per R, "
                          "never overlaid.")
     args = ap.parse_args(argv)
 
