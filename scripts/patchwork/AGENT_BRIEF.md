@@ -56,7 +56,7 @@ sandboxed to `workspace/` — use the **link** column.
 |---|---|---|
 | repo / briefs / generator | `/home/wasi/aster/maiea` (`scripts/patchwork`) | `patchwork_scripts/` |
 | job scripts | `/home/wasi/patchwork/jobs/run_<SLUG>.sbatch` | `jobs/` |
-| manifests | `/home/wasi/patchwork/manifests/<SLUG>.json` | `manifests/` |
+| target summaries | `/home/wasi/patchwork/targets/<SLUG>.json` | `targets/` |
 | output root | `/home/wasi/scratch/patchwork` (PURGED) | `results/` |
 | archive | `/project/def-ncowan/wasi/patchwork_reductions` | — |
 | exoTEDRF engine | `/home/wasi/exoTEDRF` (`optimizer` branch) | — |
@@ -68,7 +68,7 @@ stop and say so:
 
 ```
 squeue -u $USER
-ls -l /home/wasi/patchwork/manifests/
+ls -l /home/wasi/patchwork/targets/
 ls -d /home/wasi/scratch/patchwork/*/ 2>/dev/null
 ```
 
@@ -76,7 +76,7 @@ Then a one-line-per-target state table, each target in one of: `not
 started | reduce queued/running/done/verified | fit
 queued/running/done/verified | archived | BLOCKED`.
 
-**Step 1 — preflight** (once per session, before any submission). Run the
+**Step 1 — environment check** (once per session, before any submission). Run the
 `VerifyPatchworkEnvironment` tool. It must print **READY** *and* name
 `/home/wasi/exoTEDRF` as the source. If it names the installed release,
 STOP and report — the optimizer branch is not the engine.
@@ -85,7 +85,7 @@ STOP and report — the optimizer branch is not the engine.
 this as a PLAIN command — no `env -i` wrapper, it needs aster-env:
 
 ```
-python /home/wasi/aster/maiea/scripts/patchwork/generate_survey_jobs.py --manifest-dir /home/wasi/patchwork/manifests --output-root /home/wasi/scratch/patchwork --job-dir /home/wasi/patchwork/jobs --mail-user naqviw802@gmail.com
+python /home/wasi/aster/maiea/scripts/patchwork/generate_survey_jobs.py --summary-dir /home/wasi/patchwork/targets --output-root /home/wasi/scratch/patchwork --job-dir /home/wasi/patchwork/jobs --mail-user naqviw802@gmail.com
 ```
 
 It prints the wave order, each target's expected depth, and the exact
@@ -134,12 +134,12 @@ explicitly. When a check fails, quote the last 20 lines of the relevant
 ## CHECKLIST A — after REDUCE, before submitting the fit
 
 Read `results/<SLUG>/patchwork_summary.json` and
-`results/<SLUG>/reductions/*/reduction_manifest.json` with `ReadFileTool`.
+`results/<SLUG>/reductions/*/reduction_summary.json` with `ReadFileTool`.
 
 - [ ] `ls /home/wasi/scratch/patchwork/<SLUG>/reductions/*/nrs?/**/Stage3/*box_spectra_fullres.fits`
       returns **2 files per visit** (NRS1 + NRS2)
 - [ ] `segments_complete: true` for every visit
-- [ ] `exotedrf.path` is `/home/wasi/exoTEDRF` in **every** manifest —
+- [ ] `exotedrf.path` is `/home/wasi/exoTEDRF` in **every** reduction summary —
       one tree for the whole survey
 - [ ] `crds_context` identical across every target reduced so far
 - [ ] `config_version` is `1.1` everywhere
@@ -165,7 +165,7 @@ FLAG column:
       for error inflation** (COMPASS: real G395H errors run 5-12% above
       the photon prediction)
 - [ ] `ld_source: "exotic-ld"` (not `"uniform"` — grids were missing)
-- [ ] `priors_source: "archive"` (`"manifest-cache"` means the node was
+- [ ] `priors_source: "archive"` (`"summary-cache"` means the node was
       offline: acceptable, but note it)
 - [ ] `fit_version: "1.2"` — `"1.2-nopca"` means the PCA regressors could
       not be built and that target is NOT uniform with the rest
@@ -194,7 +194,7 @@ will not have them:
 
 ```
 ln -sfn /home/wasi/aster/maiea/scripts/patchwork /home/wasi/aster/maiea/workspace/patchwork_scripts
-ln -sfn /home/wasi/patchwork/manifests /home/wasi/aster/maiea/workspace/manifests
+ln -sfn /home/wasi/patchwork/targets   /home/wasi/aster/maiea/workspace/targets
 ln -sfn /home/wasi/patchwork/jobs      /home/wasi/aster/maiea/workspace/jobs
 ln -sfn /home/wasi/scratch/patchwork   /home/wasi/aster/maiea/workspace/results
 ```

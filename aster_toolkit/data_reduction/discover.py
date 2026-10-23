@@ -1,4 +1,4 @@
-"""Patchwork discovery — turn a raw JWST download tree into run manifests.
+"""Patchwork discovery — turn a raw JWST download tree into target summaries.
 
 The download tree is untrustworthy as an index: ASTER fell back to obsid
 folder names when no planet label was attached, one folder name is five
@@ -10,7 +10,7 @@ headers**, which cannot be malformed by a labeling bug.
     scan_raw_tree      walk the tree, one header read per exposure group
     group_visits       group by (program, observation, visit) exposure
     resolve_planet     which planet does this visit actually transit?
-    write_manifests    emit per-planet manifests for survey.py
+    write_target_summaries    emit per-planet target summaries for survey.py
 
 Planet identification is the part worth doing carefully. MAST
 ``TARGPROP`` is host-level ("GJ9827"), and a host may have several
@@ -26,7 +26,7 @@ Instead each visit is matched by:
    ones that actually transit during it.
 
 A visit whose planet cannot be resolved this way is reported as
-unresolved rather than guessed, and is written into the manifest with a
+unresolved rather than guessed, and is written into the target summary with a
 ``planet_name`` of null for you to fill in.
 """
 
@@ -392,23 +392,23 @@ def resolve_planet(
     return resolve_planet_from_rows(rows, expstart_mjd, expend_mjd)
 
 
-# -------------------- manifests --------------------
+# -------------------- target summaries --------------------
 
 
-def build_manifests(
+def build_target_summaries(
     root: str | os.PathLike[str],
     *,
     resolve: bool = True,
     planet_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Scan a raw tree and build one Patchwork manifest per planet.
+    """Scan a raw tree and build one Patchwork target summary per planet.
 
     ``planet_overrides`` maps either a visit prefix (``jw04098010001``)
     or a header target name (``GJ9827``) to a planet name, for the cases
     the transit-window test cannot settle on its own.
     """
     overrides = planet_overrides or {}
-    # Manifests are copied to the cluster and read from other working
+    # Target summaries are copied to the cluster and read from other working
     # directories, so record an absolute raw_root.
     root = os.path.abspath(str(root))
     scan = scan_raw_tree(root)
@@ -470,7 +470,7 @@ def build_manifests(
         else:
             unresolved.append(v)
 
-    manifests = {}
+    targets = {}
     for planet, vs in sorted(by_planet.items()):
         letter = planet.split()[-1] if len(planet.split()[-1]) == 1 else "b"
         # Programs contributing to this planet, e.g. "GO 4098". Recorded so
@@ -478,7 +478,7 @@ def build_manifests(
         # observed by two programs (K2-18 b) lists both.
         programs = sorted({f"GO {int(v['program'])}" for v in vs})
 
-        # Cache the archive ephemeris/orbit/stellar priors in the manifest.
+        # Cache the archive ephemeris/orbit/stellar priors in the target summary.
         # The fit still queries the archive at fit time (so priors cannot go
         # stale), but compute nodes without internet fall back to this cache,
         # and the cached (Rp/Rs)^2 is the expected-depth sanity check.
@@ -493,7 +493,7 @@ def build_manifests(
             except Exception:
                 priors_cache = None
 
-        manifests[planet] = {
+        targets[planet] = {
             "planet_name": planet,
             "planet_letter": letter,
             "program": " + ".join(programs),
@@ -525,26 +525,26 @@ def build_manifests(
             },
         }
 
-    return {"scan": scan, "visits": visits, "manifests": manifests,
+    return {"scan": scan, "visits": visits, "targets": targets,
             "unresolved": unresolved}
 
 
-def write_manifests(result: dict[str, Any],
+def write_target_summaries(result: dict[str, Any],
                     output_dir: str | os.PathLike[str]) -> list[str]:
-    """Write one ``{slug}.json`` manifest per planet. Unresolved visits go
+    """Write one ``{slug}.json`` target summary per planet. Unresolved visits go
     into ``_unresolved.json`` with a null planet_name to fill in."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     written = []
-    for planet, manifest in result["manifests"].items():
+    for planet, target in result["targets"].items():
         path = out / f"{_slug(planet)}.json"
-        path.write_text(json.dumps(manifest, indent=2) + "\n")
+        path.write_text(json.dumps(target, indent=2) + "\n")
         written.append(str(path))
     if result["unresolved"]:
         path = out / "_unresolved.json"
         path.write_text(json.dumps({
             "planet_name": None,
-            "_comment": "Fill planet_name per visit, then split into manifests.",
+            "_comment": "Fill planet_name per visit, then split into target summaries.",
             "visits": [
                 {"visit_prefix": v["visit_prefix"], "target": v["target"],
                  "date_obs": v["date_obs"], "ra": v["ra"], "dec": v["dec"],
@@ -569,7 +569,7 @@ def format_discovery_report(result: dict[str, Any]) -> str:
         f"Patchwork discovery — {scan['root']}",
         f"  {len(scan['exposures'])} exposure group(s); "
         f"{len(visits)} G395H BOTS science visit(s) "
-        f"({len(result['manifests'])} planet(s) resolved).",
+        f"({len(result['targets'])} planet(s) resolved).",
     ]
     if scan["unreadable"]:
         lines.append(f"  !! {len(scan['unreadable'])} unreadable file(s) — "
@@ -664,12 +664,12 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="python -m aster_toolkit.data_reduction.discover",
-        description="Index a JWST raw tree and emit Patchwork manifests.",
+        description="Index a JWST raw tree and emit Patchwork target summaries.",
     )
     parser.add_argument("--raw-root", required=True,
                         help="Root of the uncal download tree.")
-    parser.add_argument("--manifest-dir", default=None,
-                        help="Write manifests here (default: report only).")
+    parser.add_argument("--summary-dir", default=None,
+                        help="Write target summaries here (default: report only).")
     parser.add_argument("--no-resolve", action="store_true",
                         help="Skip archive planet resolution (offline).")
     parser.add_argument("--override", action="append", default=[],
@@ -685,12 +685,12 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"--override needs KEY=PLANET, got {item!r}")
         overrides[key.strip()] = value.strip()
 
-    result = build_manifests(args.raw_root, resolve=not args.no_resolve,
+    result = build_target_summaries(args.raw_root, resolve=not args.no_resolve,
                              planet_overrides=overrides)
     print(format_discovery_report(result))
-    if args.manifest_dir:
-        written = write_manifests(result, args.manifest_dir)
-        print("\nManifests written:")
+    if args.summary_dir:
+        written = write_target_summaries(result, args.summary_dir)
+        print("\nTarget summaries written:")
         for p in written:
             print(f"  {p}")
     return 0
@@ -706,7 +706,7 @@ if __name__ == "__main__":
 class DiscoverPatchworkVisits(BaseTool):
     """
     Index a JWST raw download tree and emit ready-to-run Patchwork
-    manifests, one per planet.
+    target summaries, one per planet.
 
     Directory names are ignored entirely — everything is read from FITS
     headers, so malformed multi-target folder names, obsid-only folders,
@@ -722,7 +722,7 @@ class DiscoverPatchworkVisits(BaseTool):
     planet cannot be pinned down are reported as unresolved, never
     guessed; supply them with ``overrides``.
 
-    Run this FIRST on the cluster, before any reduction — the manifests
+    Run this FIRST on the cluster, before any reduction — the target summaries
     it writes are the input to ``RunPatchworkTarget`` /
     ``GenerateFirJobs``.
 
@@ -730,15 +730,15 @@ class DiscoverPatchworkVisits(BaseTool):
     -------
         DiscoverPatchworkVisits(
             raw_root="/project/def-ncowan/wasi/jwst_raw",
-            manifest_dir="patchwork/manifests",
+            summary_dir="patchwork/targets",
         )
     """
 
     raw_root: str = RuntimeField(
         description="Root of the uncal download tree (walked recursively)."
     )
-    manifest_dir: str | None = OptionalRuntimeField(
-        description="Directory to write per-planet manifests into. "
+    summary_dir: str | None = OptionalRuntimeField(
+        description="Directory to write per-planet target summaries into. "
                     "Omit for a report-only dry run.",
     )
     resolve_planets: bool = RuntimeField(
@@ -763,19 +763,19 @@ class DiscoverPatchworkVisits(BaseTool):
         elif not isinstance(overrides, dict):
             overrides = {}
 
-        result = build_manifests(raw_root, resolve=self.resolve_planets,
+        result = build_target_summaries(raw_root, resolve=self.resolve_planets,
                                  planet_overrides=overrides)
         report = format_discovery_report(result)
-        if self.manifest_dir:
-            manifest_dir = self.manifest_dir
-            if not os.path.isabs(manifest_dir):
-                manifest_dir = os.path.join(self.base_directory, manifest_dir)
-            written = write_manifests(result, manifest_dir)
-            report += "\n\nManifests written:\n" + "\n".join(
+        if self.summary_dir:
+            summary_dir = self.summary_dir
+            if not os.path.isabs(summary_dir):
+                summary_dir = os.path.join(self.base_directory, summary_dir)
+            written = write_target_summaries(result, summary_dir)
+            report += "\n\nTarget summaries written:\n" + "\n".join(
                 f"  {p}" for p in written
             )
             report += (
                 "\n\nNext: RunPatchworkTarget (local subset test) or "
-                "GenerateFirJobs (full run on Fir) per manifest."
+                "GenerateFirJobs (full run on Fir) per target summary."
             )
         return report

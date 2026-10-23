@@ -1012,7 +1012,7 @@ def contamination_backends() -> dict[str, dict[str, str | bool]]:
 
     None of these is required: Stage 5.5 masking and the Stage 6.5
     blackbody retrieval are self-contained. They are cross-checks and
-    escape hatches for individual targets.
+    per-target alternatives.
 
     - **spotrod** (Béky, Kocsis & Holman 2014) — semi-analytic occulted
       spot model. Used by the published TOI-1231 b analysis (Sarkar et
@@ -1061,7 +1061,7 @@ def fit_spot_crossing_spotrod(
 ) -> dict[str, Any]:
     """Model (rather than mask) occulted spot crossings with SPOTROD.
 
-    This is the per-target escape hatch, NOT part of the frozen survey
+    This is a per-target alternative, NOT part of the frozen survey
     reduction — a fit that used it is not uniform with the rest of
     Patchwork and must be reported separately. Use it when a crossing is
     too large a fraction of the transit to mask, or to reproduce a

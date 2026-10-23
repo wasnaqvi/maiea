@@ -22,7 +22,7 @@ RAW_ROOT=/project/def-ncowan/wasi/jwst_raw
 # NOTE: directory name kept as-written so the existing reduction on Fir
 # (289 GB of Stage 1-3 products) is not orphaned by a rename.
 WORKDIR=~/scratch/patchwork/GJ_9827_d_asis
-EXOTEDRF_REPO=$HOME/exoTEDRF   # optimizer-branch checkout; shadows the installed release
+EXOTEDRF_REPO=$HOME/exoTEDRF   # optimizer-branch checkout; overrides the installed release
 PHASE=${PHASE:-all}          # override at submit: sbatch --export=PHASE=fit ...
 # juliet reloads existing posteriors instead of refitting, so a rerun after
 # any code/ephemeris change silently returns the OLD answers. Set FORCE_REFIT=1

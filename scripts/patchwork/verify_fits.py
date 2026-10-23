@@ -6,12 +6,12 @@ target: per visit x detector the depth, depth check, betas, channel count,
 tilt and spot events, then ``ok`` or the list of failed checks. Physics,
 not exit codes: a fit that ran to completion can still be the wrong fit.
 
-    python scripts/patchwork/gate_fits.py ~/scratch/patchwork
-    python scripts/patchwork/gate_fits.py ~/scratch/patchwork HD_15337_c TOI_451_c
+    python scripts/patchwork/verify_fits.py ~/scratch/patchwork
+    python scripts/patchwork/verify_fits.py ~/scratch/patchwork HD_15337_c TOI_451_c
 
 Exit status is 1 when any target has a STOP-level failure (wrong version,
-suspect depth, prior-returning fit, scan never ran), so it can gate a
-script. Read-only.
+suspect depth, prior-returning fit, scan never ran), so a script can stop
+on it. Read-only.
 """
 
 from __future__ import annotations

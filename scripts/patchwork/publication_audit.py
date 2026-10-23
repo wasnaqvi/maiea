@@ -307,7 +307,7 @@ def run(root, out):
     write_table(out / "gj3090_leave_one_visit.csv", gj_rows)
     provenance = [{"path": str(p.relative_to(root)), "bytes": p.stat().st_size,
                    "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(inputs)]
-    (out / "input_manifest.json").write_text(json.dumps(provenance, indent=2)+"\n")
+    (out / "input_summary.json").write_text(json.dumps(provenance, indent=2)+"\n")
     print(json.dumps({"targets": len(targets), "fitted_targets": len(fitted),
                       "detector_fits": len(visits), "output": str(out)}, indent=2))
 

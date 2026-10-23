@@ -88,8 +88,8 @@ Tools are organized in the `aster_toolkit/` package with clear separation of con
 ASTER exposes 24 tools with one tool per task — when adding a capability, extend the tool that owns the task (a mode or flag) rather than adding an overlapping tool. `tests/scripts/test_tool_consolidation.py` pins the registry.
 
 **Data Reduction** (`aster_toolkit/data_reduction/`) — the Patchwork pipeline:
-- `discover.py` - `DiscoverPatchworkVisits`: index a raw tree, identify planets, write manifests
-- `exotedrf.py` - `ReduceNirspecG395hTso` (always prints the uncal segment inventory first; `inspect_only=True` for just the inventory), `VerifyPatchworkEnvironment` (exoTEDRF preflight + optional contamination backends), `MakeUncalTestSubset` (Stages 1-3)
+- `discover.py` - `DiscoverPatchworkVisits`: index a raw tree, identify planets, write target summaries
+- `exotedrf.py` - `ReduceNirspecG395hTso` (always prints the uncal segment inventory first; `inspect_only=True` for just the inventory), `VerifyPatchworkEnvironment` (exoTEDRF environment check + optional contamination backends), `MakeUncalTestSubset` (Stages 1-3)
 - `lightcurves.py` - `DetectTiltEvents` (Stage 4; pure numpy/astropy)
 - `juliet.py` - `FitNirspecG395hWhiteLight`, `FitNirspecG395hTransmissionSpectrum`, `CombineNirspecG395hVisits` (Stages 5-6)
 - `contamination.py` - `DetectLightCurveAnomalies` (Stage 5.5), `ModelStellarContamination` (Stage 6.5)
@@ -223,9 +223,9 @@ uncals → inspect → exoTEDRF Stages 1-3 → Stage 4 lightcurves
   visit's planet by archive cone search at the header pointing **plus a
   transit-window overlap test** — a host may have several planets, and
   the planet name drives the ephemeris, so a guess yields a confidently
-  wrong depth. Writes per-planet manifests with cached archive priors.
+  wrong depth. Writes per-planet target summaries with cached archive priors.
 - **`exotedrf.py`** — Stages 1-3 as a subprocess. Frozen
-  `PATCHWORK_G395H_CONFIG`, environment preflight, CRDS pinning,
+  `PATCHWORK_G395H_CONFIG`, environment check, CRDS pinning,
   per-visit baseline window.
 - **`lightcurves.py`** — Stage 4, pure numpy/astropy (runs in the main
   ASTER env): MJD→BJD on load, out-of-transit normalization, constant-R
@@ -238,12 +238,12 @@ uncals → inspect → exoTEDRF Stages 1-3 → Stage 4 lightcurves
 - **`contamination.py`** — Stages 5.5 and 6.5, the two stellar
   contamination problems (pure numpy; `emcee` for the retrieval). See
   [Stellar contamination](#stellar-contamination--stages-55-and-65).
-- **`survey.py`** — manifest-driven driver (`inspect → reduce → fit →
+- **`survey.py`** — target-summary-driven driver (`inspect → reduce → fit →
   combine → contamination`), restartable by step, plus the Fir sbatch
   generator. `fit` is compound: white pass 1 → Stage 5.5 scan → masked
   white refit → channels.
 - **`optimize.py`** — wraps the exoTEDRF coordinate-descent optimizer as
-  a frozen, replayable rule generator (SHA-256 `omega_hash` per run).
+  a frozen, replayable rule generator (SHA-256 `config_hash` per run).
 
 ### exoTEDRF environment — the hard constraints
 
@@ -255,15 +255,15 @@ so Stages 1-3 run as a **subprocess** in the pinned environment.
 On DRAC, calling `<venv>/bin/python` by path leaves site-packages off
 `sys.path` on a compute node — virtualenvs must be *activated*. Use
 `scripts/patchwork/exotedrf-python`, which module-loads its own
-python/opencv, activates the venv, prepends the repo shadow, and execs.
+python/opencv, activates the venv, prepends the exoTEDRF checkout, and execs.
 
 **`ASTER_EXOTEDRF_REPO` selects which stage code runs.** When set it is
 prepended to `PYTHONPATH` for every exoTEDRF subprocess, so a source
-checkout shadows the installed release. Patchwork runs the **`optimizer`
+checkout overrides the installed release. Patchwork runs the **`optimizer`
 branch**: reductions and optimizer sweeps must execute the *same* stage
 code or tuned parameters do not transfer. Unset → installed release.
 The tree actually used is recorded as `exotedrf.path` in every reduction
-manifest — it must match across all targets.
+summary — it must match across all targets.
 
 Required environment on Fir:
 
@@ -281,7 +281,7 @@ export ASTER_EXOTIC_LD_DATA=~/scratch/exotic_ld_data
 at runtime it is how the `opencv` module delivers `cv2`, which
 `stcal.jump` imports at module level (so JumpStep cannot run without it).
 
-### Preflight — before committing any compute
+### Environment check — before committing any compute
 
 ```bash
 python -c "from aster_toolkit.data_reduction.exotedrf import *; \
@@ -313,7 +313,7 @@ skipped (diagnostic-only, crashes with sklearn ≥1.3); OpenCV from the
 `opencv/4.12.0` **module**, never pip (Alliance ships a deliberately
 failing dummy wheel).
 
-### Uniformity contract — frozen versions
+### Frozen versions
 
 Changing any of these changes the survey definition. Bump the version,
 and never mix old and new products in one analysis.
@@ -346,14 +346,14 @@ darkening is fixed to ExoTiC-LD when the white-fit impact parameter
 exceeds `LD_FIX_IMPACT_PARAM = 0.80`. Near grazing, a free limb
 darkening trades against depth (L 98-59 d moved 5%, with errors 2.5x
 larger). Below 0.80, v1.5 runs the v1.4 code path, so v1.4 fits there were
-**restamped, not refit** (`scripts/patchwork/restamp_fit_version.py`;
-2026-10-20, 13 targets). A restamped fit carries a `fit_restamps` record
+**restamped, not refit** (2026-10-20, 13 targets; the restamp script
+was removed once v1.6 made every target a refit). A restamped fit carries a `fit_restamps` record
 in its summary and `v1.5 (restamped from v1.4)` in its CSV/DAT headers,
-and it counts as a survey fit. A v1.4 fit with b > 0.80 is not uniform
-and must be refit; the script refuses those targets whole.
+and it counts as a survey fit. A v1.4 fit with b > 0.80 was not uniform
+and had to be refit.
 
 Fit **v1.6** (2026-10-20) changes the model, so **every target is refit**
-— nothing restamps to 1.6 (`restamp_fit_version.py` now refuses to run).
+— nothing restamps to 1.6.
 Two changes:
 - **Joint NRS1+NRS2 white light** (`fit_white_lightcurve_joint`): one
   juliet fit per visit with P, t0, a/Rs, b shared (`JOINT_SHARED_PARAMS`)
@@ -378,7 +378,7 @@ Two changes:
   the first v1.6 run fed it BJD ~2.46e6; celerite's Matern approximation
   lost the precision to resolve a few-second cadence and failed to
   factorize (`LinAlgError`) on 15 of 22 targets. The 5 that finished are
-  not trusted either and were refit; `gate_fits.py` STOPs any GP fit
+  not trusted either and were refit; `verify_fits.py` STOPs any GP fit
   without `gp_time_origin`, and the channels refuse to reuse one.
 
 New stamps: `-1det` (only one detector had Stage 3 products) and `-nogp`.
@@ -470,7 +470,7 @@ Classification rules, and why each exists:
 Masking (not modelling) is the survey default, on the referee's
 recommendation — *"for a wholesale analysis like yours, masking
 starspots seems a reasonable compromise between expediency and
-accuracy."* `fit_spot_crossing_spotrod` is the per-target escape hatch
+accuracy."* `fit_spot_crossing_spotrod` is the per-target alternative
 and its results are **not** uniform with the survey.
 
 **Stage 6.5 — unocculted spots (the `contamination` step).** Spots
@@ -533,7 +533,7 @@ band — that is the prior-returning fit, and it is bandpass-independent.
 
 - **Never run a reduction or fit in-process on a login node.**
   `RunPatchworkTarget`, `ReduceNirspecG395hTso`, and the fit tools are
-  for local subset smoke tests (`MakeUncalTestSubset`) only; real targets
+  for quick local subset tests (`MakeUncalTestSubset`) only; real targets
   go through SLURM.
 - Reduce with **2 CPUs** — exoTEDRF Stage 1 is effectively
   single-threaded, so a larger request only lengthens the queue wait.
@@ -559,7 +559,7 @@ band — that is the prior-returning fit, and it is bandpass-independent.
 - **`scripts/patchwork/generate_survey_jobs.py`** — writes sized sbatch
   scripts and prints the submission plan. **Single source of truth for
   walltime and memory; never hand-write them.**
-- **`scripts/patchwork/gate_fits.py`** — the after-fit checklist as a
+- **`scripts/patchwork/verify_fits.py`** — the after-fit checklist as a
   script (version, joint geometry, GP, betas, depth check, tilts, spots,
   Stage 6.5). Exit 1 on any STOP-level failure. Run it on the output
   root after every fit wave.
@@ -665,11 +665,11 @@ lower-cased with any `Tool` suffix dropped (`downloadmastjwstproducts`).
 
 Full detail in `scripts/patchwork/CAMPAIGN.md`. The sequence:
 
-1. **Preflight** — `VerifyPatchworkEnvironment` must print READY and name
+1. **Check the environment** — `VerifyPatchworkEnvironment` must print READY and name
    the intended exoTEDRF tree. Fix anything it flags with
    `patch_exotedrf_env.py` before spending compute.
 2. **Discover** — `DiscoverPatchworkVisits` on the raw root (login node;
-   it queries the archive) writes one manifest per planet. Supply
+   it queries the archive) writes one target summary per planet. Supply
    `overrides` for any visit whose planet cannot be resolved; never guess.
 3. **Generate jobs** — `generate_survey_jobs.py` writes sized sbatch
    scripts and prints the submission plan.
@@ -764,9 +764,9 @@ When working with the agent system:
   `load_stage3_spectra` converts on load — anything reading a Stage 3
   product by another route must convert too. Getting this wrong costs
   hours of offset and yields a fit that returns the prior.
-- Reduction pipeline paths are **absolute** everywhere; manifests are
-  copied between machines.
-- Preflight before compute; re-patch after any pip install or exoTEDRF
+- Reduction pipeline paths are **absolute** everywhere; target summaries
+  are copied between machines.
+- Check the environment before compute; re-patch after any pip install or exoTEDRF
   `git pull`.
 - Never edit the frozen config for a single target — that is a survey
   definition change requiring a version bump.

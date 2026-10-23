@@ -51,7 +51,7 @@ New guards / diagnostics:
   errors run ~5% (NRS1) / ~12% (NRS2) above photon predictions —
   beta >> 1 flags a target whose depth errors need inflating.
 - **Priors caching**: discover.py embeds the archive ephemeris/stellar
-  priors in each manifest; fits still query the archive at fit time but
+  priors in each target summary; fits still query the archive at fit time but
   fall back to the cache offline (`priors_source` recorded).
 - **NRS1–NRS2 white-light t0 offset** recorded per visit in the combine
   step (COMPASS sees significant offsets on some targets).
@@ -59,7 +59,7 @@ New guards / diagnostics:
   2026-07-30)**: COMPASS-style relative-pixel-flux PCA regressors
   (6 components) are part of the frozen fit definition. A fit where the
   components could not be built (no Stage 2 calints, or the as-is
-  escape hatch) is stamped `1.2-nopca` and must not be mixed with
+  per-target option) is stamped `1.2-nopca` and must not be mixed with
   survey fits.
 
 Stellar contamination — fit v1.3 (referee feedback 2026-08-03):
@@ -137,7 +137,7 @@ source ~/envs/exotedrf/bin/activate
 python ~/aster/maiea/scripts/patchwork/patch_exotedrf_env.py
 deactivate
 
-# preflight — must print READY
+# environment check — must print READY
 source ~/aster/aster-env/bin/activate
 python -c "from aster_toolkit.data_reduction.exotedrf import *; \
            print(format_environment_report(verify_exotedrf_environment()))"
@@ -161,14 +161,14 @@ the model's context. Do **not** instead add a non-interactive guard to
 `~/.bashrc` — the `ASTER_EXOTEDRF_*` exports live there and the
 `bash -lc` submission pattern needs them sourced.
 
-## 2. Regenerate manifests (login node — needs the archive)
+## 2. Regenerate target summaries (login node — needs the archive)
 
-The priors cache is new; regenerate so every manifest carries it:
+The priors cache is new; regenerate so every target summary carries it:
 
 ```bash
 python -m aster_toolkit.data_reduction.discover \
     --raw-root /project/def-ncowan/wasi/jwst_raw \
-    --manifest-dir ~/patchwork/manifests
+    --summary-dir ~/patchwork/targets
 ```
 
 Include the TOI-125 overrides (GO 4126 observed b and c):
@@ -176,7 +176,7 @@ Include the TOI-125 overrides (GO 4126 observed b and c):
 ```bash
 python -m aster_toolkit.data_reduction.discover \
     --raw-root /project/def-ncowan/wasi/jwst_raw \
-    --manifest-dir ~/patchwork/manifests \
+    --summary-dir ~/patchwork/targets \
     --override jw04126101001="TOI-125 b" \
     --override jw04126201001="TOI-125 c"
 ```
@@ -189,7 +189,7 @@ transit-in-window guard — then swap the overrides and refit.
 
 ```bash
 python scripts/patchwork/generate_survey_jobs.py \
-    --manifest-dir ~/patchwork/manifests \
+    --summary-dir ~/patchwork/targets \
     --output-root ~/scratch/patchwork \
     --job-dir ~/patchwork/jobs \
     --mail-user <you>
@@ -220,10 +220,10 @@ After REDUCE:
 - [ ] `ls <root>/<SLUG>/reductions/*/nrs?/**/Stage3/*box_spectra_fullres.fits`
       -> 2 files per visit (NRS1+NRS2)
 - [ ] `segments_complete: true` in `patchwork_summary.json`
-- [ ] `exotedrf.path` in the reduction manifest = `~/exoTEDRF` for
+- [ ] `exotedrf.path` in the reduction summary = `~/exoTEDRF` for
       EVERY target (one tree for the whole survey)
 
-After FIT (`python scripts/patchwork/gate_fits.py ~/scratch/patchwork` checks
+After FIT (`python scripts/patchwork/verify_fits.py ~/scratch/patchwork` checks
 most of this list and exits 1 on a STOP):
 - [ ] transit coverage ~100% (log line, seconds into the fit)
 - [ ] `depth_check.status` is `ok` or `indicative` — **not** `suspect`.

@@ -45,7 +45,6 @@ def process_wgets_file(base_directory, wgets_file_path: str, data_path: str) -> 
         lines = file.readlines()
 
     names_to_urls = {}
-    manifest_url = None  # keep this in case needed it later
 
     for line in lines:
         line = line.strip()  # Remove leading/trailing whitespace and newline characters
@@ -63,7 +62,7 @@ def process_wgets_file(base_directory, wgets_file_path: str, data_path: str) -> 
         planet_name = file_name.split('.')[0]
 
         if planet_name == 'spectra':
-            continue  # the archive's manifest entry, not a planet spectrum
+            continue  # the archive's file-list entry, not a planet spectrum
 
         if planet_name not in names_to_urls:
             names_to_urls[planet_name] = [url]

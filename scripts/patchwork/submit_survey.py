@@ -15,7 +15,7 @@ activation.
     python scripts/patchwork/submit_survey.py --submit --wave 1
     python scripts/patchwork/submit_survey.py --mode fit --submit --only TOI_270_c
 
-"Available planets" means planets with a manifest in ``--manifest-dir``
+"Available planets" means planets with a target summary in ``--summary-dir``
 (written by DiscoverPatchworkVisits). Raw-tree directory names are
 untrustworthy — obsid-only folders, concatenated names, `_nonsurvey`,
 `wave2_*` staging dirs — so this script never looks at the raw tree.
@@ -23,7 +23,7 @@ If a planet is missing, run discover first (login node, needs archive):
 
     python -m aster_toolkit.data_reduction.discover \
         --raw-root /home/wasi/aster/maiea/workspace/mast/jwst_raw \
-        --manifest-dir ~/patchwork/manifests
+        --summary-dir ~/patchwork/targets
 
 Modes
 -----
@@ -129,8 +129,8 @@ def submit_clean(command: str, *, dry_run: bool) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Submit Patchwork jobs for all planets with a manifest.")
-    ap.add_argument("--manifest-dir", default="~/patchwork/manifests")
+        description="Submit Patchwork jobs for all planets with a target summary.")
+    ap.add_argument("--summary-dir", default="~/patchwork/targets")
     ap.add_argument("--output-root", default="~/scratch/patchwork")
     ap.add_argument("--job-dir", default="~/patchwork/jobs")
     ap.add_argument("--mode", choices=sorted(MODES), default="reduce")
@@ -146,15 +146,15 @@ def main() -> int:
                     help="Actually submit. Without it, print the plan only.")
     args = ap.parse_args()
 
-    manifest_dir = Path(os.path.expanduser(args.manifest_dir))
+    summary_dir = Path(os.path.expanduser(args.summary_dir))
     job_dir = Path(os.path.expanduser(args.job_dir))
     output_root = os.path.expanduser(args.output_root)
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    manifests = sorted(glob.glob(str(manifest_dir / "*.json")))
-    manifests = [m for m in manifests if "_unresolved" not in m]
-    if not manifests:
-        print(f"No manifests in {manifest_dir}. Run discover first (login "
+    targets = sorted(glob.glob(str(summary_dir / "*.json")))
+    targets = [m for m in targets if "_unresolved" not in m]
+    if not targets:
+        print(f"No target summaries in {summary_dir}. Run discover first (login "
               "node — it needs the archive); see the module docstring.")
         return 1
 
@@ -170,10 +170,10 @@ def main() -> int:
     # (wave, slug, command, note) per target, submitted in wave order.
     plan: list[tuple[int, str, str, str]] = []
     skipped: list[str] = []
-    for mpath in manifests:
-        with open(mpath) as fh:
-            manifest = json.load(fh)
-        slug = _slug(manifest["planet_name"])
+    for path in targets:
+        with open(path) as fh:
+            target = json.load(fh)
+        slug = _slug(target["planet_name"])
         if (only and slug not in only) or slug in skip:
             continue
         if slug in EXCLUDED:
@@ -202,7 +202,7 @@ def main() -> int:
             continue
 
         script = write_fir_slurm_script(
-            mpath, output_root, script_path=job_dir / f"run_{slug}.sbatch")
+            path, output_root, script_path=job_dir / f"run_{slug}.sbatch")
         if args.mode == "contamination":
             time, mem = CONTAM_TIME, CONTAM_MEM
         else:

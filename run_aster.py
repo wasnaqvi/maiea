@@ -236,7 +236,7 @@ CAMPAIGN_TOOLS = {
     'RunCommandTool',            # sbatch / squeue / sacct / ls / rsync
     'ReadFileTool',              # the brief, and the JSON products
     'FileSearchTool',
-    'VerifyPatchworkEnvironment',  # the preflight gate
+    'VerifyPatchworkEnvironment',  # environment check before any reduction
     'TodoRead', 'TodoWrite',
 }
 

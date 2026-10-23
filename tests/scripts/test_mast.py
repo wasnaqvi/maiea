@@ -338,7 +338,7 @@ class MastWrapperTests(unittest.TestCase):
         param_names = {f["paramName"] for f in filters}
         self.assertNotIn("target_name", param_names)
 
-    def test_download_planet_jwst_products_writes_manifest(self):
+    def test_download_planet_jwst_products_writes_summary(self):
         observations = [
             {
                 "obsid": "111",
@@ -365,23 +365,23 @@ class MastWrapperTests(unittest.TestCase):
                 target_path = pathlib.Path(tmpdir) / "WASP-39_b" / "jw01234001" / "jw01234_x1dints.fits"
                 fake_download.return_value = target_path
 
-                manifest = self.mast.download_planet_jwst_products(
+                summary = self.mast.download_planet_jwst_products(
                     "WASP-39 b",
                     tmpdir,
                     product_subgroups=["X1DINTS"],
                 )
 
             target_dir = pathlib.Path(tmpdir) / "WASP-39_b"
-            self.assertTrue((target_dir / "manifest.json").is_file())
+            self.assertTrue((target_dir / "download_summary.json").is_file())
 
-            with (target_dir / "manifest.json").open() as handle:
+            with (target_dir / "download_summary.json").open() as handle:
                 saved = json.load(handle)
 
             self.assertEqual(saved["planet_name"], "WASP-39 b")
             self.assertEqual(len(saved["observations"]), 1)
             self.assertEqual(len(saved["downloaded"]), 1)
             self.assertEqual(saved["downloaded"][0]["path"], str(target_path))
-            self.assertEqual(manifest["downloaded"][0]["product"]["productSubGroupDescription"], "X1DINTS")
+            self.assertEqual(summary["downloaded"][0]["product"]["productSubGroupDescription"], "X1DINTS")
 
             fake_download.assert_called_once()
             called_args, called_kwargs = fake_download.call_args
@@ -502,18 +502,18 @@ class MastWrapperTests(unittest.TestCase):
         text = self.mast._format_observations_summary(
             [{"obsid": "1", "instrument_name": "NIRSPEC/SLIT"}],
             filters=filters,
-            query_extra={"mode": "demographics"},
+            query_extra={"mode": "population"},
         )
         self.assertIn("Filters used:", text)
         self.assertIn("obs_collection", text)
         self.assertIn("NIRSPEC/SLIT", text)
         self.assertIn("calib_level: [3]", text)
-        self.assertIn("mode: demographics", text)
+        self.assertIn("mode: population", text)
 
     def _make_tool(self, Tool, **kwargs):
         return _construct_tool(Tool, **kwargs)
 
-    def test_search_basetool_demographics_mode(self):
+    def test_search_basetool_population_mode(self):
         Tool = self.mast.SearchMastJwstObservations
         with patch.object(
             self.mast,
@@ -537,7 +537,7 @@ class MastWrapperTests(unittest.TestCase):
             output = tool._run()
 
         call.assert_called_once()
-        self.assertIn("demographics", output)
+        self.assertIn("population", output)
         self.assertIn("Filters used:", output)
 
     def test_search_basetool_per_planet_mode_still_works(self):
@@ -745,7 +745,7 @@ class MastWrapperTests(unittest.TestCase):
 
     # -------- new: batch obsid download --------
 
-    def test_download_observations_products_writes_manifest(self):
+    def test_download_observations_products_writes_summary(self):
         products = [
             {
                 "productType": "SCIENCE",
@@ -760,7 +760,7 @@ class MastWrapperTests(unittest.TestCase):
                 patch.object(self.mast, "download_mast_product") as fake_download,
             ):
                 fake_download.return_value = pathlib.Path(tmpdir) / "label" / "111" / "jw01_x1dints.fits"
-                manifest = self.mast.download_observations_products(
+                summary = self.mast.download_observations_products(
                     ["111", "222"],
                     tmpdir,
                     product_subgroups=["X1DINTS"],
@@ -768,15 +768,15 @@ class MastWrapperTests(unittest.TestCase):
                 )
 
             target_dir = pathlib.Path(tmpdir) / "hot_jupiters"
-            self.assertTrue((target_dir / "manifest.json").is_file())
-            with (target_dir / "manifest.json").open() as handle:
+            self.assertTrue((target_dir / "download_summary.json").is_file())
+            with (target_dir / "download_summary.json").open() as handle:
                 saved = json.load(handle)
 
             self.assertEqual(saved["label"], "hot_jupiters")
             self.assertEqual(saved["obsids"], ["111", "222"])
             # one download per obsid (mocked products list is the same for each)
             self.assertEqual(len(saved["downloaded"]), 2)
-            self.assertEqual(manifest["downloaded"][0]["obsid"], "111")
+            self.assertEqual(summary["downloaded"][0]["obsid"], "111")
 
     def test_download_basetool_batch_obsids_mode(self):
         Tool = self.mast.DownloadMastJwstProducts
@@ -830,7 +830,7 @@ class MastWrapperTests(unittest.TestCase):
             tool._run()
 
 
-# ---------------- demographics integration test ----------------
+# ---------------- population integration test ----------------
 
 
 def _haversine_deg(ra1, dec1, ra2, dec2):
@@ -900,11 +900,11 @@ def write_csv(path, rows):
             writer.writerow(row)
 
 
-class DemographicsTests(unittest.TestCase):
+class PopulationTests(unittest.TestCase):
     def setUp(self):
         self.mast = load_mast_module()
 
-    def test_demographics_pipeline_compiles_two_csvs(self):
+    def test_population_pipeline_compiles_two_csvs(self):
         # Fake archive populations (hot/warm Jupiters + sub-Neptunes)
         hot_warm_jupiters = [
             {
@@ -1033,7 +1033,7 @@ class DemographicsTests(unittest.TestCase):
             },
         ]
 
-        # Drive the demographics MAST query via the tool surface (verifies
+        # Drive the population MAST query via the tool surface (verifies
         # the no-position path is what an agent would actually hit).
         with patch.object(
             self.mast,
@@ -1245,7 +1245,7 @@ class PopulationSearchTests(unittest.TestCase):
                     instruments=["NIRSpec", "NIRCam", "MIRI", "NIRISS"],
                     dataproduct_types=["spectrum", "timeseries"],
                     calib_levels=[3],
-                    output_csv="demographics/test_xmatch.csv",
+                    output_csv="population/test_xmatch.csv",
                     base_directory=tmpdir,
                 )
                 output = tool._run()
@@ -1255,7 +1255,7 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertIn("Population planets considered: 2", output)
             self.assertIn("JWST observations considered: 4", output)
 
-            csv_path = pathlib.Path(tmpdir) / "demographics" / "test_xmatch.csv"
+            csv_path = pathlib.Path(tmpdir) / "population" / "test_xmatch.csv"
             self.assertTrue(csv_path.is_file())
             with csv_path.open() as fh:
                 read_back = list(csv.DictReader(fh))
@@ -1307,7 +1307,7 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertIn("pl_name='TOI-X b' count=1", out)
             self.assertNotIn("pl_name='TOI-X c'", out)   # baseline for c
             self.assertNotIn("pl_name='K2-18 b'", out)   # eclipse
-            (rows_csv,) = (pathlib.Path(tmpdir) / "mast" / "demographics").glob("search_*.csv")
+            (rows_csv,) = (pathlib.Path(tmpdir) / "mast" / "population").glob("search_*.csv")
             with rows_csv.open() as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual([(r["pl_name"], r["obsid"], r["obs_type"]) for r in rows],
@@ -1362,7 +1362,7 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertIn("no MAST query", output)
             self.assertIn("Aggregated 3 row(s)", output)
             self.assertIn("instrument_name_distinct", output)
-            grouped = list((pathlib.Path(tmpdir) / "mast" / "demographics").glob("aggregate_*.csv"))
+            grouped = list((pathlib.Path(tmpdir) / "mast" / "population").glob("aggregate_*.csv"))
             self.assertEqual(len(grouped), 1)
             with grouped[0].open() as fh:
                 groups = list(csv.DictReader(fh))
@@ -1391,7 +1391,7 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertIn("Full rows (4) written to:", out)
             self.assertIn("Aggregated 4 row(s)", out)
             self.assertIn("instrument_name='NIRSPEC/SLIT'", out)
-            demo = pathlib.Path(tmpdir) / "mast" / "demographics"
+            demo = pathlib.Path(tmpdir) / "mast" / "population"
             self.assertEqual(len(list(demo.glob("search_*.csv"))), 1)
             self.assertEqual(len(list(demo.glob("aggregate_*.csv"))), 1)
 
@@ -1448,7 +1448,7 @@ class PopulationSearchTests(unittest.TestCase):
     def test_empty_mast_result_never_queries_the_archive(self):
         with (
             patch.object(self.mast, "search_all_jwst_observations", return_value=([], [])),
-            patch.object(self.mast, "_diagnose_empty_demographics", return_value="diag"),
+            patch.object(self.mast, "_diagnose_empty_population", return_value="diag"),
             patch.object(self.mast, "archive_tap_query") as no_archive,
         ):
             out = self._make_tool(
@@ -1477,7 +1477,7 @@ class PopulationSearchTests(unittest.TestCase):
 
     # ---- DownloadDemographicJwstProducts ----
 
-    def test_download_demographic_products_groups_by_planet(self):
+    def test_download_population_products_groups_by_planet(self):
         # Mocked crossmatch rows: WASP-39 b has 2 obsids, HD 209458 b has 1
         rows = [
             {"pl_name": "WASP-39 b", "obsid": "10001"},
@@ -1497,7 +1497,7 @@ class PopulationSearchTests(unittest.TestCase):
                     "downloaded": [{"obsid": o, "product": {}, "path": f"/x/{o}"} for o in obsids],
                 },
             ) as call:
-                manifest = self.mast.download_demographic_products(
+                summary = self.mast.download_population_products(
                     rows,
                     tmpdir,
                     label="warm_hot_jupiters",
@@ -1505,8 +1505,8 @@ class PopulationSearchTests(unittest.TestCase):
                 )
 
             # 2 planets processed, 3 unique (planet, obsid) files
-            self.assertEqual(manifest["planet_count"], 2)
-            self.assertEqual(manifest["total_files_downloaded"], 3)
+            self.assertEqual(summary["planet_count"], 2)
+            self.assertEqual(summary["total_files_downloaded"], 3)
             self.assertEqual(call.call_count, 2)
 
             # Per-planet calls used pl_name as label and the deduped obsid list
@@ -1514,16 +1514,16 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertEqual(wasp_call.args[0], ["10001", "10002"])
             self.assertEqual(wasp_call.kwargs["product_subgroups"], ["X1DINTS"])
 
-            # Top-level demographic manifest written under {output_dir}/{label}/
+            # Top-level population summary written under {output_dir}/{label}/
             root = pathlib.Path(tmpdir) / "warm_hot_jupiters"
-            self.assertTrue((root / "demographic_manifest.json").is_file())
-            with (root / "demographic_manifest.json").open() as fh:
+            self.assertTrue((root / "population_summary.json").is_file())
+            with (root / "population_summary.json").open() as fh:
                 saved = json.load(fh)
             self.assertEqual(saved["label"], "warm_hot_jupiters")
             pl_names = sorted(e["pl_name"] for e in saved["per_planet"])
             self.assertEqual(pl_names, ["HD 209458 b", "WASP-39 b"])
 
-    def test_download_demographic_products_respects_caps(self):
+    def test_download_population_products_respects_caps(self):
         rows = [
             {"pl_name": "A", "obsid": "1"},
             {"pl_name": "A", "obsid": "2"},
@@ -1538,7 +1538,7 @@ class PopulationSearchTests(unittest.TestCase):
                 return {"label": label, "obsids": list(obsids), "downloaded": []}
 
             with patch.object(self.mast, "download_observations_products", side_effect=fake_download):
-                self.mast.download_demographic_products(
+                self.mast.download_population_products(
                     rows,
                     tmpdir,
                     label="cap_test",
@@ -1591,7 +1591,7 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertIn("WASP-39 b", output)
 
             root = pathlib.Path(tmpdir) / "mast" / "raw" / "warm_hot_jupiters"
-            self.assertTrue((root / "demographic_manifest.json").is_file())
+            self.assertTrue((root / "population_summary.json").is_file())
 
     def test_download_tool_rows_path_default_dir_and_caps(self):
         Tool = self.mast.DownloadMastJwstProducts
@@ -1602,7 +1602,7 @@ class PopulationSearchTests(unittest.TestCase):
                  {"pl_name": "B b", "obsid": "3"}],
             )
             with patch.object(
-                self.mast, "download_demographic_products",
+                self.mast, "download_population_products",
                 return_value={"label": "aggregate", "planet_count": 1,
                               "total_files_downloaded": 0, "per_planet": []},
             ) as call:
@@ -1610,7 +1610,7 @@ class PopulationSearchTests(unittest.TestCase):
                                 max_observations="1", max_products="2",
                                 base_directory=tmpdir)._run()
             args, kwargs = call.call_args
-            self.assertTrue(args[1].endswith(os.path.join("mast", "demographics_raw")))
+            self.assertTrue(args[1].endswith(os.path.join("mast", "population_raw")))
             self.assertEqual(kwargs["max_planets"], 1)
             self.assertEqual(kwargs["max_obs_per_planet"], 1)
             self.assertEqual(kwargs["max_products_per_obs"], 2)
@@ -1721,7 +1721,7 @@ class PopulationSearchTests(unittest.TestCase):
         )
         self.assertTrue(str(path).endswith(".csv"))
         self.assertTrue(path.name.startswith("crossmatch_"))
-        self.assertEqual(path.parent.as_posix(), "/tmp/base/mast/demographics")
+        self.assertEqual(path.parent.as_posix(), "/tmp/base/mast/population")
 
     def test_autoname_csv_path_distinguishes_different_hints(self):
         a = self.mast._autoname_csv_path(
@@ -1817,9 +1817,9 @@ class PopulationSearchTests(unittest.TestCase):
             self.assertIn("FULL RESULTS (50 rows)", output)
             self.assertIn("do NOT reconstruct", output)
 
-            demographics_dir = pathlib.Path(tmpdir) / "mast" / "demographics"
-            self.assertTrue(demographics_dir.is_dir())
-            csvs = list(demographics_dir.glob("search_*.csv"))
+            population_dir = pathlib.Path(tmpdir) / "mast" / "population"
+            self.assertTrue(population_dir.is_dir())
+            csvs = list(population_dir.glob("search_*.csv"))
             self.assertEqual(
                 len(csvs), 1, f"expected one auto-named CSV, got {csvs}",
             )
@@ -1847,8 +1847,8 @@ class PopulationSearchTests(unittest.TestCase):
             )._run()
 
             self.assertIn("FULL RESULTS", output)
-            demographics_dir = pathlib.Path(tmpdir) / "mast" / "demographics"
-            csvs = list(demographics_dir.glob("aggregate_*.csv"))
+            population_dir = pathlib.Path(tmpdir) / "mast" / "population"
+            csvs = list(population_dir.glob("aggregate_*.csv"))
             self.assertEqual(len(csvs), 1)
             with csvs[0].open() as fh:
                 groups = list(csv.DictReader(fh))
@@ -1857,16 +1857,16 @@ class PopulationSearchTests(unittest.TestCase):
                 {"NIRSPEC/SLIT", "NIRCAM/GRISM", "NIRISS/SOSS", "NIRCAM/IMAGE"},
             )
 
-# ---------------- optional live demographics compilation ----------------
+# ---------------- optional live population compilation ----------------
 # Enabled by ASTER_LIVE_MAST=1. Hits live NASA Exoplanet Archive + MAST.
 
 @unittest.skipUnless(
     os.environ.get("ASTER_LIVE_MAST") == "1",
-    "Set ASTER_LIVE_MAST=1 to run live demographics compilation.",
+    "Set ASTER_LIVE_MAST=1 to run live population compilation.",
 )
-class LiveDemographicsCompile(unittest.TestCase):
+class LivePopulationCompile(unittest.TestCase):
     """
-    Live end-to-end: compile JWST demographics CSVs for warm+hot Jupiters
+    Live end-to-end: compile JWST population CSVs for warm+hot Jupiters
     and sub-Neptunes using the actual MAST + Exoplanet Archive endpoints.
 
     Output: ``tests/scripts/_artifacts/{warm_hot_jupiters_jwst.csv,
@@ -2339,7 +2339,7 @@ class JwstProgramInfoTests(unittest.TestCase):
             self.assertIn("Event classification: 2/3 rows typed", output)
             self.assertIn("obs_type_note breakdown", output)
             self.assertIn("approximate", output)
-            demo = pathlib.Path(tmpdir) / "mast" / "demographics"
+            demo = pathlib.Path(tmpdir) / "mast" / "population"
             self.assertEqual(list(demo.glob("search_*.csv")), [])
             (grouped,) = demo.glob("aggregate_*.csv")
             with grouped.open() as fh:
@@ -2488,7 +2488,7 @@ class RawDataCheckTests(unittest.TestCase):
                           out)
             self.assertIn("Exclusive-access release dates: 2025-11-21", out)
             self.assertIn("raw_data='public' count=1", out)
-            (rows_csv,) = (pathlib.Path(tmpdir) / "mast" / "demographics").glob("search_*.csv")
+            (rows_csv,) = (pathlib.Path(tmpdir) / "mast" / "population").glob("search_*.csv")
             with rows_csv.open() as fh:
                 rows = {r["obsid"]: r for r in csv.DictReader(fh)}
             self.assertEqual(rows["2"]["raw_data"], "exclusive_access")
@@ -2756,8 +2756,8 @@ class ExotedrfDownloadParityTests(unittest.TestCase):
         self.assertTrue(all(f.startswith("mast/program_1366/jw01366-o004") for f in files))
         self.assertTrue(all("jw01366004002_" in f for f in files))
         self.assertIn("Visits selected: ['jw01366004002']", out)
-        manifest = json.loads((pathlib.Path(self.tmp) / "mast/program_1366/manifest.json").read_text())
-        self.assertEqual(manifest["visits_available"], ["jw01366004001", "jw01366004002"])
+        summary = json.loads((pathlib.Path(self.tmp) / "mast/program_1366/download_summary.json").read_text())
+        self.assertEqual(summary["visits_available"], ["jw01366004001", "jw01366004002"])
 
     def test_list_only_with_visits_downloads_nothing(self):
         with patch.object(self.mast, "search_all_jwst_observations",

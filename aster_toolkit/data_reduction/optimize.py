@@ -1,22 +1,22 @@
 """Patchwork wrapper for the exoTEDRF coordinate-descent optimizer.
 
 Drives ``exotedrf/optimize.py`` (the ``optimizer`` branch of
-radicamc/exoTEDRF) as Patchwork's **Class-2 rule generator**: a frozen,
-deterministic procedure that turns reduction knobs which would otherwise
+radicamc/exoTEDRF) as Patchwork's **tuning rule**: a frozen,
+deterministic procedure that turns reduction parameters which would otherwise
 be hand-picked (trace mask width, jump/outlier thresholds, BadPix
 box/window, extraction aperture) into audited, replayable choices.
 
 The optimizer greedily sweeps each parameter (coordinate descent, one
-1D sweep per knob) and scores every trial with a point-to-point noise
+1D sweep per parameter) and scores every trial with a point-to-point noise
 cost on the Stage 3 flux cube: the 2nd time-difference of each
 normalized channel, medianed over out-of-transit integrations and over
 channels — i.e. the effective white-noise level that sets the error
 bars of the final transmission spectrum.
 
-Uniformity contract (PATCHWORK_OPTIMIZER_VERSION)
--------------------------------------------------
+Frozen settings (PATCHWORK_OPTIMIZER_VERSION)
+---------------------------------------------
 The greedy descent is order-dependent and the cost is definition-
-dependent, so for the optimizer to be a Class-2 rule (and not a per-run
+dependent, so for the optimizer to be a fixed rule (and not a per-run
 judgment call) everything that changes its answer is frozen here:
 
 - the sweep grids (``G395H_SWEEP``, integers only),
@@ -26,7 +26,7 @@ judgment call) everything that changes its answer is frozen here:
 - the pipeline step configuration around the sweep, and
 - the CRDS context (pinned, so reference files cannot drift mid-survey).
 
-The SHA-256 of the generated YAML (``omega_hash``) is recorded in every
+The SHA-256 of the generated YAML (``config_hash``) is recorded in every
 output so a reduction can state exactly which rule produced it. Change
 anything -> bump the version; never mix versions in one analysis.
 
@@ -34,7 +34,7 @@ Branch note
 -----------
 On the ``optimizer`` branch, NIRSpec group-level 1/f silently maps
 'scale-achromatic' -> 'median' (stage1.py). The template therefore pins
-``oof_method: median`` explicitly — the Ω record should say what
+``oof_method: median`` explicitly — the recorded config should say what
 actually ran, not what was requested.
 
 Environment
@@ -43,8 +43,8 @@ The optimizer is NOT in the pip release; it lives in the pulled
 checkout. ``ASTER_EXOTEDRF_REPO`` must point at the repo root (e.g.
 ``/Users/wasi/Desktop/exoTEDRF`` locally, wherever it is cloned on
 Fir). The wrapper prepends it to PYTHONPATH of the pinned-env python so
-the checkout — optimizer plus its exact stage code — shadows any
-installed release. Compute: ~50 trials with stage caching; days per
+the checkout — optimizer plus its exact stage code — takes precedence
+over any installed release. Compute: ~50 trials with stage caching; days per
 visit x detector on a full TSO. Calibrator targets only.
 """
 
@@ -97,7 +97,7 @@ COST_W2 = 1.0
 
 # Frozen sweep grids. Insertion order IS the coordinate-descent order
 # (Stage 1 -> 2 -> 3); integers only (the optimizer initializes each
-# knob to int(median(grid))). Survey definition — do not edit per
+# parameter to int(median(grid))). Survey definition — do not edit per
 # target; bump PATCHWORK_OPTIMIZER_VERSION if changed at all.
 G395H_SWEEP: dict[str, list[int]] = {
     # Stage 1
@@ -113,7 +113,7 @@ G395H_SWEEP: dict[str, list[int]] = {
     "extract_width": [8, 10, 12, 14, 16, 18, 20, 22, 24],
 }
 
-# Non-swept optimizer knobs (SOSS/MIRI-only), fixed to their defaults so
+# Non-swept optimizer parameters (SOSS/MIRI-only), fixed to their defaults so
 # the YAML stays schema-complete for optimize.py's parser.
 G395H_FIXED_SWEEPABLES: dict[str, int] = {
     "soss_inner_mask_width": 40,
@@ -257,7 +257,7 @@ def write_optimize_config(
     return path
 
 
-def omega_hash(config_path: str | os.PathLike[str]) -> str:
+def config_hash(config_path: str | os.PathLike[str]) -> str:
     """SHA-256 of the generated YAML — the identity of the frozen rule
     (grids + order + cost + step config + CRDS context) for provenance."""
     return hashlib.sha256(Path(config_path).read_bytes()).hexdigest()[:16]
@@ -294,8 +294,8 @@ def run_optimization(
     Stage 1-3 trials, softened by the optimizer's stage caching). Run
     per-detector; NRS1 and NRS2 are independent sweeps.
 
-    Returns a manifest with the omega hash, cost-table path, best
-    parameter vector, and per-knob sensitivity summary.
+    Returns a summary with the config hash, cost-table path, best
+    parameter vector, and per-parameter sensitivity.
     """
     from .exotedrf import compute_baseline_ints
 
@@ -324,12 +324,12 @@ def run_optimization(
         st_met=st_met,
         planet_letter=planet_letter,
     )
-    rule_hash = omega_hash(config_path)
+    rule_hash = config_hash(config_path)
 
     python = _exotedrf_python()
     repo = _exotedrf_repo()
     env = dict(os.environ)
-    # The checkout must shadow any installed exotedrf: the optimizer and
+    # The checkout must take precedence over any installed exotedrf: the optimizer and
     # the stage code it sweeps have to come from the same tree.
     env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
     env["CRDS_PATH"] = crds
@@ -354,9 +354,9 @@ def run_optimization(
         returncode = process.wait()
 
     cost_path = out / "pipeline_outputs_directory" / "Files" / f"Cost_{name_tag}.txt"
-    manifest: dict[str, Any] = {
+    summary: dict[str, Any] = {
         "optimizer_version": PATCHWORK_OPTIMIZER_VERSION,
-        "omega_hash": rule_hash,
+        "config_hash": rule_hash,
         "detector": detector,
         "input_dir": str(input_dir),
         "output_dir": str(out),
@@ -364,7 +364,7 @@ def run_optimization(
         "log": str(log_path),
         "baseline_ints": list(baseline_ints),
         # The stage code the sweep actually ran against (the checkout,
-        # via the PYTHONPATH shadow). Compare against the 'exotedrf'
+        # prepended to PYTHONPATH). Compare against the 'exotedrf'
         # entry of any reduction that adopts these parameters — if the
         # paths differ, the tuning was done on different code.
         "exotedrf": exotedrf_version(python, extra_pythonpath=repo),
@@ -374,16 +374,16 @@ def run_optimization(
     }
     if cost_path.exists():
         table = parse_cost_table(cost_path)
-        manifest["n_trials"] = len(table["rows"])
-        manifest["best_params"] = table["best_params"]
-        manifest["best_cost"] = table["best_cost"]
-        manifest["sensitivity"] = summarize_sweep(table)
+        summary["n_trials"] = len(table["rows"])
+        summary["best_params"] = table["best_params"]
+        summary["best_cost"] = table["best_cost"]
+        summary["sensitivity"] = summarize_sweep(table)
 
-    manifest_path = out / "optimizer_manifest.json"
-    with manifest_path.open("w") as fh:
-        json.dump(manifest, fh, indent=2)
-    manifest["manifest_path"] = str(manifest_path)
-    return manifest
+    summary_path = out / "optimizer_summary.json"
+    with summary_path.open("w") as fh:
+        json.dump(summary, fh, indent=2)
+    summary["summary_path"] = str(summary_path)
+    return summary
 
 
 # -------------------- cost-table analysis --------------------
@@ -424,12 +424,12 @@ def parse_cost_table(path: str | os.PathLike[str]) -> dict[str, Any]:
 
 
 def summarize_sweep(table: dict[str, Any]) -> dict[str, Any]:
-    """Per-knob sensitivity: cost spread over each parameter's trials.
+    """Per-parameter sensitivity: cost spread over each parameter's trials.
 
-    'flat' knobs (spread small vs the global best) are candidates for a
-    plain Class-1 freeze; 'sharp' knobs are the ones actually earning
-    their Class-2 status. Advisory only — the adoption decision (and the
-    depth-shift ablation gate) stays with the human.
+    'flat' parameters (spread small vs the global best) can simply be
+    fixed; 'sharp' parameters are the ones worth tuning. Advisory only —
+    the adoption decision (and the depth comparison check) stays with
+    the human.
     """
     best_cost = table["best_cost"]
     out: dict[str, Any] = {}
@@ -437,7 +437,7 @@ def summarize_sweep(table: dict[str, Any]) -> dict[str, Any]:
         by_value: dict[float, list[float]] = {}
         for r in table["rows"]:
             by_value.setdefault(r["params"][param], []).append(r["cost"])
-        # Trials where this knob was swept: min cost per tried value.
+        # Trials where this parameter was swept: min cost per tried value.
         per_value = {v: min(costs) for v, costs in by_value.items()}
         if len(per_value) < 2:
             continue
@@ -456,7 +456,7 @@ def best_params_to_overrides(best_params: dict[str, Any]) -> dict[str, Any]:
     """Map an optimizer best vector onto ``run_reduction`` overrides
     (the keys run_DMS understands), for reducing WITH the optimized rule.
 
-    Using these overrides is a survey-definition event: record the omega
+    Using these overrides is a survey-definition event: record the config
     hash next to the reduction, and do not mix optimized and default
     reductions in one analysis.
     """
@@ -478,31 +478,31 @@ def best_params_to_overrides(best_params: dict[str, Any]) -> dict[str, Any]:
     return overrides
 
 
-def format_optimizer_result(manifest: dict[str, Any]) -> str:
+def format_optimizer_result(summary: dict[str, Any]) -> str:
     lines = [
-        f"Optimizer run ({manifest['detector']}) — Patchwork rule "
-        f"v{manifest['optimizer_version']}, omega {manifest['omega_hash']}.",
+        f"Optimizer run ({summary['detector']}) — Patchwork rule "
+        f"v{summary['optimizer_version']}, config {summary['config_hash']}.",
     ]
-    if not manifest["success"]:
-        lines.append(f"  FAILED (exit {manifest['returncode']}) — see {manifest['log']}")
+    if not summary["success"]:
+        lines.append(f"  FAILED (exit {summary['returncode']}) — see {summary['log']}")
         return "\n".join(lines)
     lines.append(
-        f"  {manifest['n_trials']} trials, best cost {manifest['best_cost']:.6g}."
+        f"  {summary['n_trials']} trials, best cost {summary['best_cost']:.6g}."
     )
     lines.append("  Best parameters:")
-    for k, v in manifest["best_params"].items():
+    for k, v in summary["best_params"].items():
         lines.append(f"    {k} = {v}")
-    sens = manifest.get("sensitivity", {})
+    sens = summary.get("sensitivity", {})
     sharp = [k for k, s in sens.items() if s["classification"] == "sharp"]
     flat = [k for k, s in sens.items() if s["classification"] == "flat"]
     if sharp:
-        lines.append(f"  Sharp knobs (earn Class-2 status): {', '.join(sharp)}")
+        lines.append(f"  Sharp parameters (worth tuning): {', '.join(sharp)}")
     if flat:
-        lines.append(f"  Flat knobs (freezable as Class-1): {', '.join(flat)}")
-    lines.append(f"  Cost table: {manifest['cost_table']}")
-    lines.append(f"  Manifest:   {manifest['manifest_path']}")
+        lines.append(f"  Flat parameters (can be fixed): {', '.join(flat)}")
+    lines.append(f"  Cost table: {summary['cost_table']}")
+    lines.append(f"  Summary:    {summary['summary_path']}")
     lines.append(
-        "Gate before adoption: reduce with these values AND the frozen "
+        "Check before adoption: reduce with these values AND the frozen "
         "defaults, fit both, compare depths (must agree well within 1 sigma)."
     )
     return "\n".join(lines)
@@ -521,7 +521,7 @@ FIR_OPTIMIZER_SBATCH_TEMPLATE = """\
 # output_root would leave the job with no log at all.
 #SBATCH --output=%x-%j.out
 
-# --- Patchwork optimizer (Class-2 rule) on DRAC Fir -----------------
+# --- Patchwork optimizer (tuning rule) on DRAC Fir ------------------
 # One visit x one detector per job; NRS1/NRS2 are independent sweeps.
 module load StdEnv/2023 {python_module}
 source {aster_env}/bin/activate
@@ -534,7 +534,7 @@ export CRDS_SERVER_URL=https://jwst-crds.stsci.edu
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 python -m aster_toolkit.data_reduction.optimize \\
-    --manifest {manifest_path} \\
+    --summary {summary_path} \\
     --output-root {output_root} \\
     --visit {visit} \\
     --detector {det}
@@ -542,7 +542,7 @@ python -m aster_toolkit.data_reduction.optimize \\
 
 
 def write_fir_optimizer_slurm_scripts(
-    manifest_path: str | os.PathLike[str],
+    summary_path: str | os.PathLike[str],
     output_root: str,
     *,
     visits: list[str] | None = None,
@@ -561,18 +561,18 @@ def write_fir_optimizer_slurm_scripts(
 ) -> list[Path]:
     """One sbatch per visit x detector (a sweep is ~50 reductions — never
     bundle them into one job). Does NOT submit."""
-    from .survey import _slug, load_manifest
+    from .survey import _slug, load_target_summary
 
-    manifest = load_manifest(manifest_path)
-    slug = _slug(manifest["planet_name"])
-    visits = visits or list(manifest["visits"])
-    out_dir = Path(script_dir) if script_dir else Path(manifest_path).parent
+    target = load_target_summary(summary_path)
+    slug = _slug(target["planet_name"])
+    visits = visits or list(target["visits"])
+    out_dir = Path(script_dir) if script_dir else Path(summary_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
     written = []
     for visit in visits:
-        if visit not in manifest["visits"]:
-            raise KeyError(f"Visit '{visit}' not in manifest {manifest_path}")
+        if visit not in target["visits"]:
+            raise KeyError(f"Visit '{visit}' not in target {summary_path}")
         for det in detectors:
             script = FIR_OPTIMIZER_SBATCH_TEMPLATE.format(
                 account=account, slug=slug, visit=visit, det=det.lower(),
@@ -581,7 +581,7 @@ def write_fir_optimizer_slurm_scripts(
                 python_module=python_module,
                 exotedrf_python=exotedrf_python,
                 exotedrf_repo=exotedrf_repo, crds_path=crds_path,
-                manifest_path=os.path.abspath(str(manifest_path)),
+                summary_path=os.path.abspath(str(summary_path)),
             )
             path = out_dir / f"opt_{slug}_{visit}_{det.lower()}.sbatch"
             path.write_text(script)
@@ -595,30 +595,30 @@ def write_fir_optimizer_slurm_scripts(
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    from .survey import _slug, load_manifest, stage_visit_uncals
+    from .survey import _slug, load_target_summary, stage_visit_uncals
 
     parser = argparse.ArgumentParser(
         prog="python -m aster_toolkit.data_reduction.optimize",
         description="Run the frozen Patchwork optimizer sweep for one "
-                    "visit x detector of a target manifest.",
+                    "visit x detector of a target summary.",
     )
-    parser.add_argument("--manifest", required=True, help="Target manifest JSON.")
+    parser.add_argument("--summary", required=True, help="Target summary JSON.")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--visit", required=True,
-                        help="Visit key from the manifest, e.g. o010.")
+                        help="Visit key from the target summary, e.g. o010.")
     parser.add_argument("--detector", required=True, choices=["NRS1", "NRS2"])
     args = parser.parse_args(argv)
 
-    manifest = load_manifest(args.manifest)
-    if args.visit not in manifest["visits"]:
-        parser.error(f"Visit '{args.visit}' not in manifest.")
-    slug = _slug(manifest["planet_name"])
+    target = load_target_summary(args.summary)
+    if args.visit not in target["visits"]:
+        parser.error(f"Visit '{args.visit}' not in target.")
+    slug = _slug(target["planet_name"])
     root = Path(args.output_root) / slug
 
     input_dir = stage_visit_uncals(
-        manifest["visits"][args.visit], root / "uncals" / args.visit
+        target["visits"][args.visit], root / "uncals" / args.visit
     )
-    stellar = manifest.get("stellar") or {}
+    stellar = target.get("stellar") or {}
     result = run_optimization(
         input_dir,
         root / "optimizer" / args.visit,
@@ -627,7 +627,7 @@ def main(argv: list[str] | None = None) -> int:
         st_teff=stellar.get("st_teff"),
         st_logg=stellar.get("st_logg"),
         st_met=stellar.get("st_met"),
-        planet_letter=manifest.get("planet_letter", "b"),
+        planet_letter=target.get("planet_letter", "b"),
         log_callback=lambda line: print(line, end=""),
     )
     print(format_optimizer_result(result))
@@ -643,17 +643,17 @@ if __name__ == "__main__":
 
 class OptimizeNirspecG395hReduction(BaseTool):
     """
-    Run Patchwork's frozen Class-2 optimizer rule (the exoTEDRF
+    Run Patchwork's frozen optimizer rule (the exoTEDRF
     coordinate-descent optimizer) on one NIRSpec/G395H visit x detector:
     sweep trace-mask width, jump/outlier thresholds, BadPix box/window,
     and extraction aperture, scoring each trial by out-of-transit
     point-to-point scatter of the Stage 3 spectra.
 
     The sweep grids, order, cost weights, wavelength windows, and CRDS
-    context are all frozen module-wide; the YAML's SHA-256 (omega hash)
+    context are all frozen module-wide; the YAML's SHA-256 (config hash)
     is recorded so any result is replayable. This is a CALIBRATION
     procedure — run it on calibrator targets (GJ 9827 d), not per survey
-    target, and gate adoption on the depth-shift ablation.
+    target, and adopt the result only after the depth comparison check.
 
     Compute warning: ~50 Stage 1-3 trials — DAYS on a full TSO even with
     the optimizer's stage caching. On the laptop, only ever on a
@@ -663,7 +663,7 @@ class OptimizeNirspecG395hReduction(BaseTool):
 
     Outputs under {output_dir}/{nrs1|nrs2}/: run_optimize.yaml (frozen
     rule), optimizer.log, Cost/Scatter tables + plots, and
-    optimizer_manifest.json (omega hash, best vector, per-knob
+    optimizer_summary.json (config hash, best vector, per-parameter
     flat/sharp sensitivity).
 
     Example
@@ -698,7 +698,7 @@ class OptimizeNirspecG395hReduction(BaseTool):
         output_dir = self.output_dir
         if not os.path.isabs(output_dir):
             output_dir = os.path.join(self.base_directory, output_dir)
-        manifest = run_optimization(
+        summary = run_optimization(
             input_dir, output_dir,
             detector=self.detector,
             name_tag=self.name_tag,
@@ -707,24 +707,23 @@ class OptimizeNirspecG395hReduction(BaseTool):
             st_met=self.st_met,
             planet_letter=self.planet_letter,
         )
-        return format_optimizer_result(manifest)
+        return format_optimizer_result(summary)
 
 
 class SummarizeG395hOptimization(BaseTool):
     """
     Analyze a completed optimizer run from its ``Cost_<tag>.txt`` table:
     best parameter vector (global-minimum row, the optimizer's own
-    selection rule), per-knob flat/sharp sensitivity classification, and
+    selection rule), per-parameter flat/sharp sensitivity classification, and
     the ready-to-use ``run_reduction`` overrides JSON for reducing with
     the optimized values.
 
     Use after a Fir optimizer job finishes, or on a partial table while
-    one is still running (every completed trial is a row). 'Flat' knobs
+    one is still running (every completed trial is a row). 'Flat' parameters
     barely move the cost — freeze them as plain survey constants.
-    'Sharp' knobs are the ones the optimizer is actually earning its
-    keep on.
+    'Sharp' parameters are the ones worth tuning.
 
-    Adoption gate (do NOT skip): reduce a calibrator with the overrides
+    Adoption check (do NOT skip): reduce a calibrator with the overrides
     AND with the frozen defaults, fit both with the juliet tools, and
     compare transmission depths — scatter-minimizing cost is blind to
     depth bias, so agreement well within 1 sigma is required before the
@@ -765,7 +764,7 @@ class SummarizeG395hOptimization(BaseTool):
         lines.append("run_reduction overrides for these values:")
         lines.append(json.dumps(overrides, indent=2))
         lines.append(
-            "Adoption gate: reduce with overrides AND defaults, fit both, "
+            "Adoption check: reduce with overrides AND defaults, fit both, "
             "compare depths before touching the survey config."
         )
         return "\n".join(lines)

@@ -12,7 +12,7 @@ Ties the whole Patchwork chain together for one target:
       -> visit combination + metrics       (juliet.py Stage 6)
       -> Stage 6.5 unocculted-spot check   (contamination.py)
 
-driven by a small per-target JSON manifest:
+driven by a small per-target JSON summary:
 
     {
       "planet_name": "GJ 9827 d",
@@ -28,7 +28,7 @@ A visit entry may instead be a plain directory string when that directory
 already contains only that visit's uncal segments. ``stellar`` overrides
 the NASA Exoplanet Archive values (useful offline on compute nodes).
 
-Runs identically on the laptop (subset smoke tests) and on DRAC's Fir
+Runs identically on the laptop (quick subset tests) and on DRAC's Fir
 cluster — ``write_fir_slurm_script`` emits the sbatch file; the CLI
 (``python -m aster_toolkit.data_reduction.survey``) is what the job runs.
 """
@@ -119,13 +119,13 @@ def _slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
 
 
-def load_manifest(path: str | os.PathLike[str]) -> dict[str, Any]:
+def load_target_summary(path: str | os.PathLike[str]) -> dict[str, Any]:
     with Path(path).open() as fh:
-        manifest = json.load(fh)
+        target = json.load(fh)
     for key in ("planet_name", "visits"):
-        if key not in manifest:
-            raise ValueError(f"Manifest missing required key '{key}'.")
-    return manifest
+        if key not in target:
+            raise ValueError(f"Target summary missing required key '{key}'.")
+    return target
 
 
 def _load_existing_summary(path: Path) -> dict[str, Any]:
@@ -161,16 +161,16 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             tmp.unlink()
 
 
-def _known_overlapping_transits(manifest: dict[str, Any]) -> list[str]:
+def _known_overlapping_transits(target: dict[str, Any]) -> list[str]:
     overlaps: set[str] = set()
-    for visit, spec in manifest.get("visits", {}).items():
+    for visit, spec in target.get("visits", {}).items():
         if isinstance(spec, dict):
             candidates = {str(p) for p in spec.get("transit_candidates", [])}
             if len(candidates) > 1:
                 overlaps.update(candidates)
-        if (manifest.get("planet_name") == "TOI-270 b"
+        if (target.get("planet_name") == "TOI-270 b"
                 and visit == "o017"
-                and "4098" in str(manifest.get("program", ""))):
+                and "4098" in str(target.get("program", ""))):
             overlaps.update(("TOI-270 b", "TOI-270 d"))
     return sorted(overlaps)
 
@@ -196,7 +196,7 @@ def stage_visit_uncals(
     visit_spec: str | dict[str, str],
     staging_dir: str | os.PathLike[str],
 ) -> str:
-    """Resolve one manifest visit entry into a directory of that visit's
+    """Resolve one target-summary visit entry into a directory of that visit's
     uncal segments.
 
     A plain string is used unchanged. A ``{raw_root, visit_prefix}`` dict
@@ -251,7 +251,7 @@ def existing_fit_products(fit_dir: str | os.PathLike[str]) -> list[str]:
 
 
 def run_patchwork_target(
-    manifest: dict[str, Any],
+    target: dict[str, Any],
     output_root: str | os.PathLike[str],
     *,
     steps: tuple[str, ...] | list[str] = ALL_STEPS,
@@ -267,16 +267,16 @@ def run_patchwork_target(
     Returns (and writes) ``patchwork_summary.json`` under
     ``{output_root}/{target_slug}/`` — the per-target Patchwork log.
     """
-    planet = manifest["planet_name"]
-    letter = manifest.get("planet_letter", planet.split()[-1])
-    program = manifest.get("program", "")   # e.g. "GO 4098"; used in figures
+    planet = target["planet_name"]
+    letter = target.get("planet_letter", planet.split()[-1])
+    program = target.get("program", "")   # e.g. "GO 4098"; used in figures
     slug = _slug(planet)
     root = Path(output_root) / slug
     root.mkdir(parents=True, exist_ok=True)
 
-    # Manifest-cached priors (written by discover.py): the offline
+    # Cached priors (written by discover.py): the offline
     # fallback for compute nodes, and the expected-depth cross-check.
-    cached_priors = manifest.get("priors")
+    cached_priors = target.get("priors")
 
     # Spectral binning resolution. Frozen survey-wide at R=100 by default
     # (see DEFAULT_RESOLUTION), but settable per target so a run can be
@@ -287,16 +287,16 @@ def run_patchwork_target(
     # yields R=200, R=100 and R=50; fitting at R=100 yields only 100 and
     # coarser. The cost is roughly linear in channel count: ~115 channels
     # at R=200 against ~58 at R=100, so about double the fit walltime.
-    resolution = float(manifest.get("resolution") or DEFAULT_RESOLUTION)
+    resolution = float(target.get("resolution") or DEFAULT_RESOLUTION)
     if not np.isfinite(resolution) or resolution <= 0:
-        raise ValueError(f"Manifest resolution must be positive; got {resolution!r}.")
+        raise ValueError(f"Target summary resolution must be positive; got {resolution!r}.")
     if resolution != DEFAULT_RESOLUTION:
         log(f"[{slug}] NON-DEFAULT binning R={resolution:.0f} "
             f"(survey default {DEFAULT_RESOLUTION}); products are not "
             "channel-for-channel comparable with default-R targets until "
             "rebinned to a common resolution.")
 
-    stellar = manifest.get("stellar")
+    stellar = target.get("stellar")
     if stellar is None and {"reduce", "fit", "contamination"} & set(steps):
         try:
             priors = fetch_transit_priors(planet)
@@ -330,7 +330,7 @@ def run_patchwork_target(
         summary["resolution"] = resolution
 
     visit_dirs: dict[str, str] = {}
-    for vname, spec in manifest["visits"].items():
+    for vname, spec in target["visits"].items():
         visit_dirs[vname] = stage_visit_uncals(spec, root / "uncals" / vname)
 
     # -- inspect ------------------------------------------------------
@@ -395,7 +395,7 @@ def run_patchwork_target(
         from .exotedrf import find_stage3_products
         import shutil
 
-        overlapping = _known_overlapping_transits(manifest)
+        overlapping = _known_overlapping_transits(target)
         if len(overlapping) > 1:
             raise RuntimeError(
                 f"{planet} has overlapping transits in this visit: "
@@ -454,11 +454,11 @@ def run_patchwork_target(
                     products[0], planet,
                     instrument=det, reduction_dir=str(det_dir),
                     fallback_priors=cached_priors,
-                    # Manifest-level ephemeris correction. Only for a
+                    # Target-level ephemeris correction. Only for a
                     # target whose archive ephemeris demonstrably misses
                     # a transit that IS in the data; every use is stamped
                     # into priors_source. See prepare_visit_fit_inputs.
-                    priors_override=manifest.get("priors_override"),
+                    priors_override=target.get("priors_override"),
                     resolution=resolution,
                 )
                 preps[det] = prep
@@ -801,7 +801,7 @@ def run_patchwork_target(
                 "combine step first.")
         elif not t_phot:
             log(f"[{slug}] contamination: no stellar effective temperature "
-                "available — skipping. Add 'stellar' to the manifest.")
+                "available — skipping. Add 'stellar' to the target summary.")
         else:
             from .juliet import read_spectrum_csv
 
@@ -924,14 +924,14 @@ raise SystemExit(0 if r['ok'] else 1)" || exit 1
 # (set it in the submitting shell — SLURM's --export=NAME=VALUE splits on
 # the comma inside the value no matter how it is quoted).
 python -m aster_toolkit.data_reduction.survey \\
-    --manifest {manifest_path} \\
+    --summary {summary_path} \\
     --output-root {output_root} \\
     --steps "${{STEPS:-{steps}}}" $REFIT_FLAG
 """
 
 
 def write_fir_slurm_script(
-    manifest_path: str | os.PathLike[str],
+    summary_path: str | os.PathLike[str],
     output_root: str,
     *,
     script_path: str | os.PathLike[str] | None = None,
@@ -954,8 +954,8 @@ def write_fir_slurm_script(
     adjust ``aster_env``/``exotedrf_python`` to where the two
     environments actually live. Does NOT submit — inspect, then sbatch it.
     """
-    manifest = load_manifest(manifest_path)
-    slug = _slug(manifest["planet_name"])
+    target = load_target_summary(summary_path)
+    slug = _slug(target["planet_name"])
     script = FIR_SBATCH_TEMPLATE.format(
         account=account, slug=slug, time=time, cpus=cpus, mem=mem,
         output_root=output_root, aster_env=aster_env, aster_repo=aster_repo,
@@ -963,10 +963,10 @@ def write_fir_slurm_script(
         exotedrf_python=exotedrf_python, exotedrf_repo=exotedrf_repo,
         crds_path=crds_path,
         crds_context=crds_context, exotic_ld_data=exotic_ld_data,
-        manifest_path=os.path.abspath(manifest_path), steps=steps,
+        summary_path=os.path.abspath(summary_path), steps=steps,
     )
     path = Path(script_path) if script_path else (
-        Path(manifest_path).parent / f"run_{slug}.sbatch"
+        Path(summary_path).parent / f"run_{slug}.sbatch"
     )
     path.write_text(script)
     return path
@@ -980,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m aster_toolkit.data_reduction.survey",
         description="Run the Patchwork uncals->spectrum chain for one target.",
     )
-    parser.add_argument("--manifest", required=True, help="Target manifest JSON.")
+    parser.add_argument("--summary", required=True, help="Target summary JSON.")
     parser.add_argument("--output-root", required=True,
                         help="Root directory for all per-target outputs.")
     parser.add_argument("--steps", default=",".join(ALL_STEPS),
@@ -998,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"Unknown steps: {sorted(unknown)}")
 
     run_patchwork_target(
-        load_manifest(args.manifest),
+        load_target_summary(args.summary),
         args.output_root,
         steps=steps,
         detectors=tuple(d.strip().upper() for d in args.detectors.split(",")),
@@ -1016,7 +1016,7 @@ if __name__ == "__main__":
 
 class RunPatchworkTarget(BaseTool):
     """
-    Run the full Patchwork chain for ONE target from a manifest JSON:
+    Run the full Patchwork chain for ONE target from a target summary JSON:
     segment inspection -> exoTEDRF Stages 1-3 (per visit, NRS1+NRS2) ->
     Stage 4 lightcurves + tilt scan -> juliet white-light + spectroscopic
     fits (frozen v1.1: ExoTiC-LD priors, trace decorrelation, tilt steps)
@@ -1028,7 +1028,7 @@ class RunPatchworkTarget(BaseTool):
     ``GenerateFirJobs``. Restartable — rerun with a later
     ``steps`` subset to continue from existing on-disk products.
 
-    Manifest format (see module docstring): planet_name, planet_letter,
+    Target summary format (see module docstring): planet_name, planet_letter,
     visits {name: uncal_dir | {raw_root, visit_prefix}}, optional stellar
     overrides.
 
@@ -1040,13 +1040,13 @@ class RunPatchworkTarget(BaseTool):
     Example
     -------
         RunPatchworkTarget(
-            manifest_path="patchwork/GJ_9827_d.json",
+            summary_path="patchwork/GJ_9827_d.json",
             output_root="patchwork/results",
             steps="inspect,reduce,fit,combine,contamination",
         )
     """
 
-    manifest_path: str = RuntimeField(description="Path to the target manifest JSON.")
+    summary_path: str = RuntimeField(description="Path to the target summary JSON.")
     output_root: str = RuntimeField(description="Root directory for outputs.")
     steps: str = RuntimeField(
         default="inspect,reduce,fit,combine,contamination",
@@ -1061,16 +1061,16 @@ class RunPatchworkTarget(BaseTool):
     base_directory: str = StateField()
 
     def _run(self) -> str:
-        manifest_path = self.manifest_path
-        if not os.path.isabs(manifest_path):
-            manifest_path = os.path.join(self.base_directory, manifest_path)
+        summary_path = self.summary_path
+        if not os.path.isabs(summary_path):
+            summary_path = os.path.join(self.base_directory, summary_path)
         output_root = self.output_root
         if not os.path.isabs(output_root):
             output_root = os.path.join(self.base_directory, output_root)
 
         lines: list[str] = []
         summary = run_patchwork_target(
-            load_manifest(manifest_path),
+            load_target_summary(summary_path),
             output_root,
             steps=tuple(s.strip() for s in self.steps.split(",") if s.strip()),
             force_refit=self.force_refit,
@@ -1096,7 +1096,7 @@ class GenerateFirJobs(BaseTool):
     """
     The ONE tool that writes SLURM sbatch scripts for DRAC **Fir** (where
     the full uncal data and the pinned exoTEDRF/juliet environments live).
-    Does NOT submit anything — copy the manifest + script(s) to Fir, check
+    Does NOT submit anything — copy the target summary + script(s) to Fir, check
     the environment paths, then ``sbatch`` them yourself.
 
     ``job`` selects what the scripts run:
@@ -1104,7 +1104,7 @@ class GenerateFirJobs(BaseTool):
         chain for one target (``python -m aster_toolkit.data_reduction.survey``);
         ``steps`` picks the subset. Defaults: 24:00:00, 8 CPUs, 40G.
       * ``"optimizer"`` — ONE script PER visit x detector running the frozen
-        Class-2 optimizer sweep (``python -m aster_toolkit.data_reduction.optimize``;
+        optimizer sweep (``python -m aster_toolkit.data_reduction.optimize``;
         ~50 reductions each, so never bundled). ``visits`` / ``detectors``
         pick the subset; ``exotedrf_repo`` must be the pulled
         'optimizer'-branch checkout. Defaults: 3-00:00:00, 16 CPUs, 64G.
@@ -1113,18 +1113,18 @@ class GenerateFirJobs(BaseTool):
     Every script loads the python module, activates the ASTER env, points
     ASTER_EXOTEDRF_PYTHON / ASTER_EXOTEDRF_REPO at the exoTEDRF interpreter
     and checkout, and puts the CRDS (and ExoTiC-LD) caches on scratch.
-    Manifest paths (raw_root, etc.) must be Fir paths.
+    Target summary paths (raw_root, etc.) must be Fir paths.
 
     Examples
     --------
-        GenerateFirJobs(manifest_path="patchwork/manifests/GJ_9827_d.json",
+        GenerateFirJobs(summary_path="patchwork/targets/GJ_9827_d.json",
                         output_root="/scratch/wasi/patchwork", time="36:00:00")
         GenerateFirJobs(job="optimizer",
-                        manifest_path="patchwork/manifests/GJ_9827_d.json",
+                        summary_path="patchwork/targets/GJ_9827_d.json",
                         output_root="/scratch/wasi/patchwork", detectors="NRS1")
     """
 
-    manifest_path: str = RuntimeField(description="Path to the target manifest JSON.")
+    summary_path: str = RuntimeField(description="Path to the target summary JSON.")
     output_root: str = RuntimeField(
         description="Output root ON FIR (e.g. /scratch/<user>/patchwork)."
     )
@@ -1177,7 +1177,7 @@ class GenerateFirJobs(BaseTool):
     exotedrf_repo: str = RuntimeField(
         default="~/exoTEDRF",
         description="Fir path to the exoTEDRF checkout (the 'optimizer' branch "
-                    "for job='optimizer'; it also shadows the release for "
+                    "for job='optimizer'; it also overrides the installed release for "
                     "reductions so both share one stage-code tree).",
     )
     base_directory: str = StateField()
@@ -1191,9 +1191,9 @@ class GenerateFirJobs(BaseTool):
         cpus = int(self.cpus) if str(self.cpus or "").strip() else defaults["cpus"]
         mem = (self.mem or "").strip() or defaults["mem"]
 
-        manifest_path = self.manifest_path
-        if not os.path.isabs(manifest_path):
-            manifest_path = os.path.join(self.base_directory, manifest_path)
+        summary_path = self.summary_path
+        if not os.path.isabs(summary_path):
+            summary_path = os.path.join(self.base_directory, summary_path)
         common = dict(
             account=self.account, time=time, cpus=cpus, mem=mem,
             aster_env=self.aster_env, aster_repo=self.aster_repo,
@@ -1204,14 +1204,14 @@ class GenerateFirJobs(BaseTool):
 
         if job == "patchwork":
             path = write_fir_slurm_script(
-                manifest_path, self.output_root, steps=self.steps, **common
+                summary_path, self.output_root, steps=self.steps, **common
             )
             return (
                 f"Wrote {path} (job=patchwork, {time}, {cpus} CPUs, {mem}).\n"
-                "Copy the manifest + this script to Fir, verify aster_env / "
+                "Copy the target summary + this script to Fir, verify aster_env / "
                 "exotedrf_python paths, then submit with: sbatch "
                 f"{os.path.basename(str(path))}\n"
-                "NOTE: manifest paths (raw_root, etc.) must be Fir paths."
+                "NOTE: target summary paths (raw_root, etc.) must be Fir paths."
             )
 
         from .optimize import write_fir_optimizer_slurm_scripts
@@ -1219,7 +1219,7 @@ class GenerateFirJobs(BaseTool):
         visits = ([v.strip() for v in self.visits.split(",") if v.strip()]
                   if self.visits else None)
         written = write_fir_optimizer_slurm_scripts(
-            manifest_path,
+            summary_path,
             self.output_root,
             visits=visits,
             detectors=tuple(d.strip().upper() for d in self.detectors.split(",")
@@ -1230,7 +1230,7 @@ class GenerateFirJobs(BaseTool):
                  f"(job=optimizer, {time}, {cpus} CPUs, {mem}):"]
         lines += [f"  {p}" for p in written]
         lines.append(
-            "Copy to Fir with the manifest, verify aster_env / "
+            "Copy to Fir with the target summary, verify aster_env / "
             "exotedrf_python / exotedrf_repo paths, then sbatch each. "
             "After completion: SummarizeG395hOptimization on the cost tables."
         )

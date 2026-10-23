@@ -450,7 +450,7 @@ def search_all_jwst_observations(
     """
     Filter-only MAST search for JWST observations (no cone / no position).
 
-    Use when you want a population-level / demographics query that scans every
+    Use when you want a population query that scans every
     JWST observation matching the filters, not centered on a single target.
     Returns (rows, filters_used) so callers can echo the filters that produced
     the result set.
@@ -460,7 +460,7 @@ def search_all_jwst_observations(
     MAST ``Mast.Caom.Filtered`` pagination has NO stable row ordering, so a
     multi-page read can both duplicate and silently MISS rows at page
     boundaries — and differently on every run. Observed live 2026-07-10 on
-    the Q2 sub-Neptune demographics query (~171k rows / 4 pages): two
+    the Q2 sub-Neptune population query (~171k rows / 4 pages): two
     identical queries returned sets differing by 41 and 5 observations, each
     with dozens of duplicated rows. This — not instrument vocabulary — was
     the root cause of the "missing NIRSpec visits" incidents.
@@ -474,7 +474,7 @@ def search_all_jwst_observations(
          ONCE as a single page sized to hold the entire result set (a single
          page has no boundaries to lose rows across).
       3. If the count still disagrees, ``RuntimeError`` is raised — an
-         incomplete demographics table must never be returned silently.
+         incomplete population table must never be returned silently.
     """
     selected_columns = _as_list(columns) or list(JWST_OBSERVATION_COLUMNS)
     filters = _build_jwst_observation_filters(
@@ -563,7 +563,7 @@ def search_all_jwst_observations(
                 f"MAST pagination returned an incomplete result set: server "
                 f"reports {expected_total} observations, received "
                 f"{len(all_rows)} unique rows even after a single-page "
-                "retry. Refusing to return silently-incomplete demographics "
+                "retry. Refusing to return silently-incomplete population "
                 "data — rerun or narrow the filters."
             )
 
@@ -1367,7 +1367,7 @@ def _download_product_sets(
     """Download (key, products) pairs; return (downloaded, skipped_proprietary).
 
     ``dir_name(key)`` names the per-observation subdirectory; ``key`` is
-    echoed into each manifest entry by the caller-supplied ``entry`` dict.
+    echoed into each summary entry by the caller-supplied ``entry`` dict.
     """
     downloaded: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -1415,7 +1415,7 @@ def download_observations_products(
 
     Writes files under ``{output_directory}/{label}/{obs_dir}/`` (``obs_dir``
     is ``obs_dir_names[obsid]`` when given, else the obsid) and a
-    ``manifest.json`` capturing every download. ``visits`` restricts to
+    ``download_summary.json`` capturing every download. ``visits`` restricts to
     exoTEDRF-numbered visits (see ``select_products_by_visit``); products
     are listed for every obsid first so the numbering is global.
     """
@@ -1456,20 +1456,20 @@ def download_observations_products(
     for entry in downloaded + skipped:
         entry["obsid"] = entry.pop("key")
 
-    manifest = {
+    summary = {
         "label": label,
         "obsids": obsid_list,
         "downloaded": downloaded,
         "skipped_proprietary": skipped,
     }
     if visits is not None:
-        manifest["visits_available"] = all_visits
-        manifest["visits_selected"] = selected_visits
+        summary["visits_available"] = all_visits
+        summary["visits_selected"] = selected_visits
 
-    with (target_dir / "manifest.json").open("w") as handle:
-        json.dump(manifest, handle, indent=2)
+    with (target_dir / "download_summary.json").open("w") as handle:
+        json.dump(summary, handle, indent=2)
 
-    return manifest
+    return summary
 
 
 def download_planet_jwst_products(
@@ -1500,7 +1500,7 @@ def download_planet_jwst_products(
 
     ``proposal_id`` / ``instruments`` / ``dataproduct_types`` filter the MAST
     query; ``filters`` (e.g. 'G395H') and ``visits`` select client-side, as
-    exoTEDRF's ``download_observations`` does. The returned manifest is
+    exoTEDRF's ``download_observations`` does. The returned summary is
     JSON-serializable and records the observation rows, product metadata,
     and local file paths.
     """
@@ -1557,21 +1557,21 @@ def download_planet_jwst_products(
     for entry in downloaded + skipped:
         entry["observation"] = observations[entry.pop("key")]
 
-    manifest = {
+    summary = {
         "planet_name": planet_name,
         "observations": observations,
         "downloaded": downloaded,
         "skipped_proprietary": skipped,
     }
     if visits is not None:
-        manifest["visits_available"] = all_visits
-        manifest["visits_selected"] = selected_visits
+        summary["visits_available"] = all_visits
+        summary["visits_selected"] = selected_visits
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    with (target_dir / "manifest.json").open("w") as handle:
-        json.dump(manifest, handle, indent=2)
+    with (target_dir / "download_summary.json").open("w") as handle:
+        json.dump(summary, handle, indent=2)
 
-    return manifest
+    return summary
 
 
 def _format_filters_block(
@@ -1661,14 +1661,14 @@ def _format_products_summary(products: list[dict[str, Any]], limit: int = 100) -
     return "\n".join(lines)
 
 
-def _format_download_manifest(manifest: dict[str, Any]) -> str:
-    """Format download manifest as a compact, LLM-readable summary."""
-    downloaded = manifest.get("downloaded", [])
-    skipped = manifest.get("skipped_proprietary", [])
+def _format_download_summary(summary: dict[str, Any]) -> str:
+    """Format a download summary as compact text for the model."""
+    downloaded = summary.get("downloaded", [])
+    skipped = summary.get("skipped_proprietary", [])
 
-    if "planet_name" in manifest:
-        planet = manifest.get("planet_name", "?")
-        observations = manifest.get("observations", [])
+    if "planet_name" in summary:
+        planet = summary.get("planet_name", "?")
+        observations = summary.get("observations", [])
         lines = [
             f"Downloaded JWST data for {planet}.",
             f"Observations matched: {len(observations)}",
@@ -1678,8 +1678,8 @@ def _format_download_manifest(manifest: dict[str, Any]) -> str:
             "Local paths:",
         ]
     else:
-        label = manifest.get("label", "aggregate")
-        obsids = manifest.get("obsids", [])
+        label = summary.get("label", "aggregate")
+        obsids = summary.get("obsids", [])
         lines = [
             f"Downloaded JWST data for batch '{label}'.",
             f"Obsids requested: {len(obsids)}",
@@ -1688,9 +1688,9 @@ def _format_download_manifest(manifest: dict[str, Any]) -> str:
             "",
             "Local paths:",
         ]
-    if "visits_selected" in manifest:
-        lines.insert(4, f"Visits selected: {manifest['visits_selected']} "
-                        f"(of {manifest.get('visits_available')})")
+    if "visits_selected" in summary:
+        lines.insert(4, f"Visits selected: {summary['visits_selected']} "
+                        f"(of {summary.get('visits_available')})")
     for entry in downloaded:
         lines.append(f"  - {entry.get('path', '?')}")
     if not downloaded:
@@ -1705,11 +1705,11 @@ def _format_download_manifest(manifest: dict[str, Any]) -> str:
                 f"file={prod.get('productFilename','?')}"
             )
         if len(skipped) > 20:
-            lines.append(f"  ... ({len(skipped) - 20} more skipped, see manifest.json)")
+            lines.append(f"  ... ({len(skipped) - 20} more skipped, see download_summary.json)")
     return "\n".join(lines)
 
 
-def _diagnose_empty_demographics(
+def _diagnose_empty_population(
     *,
     instruments: Any,
     dataproduct_types: Any,
@@ -1720,7 +1720,7 @@ def _diagnose_empty_demographics(
     timeout: float = 120.0,
 ) -> str:
     """
-    Explain an empty no-position (demographics) JWST search so the agent does
+    Explain an empty no-position (population) JWST search so the agent does
     not conclude "no such data exists" when the FILTERS are simply too strict.
 
     Strategy: re-run the same search with the filters progressively relaxed
@@ -1730,7 +1730,7 @@ def _diagnose_empty_demographics(
     caller which filter to change rather than dead-ending.
     """
     lines = [
-        "Diagnostics (demographics mode): the strict query matched nothing. "
+        "Diagnostics (population mode): the strict query matched nothing. "
         "This usually means the FILTER combination is too narrow, NOT that the "
         "data is absent. Findings:",
     ]
@@ -1770,7 +1770,7 @@ def _diagnose_empty_demographics(
         return "\n".join(lines)
 
     # No proposal_id to scope a cheap probe. Live relaxation is deliberately
-    # AVOIDED here: a filter-free demographics search spans ~170k rows and the
+    # AVOIDED here: a filter-free population search spans ~170k rows and the
     # completeness guard would refetch the whole set — a diagnostic must never
     # cost more than the query. Give targeted static guidance instead.
     culprits = []
@@ -1955,7 +1955,7 @@ class SearchMastJwstObservations(BaseTool):
         SearchMastJwstObservations(dataproduct_types=["timeseries"],
                                    group_by=["instrument_name"])
     Regroup a CSV an earlier call wrote:
-        SearchMastJwstObservations(rows_path="mast/demographics/search_....csv",
+        SearchMastJwstObservations(rows_path="mast/population/search_....csv",
                                    group_by=["cycle_number"])
 
     Populations
@@ -2229,9 +2229,9 @@ class SearchMastJwstObservations(BaseTool):
             )
 
         # ---- 1. MAST ----
-        demographics = planet_name is None and ra is None and dec is None
+        no_position = planet_name is None and ra is None and dec is None
         diagnostics = ""
-        if demographics:
+        if no_position:
             observations, filters = search_all_jwst_observations(
                 instruments=self.instruments,
                 dataproduct_types=self.dataproduct_types,
@@ -2240,16 +2240,16 @@ class SearchMastJwstObservations(BaseTool):
                 proposal_id=proposal_id,
             )
             observations = by_grating(observations)
-            query_extra = {"mode": "demographics (Mast.Caom.Filtered, no position)",
+            query_extra = {"mode": "population (Mast.Caom.Filtered, no position)",
                            **grating_extra}
             hint_parts = [population_preset, archive_conditions, self.instruments,
                           self.dataproduct_types, self.calib_levels, proposal_id,
                           target_name, grating_filters, obs_types]
             if not observations:
-                # Empty demographics result used to dead-end as a bare "No JWST
+                # Empty population result used to dead-end as a bare "No JWST
                 # observations found", inviting a false "no such data" verdict.
                 # Diagnose which filter was too strict instead.
-                diagnostics = _diagnose_empty_demographics(
+                diagnostics = _diagnose_empty_population(
                     instruments=self.instruments,
                     dataproduct_types=self.dataproduct_types,
                     calib_levels=self.calib_levels,
@@ -2318,9 +2318,9 @@ class SearchMastJwstObservations(BaseTool):
                 observations, limit=10 if group_keys else 50,
                 filters=filters, query_extra=query_extra,
             )
-            saved = self._save_rows(observations, always=demographics,
+            saved = self._save_rows(observations, always=no_position,
                                     hint_parts=hint_parts)
-            if demographics:
+            if no_position:
                 body = saved + summary + (f"\n\n{diagnostics}" if diagnostics else "")
             elif not observations:
                 body = f"{summary}\n\n{diagnostics}"
@@ -2356,7 +2356,7 @@ class SearchMastJwstObservations(BaseTool):
             type_lines.extend(annotate_rows_with_raw_data(rows))
 
         csv_path = None
-        if self.base_directory and (demographics or _clean_str(self.output_csv)):
+        if self.base_directory and (no_position or _clean_str(self.output_csv)):
             csv_path = self._rows_csv_path(hint_parts)
             _write_rows_csv(csv_path, rows)
 
@@ -2465,7 +2465,7 @@ def _format_cycle_warnings(warnings: list[str]) -> str:
 
 
 # (Listing products for an obsid is DownloadMastJwstProducts(list_only=True);
-#  the merged download tool is defined after download_demographic_products.)
+#  the merged download tool is defined after download_population_products.)
 
 
 # -------------------- JWST program info (observing cycle) --------------------
@@ -2960,7 +2960,7 @@ def _autoname_csv_path(
     *,
     kind: str,
     hint_parts: list[Any] | None = None,
-    subdir: str = "mast/demographics",
+    subdir: str = "mast/population",
 ) -> Path:
     """
     Build a deterministic-ish CSV path under ``base_directory`` so every
@@ -3165,7 +3165,7 @@ def _format_aggregate_summary(
     return "\n".join(head)
 
 
-def download_demographic_products(
+def download_population_products(
     rows: list[dict[str, Any]],
     output_directory: str | os.PathLike[str],
     *,
@@ -3182,15 +3182,15 @@ def download_demographic_products(
     timeout: float = 120.0,
 ) -> dict[str, Any]:
     """
-    Download JWST products for an entire demographic population, organized per
+    Download JWST products for a planet population, organized per
     planet on disk.
 
     ``rows`` must contain ``pl_name`` and ``obsid`` columns (the schema written
     by a ``SearchMastJwstObservations`` population search). Rows are grouped by planet name; for each
     planet, the unique obsids are downloaded under
     ``{output_directory}/{label}/{pl_name}/{obsid}/``. A per-planet
-    ``manifest.json`` is written by the underlying batch downloader; a global
-    ``demographic_manifest.json`` summarizing the whole demographic is written
+    ``download_summary.json`` is written by the underlying batch downloader; a global
+    ``population_summary.json`` summarizing the whole population is written
     at the label root.
     """
     by_planet: dict[str, list[str]] = {}
@@ -3215,7 +3215,7 @@ def download_demographic_products(
         if max_obs_per_planet is not None:
             obsids = obsids[:max_obs_per_planet]
 
-        sub_manifest = download_observations_products(
+        sub_summary = download_observations_products(
             obsids,
             root,
             product_types=product_types,
@@ -3228,7 +3228,7 @@ def download_demographic_products(
             timeout=timeout,
             label=pl_name,
         )
-        files = len(sub_manifest.get("downloaded", []))
+        files = len(sub_summary.get("downloaded", []))
         total_files += files
         per_planet_summary.append(
             {
@@ -3239,25 +3239,25 @@ def download_demographic_products(
             }
         )
 
-    manifest = {
+    summary = {
         "label": label,
         "planet_count": len(per_planet_summary),
         "total_files_downloaded": total_files,
         "per_planet": per_planet_summary,
     }
-    with (root / "demographic_manifest.json").open("w") as handle:
-        json.dump(manifest, handle, indent=2)
-    return manifest
+    with (root / "population_summary.json").open("w") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary
 
 
-def _format_demographic_summary(manifest: dict[str, Any], limit: int = 40) -> str:
-    label = manifest.get("label", "?")
-    planet_count = manifest.get("planet_count", 0)
-    total_files = manifest.get("total_files_downloaded", 0)
-    per_planet = manifest.get("per_planet", [])
+def _format_population_summary(summary: dict[str, Any], limit: int = 40) -> str:
+    label = summary.get("label", "?")
+    planet_count = summary.get("planet_count", 0)
+    total_files = summary.get("total_files_downloaded", 0)
+    per_planet = summary.get("per_planet", [])
 
     lines = [
-        f"Downloaded JWST data for demographic '{label}'.",
+        f"Downloaded JWST data for population '{label}'.",
         f"Planets processed: {planet_count}",
         f"Total files downloaded: {total_files}",
         "",
@@ -3373,9 +3373,9 @@ class DownloadMastJwstProducts(BaseTool):
         ``SearchMastJwstObservations`` (needs an ``obsid`` column). Rows with
         ``pl_name`` download per planet under
         ``{output_dir}/{label}/{pl_name}/{obsid}/`` (+ a top-level
-        ``demographic_manifest.json``); rows without it download as one flat
+        ``population_summary.json``); rows without it download as one flat
         batch under ``{output_dir}/{label}/{obsid}/``.
-    Every run writes a ``manifest.json``. One directory per observation is
+    Every run writes a ``download_summary.json``. One directory per observation is
     deliberate: ``ReduceNirspecG395hTso`` takes ONE observation's segments
     per ``input_dir``, and ``DiscoverPatchworkVisits`` reads headers anyway.
 
@@ -3407,7 +3407,7 @@ class DownloadMastJwstProducts(BaseTool):
       * ``max_products``     — product files per observation.
 
     Downloads resume interrupted files, and proprietary (exclusive-access)
-    products are skipped and listed in the manifest rather than aborting.
+    products are skipped and listed in the summary rather than aborting.
 
     exoTEDRF equivalence
     --------------------
@@ -3428,7 +3428,7 @@ class DownloadMastJwstProducts(BaseTool):
         DownloadMastJwstProducts(proposal_id="1366", filters=["G395H"],
                                  dataproduct_types=["timeseries"],
                                  raw_only=True, visits=[1])
-        DownloadMastJwstProducts(rows_path="mast/demographics/subneptunes.csv",
+        DownloadMastJwstProducts(rows_path="mast/population/subneptunes.csv",
                                  label="subneptunes", raw_only=True,
                                  max_observations=1, max_products=2)
     """
@@ -3456,7 +3456,7 @@ class DownloadMastJwstProducts(BaseTool):
     output_dir: str | None = OptionalRuntimeField(
         description=(
             "Output directory relative to the workspace. Default 'mast' "
-            "(query / obsids) or 'mast/demographics_raw' (rows_path)."
+            "(query / obsids) or 'mast/population_raw' (rows_path)."
         ),
     )
     label: str | None = OptionalRuntimeField(
@@ -3586,7 +3586,7 @@ class DownloadMastJwstProducts(BaseTool):
             if ignored else ""
         )
 
-        default_dir = "mast/demographics_raw" if mode == "rows_path" else "mast"
+        default_dir = "mast/population_raw" if mode == "rows_path" else "mast"
         output_root = os.path.join(
             self.base_directory, _clean_str(self.output_dir) or default_dir
         )
@@ -3635,21 +3635,21 @@ class DownloadMastJwstProducts(BaseTool):
             if list_only:
                 return note + listing([(pl or label, ids) for pl, ids in by_planet.items()])
             if set(by_planet) == {""}:
-                manifest = download_observations_products(
+                summary = download_observations_products(
                     by_planet[""], output_root,
                     product_subgroups=self.product_subgroups, raw_only=raw_only,
                     max_products_per_obs=max_products, label=label,
                     product_dataproduct_types=dptypes,
                 )
-                return note + _format_download_manifest(manifest)
-            manifest = download_demographic_products(
+                return note + _format_download_summary(summary)
+            summary = download_population_products(
                 rows, output_root, label=label,
                 product_subgroups=self.product_subgroups, raw_only=raw_only,
                 max_planets=max_planets, max_obs_per_planet=max_observations,
                 max_products_per_obs=max_products,
                 product_dataproduct_types=dptypes,
             )
-            return note + _format_demographic_summary(manifest)
+            return note + _format_population_summary(summary)
 
         if mode == "obsids":
             label = label or "aggregate"
@@ -3658,13 +3658,13 @@ class DownloadMastJwstProducts(BaseTool):
                 obsids_list = obsids_list[:max_observations]
             if list_only:
                 return note + listing([("", obsids_list)])
-            manifest = download_observations_products(
+            summary = download_observations_products(
                 obsids_list, output_root,
                 product_subgroups=self.product_subgroups, raw_only=raw_only,
                 max_products_per_obs=max_products, visits=visits,
                 product_dataproduct_types=dptypes, label=label,
             )
-            return note + _format_download_manifest(manifest)
+            return note + _format_download_summary(summary)
 
         # query mode: planet_name and/or proposal_id
         ra = _as_float_or_none(self.ra, "ra")
@@ -3687,7 +3687,7 @@ class DownloadMastJwstProducts(BaseTool):
                 )
             if list_only:
                 return note + listing([(describe, obsids_found)])
-            manifest = download_observations_products(
+            summary = download_observations_products(
                 obsids_found, output_root,
                 product_subgroups=self.product_subgroups, raw_only=raw_only,
                 max_products_per_obs=max_products, visits=visits,
@@ -3698,9 +3698,9 @@ class DownloadMastJwstProducts(BaseTool):
                 },
                 label=label or f"program_{proposal_id}",
             )
-            return note + _format_download_manifest(manifest)
+            return note + _format_download_summary(summary)
 
-        manifest = download_planet_jwst_products(
+        summary = download_planet_jwst_products(
             planet_name, output_root,
             ra=ra, dec=dec, radius_deg=radius_deg,
             instruments=self.instruments,
@@ -3710,7 +3710,7 @@ class DownloadMastJwstProducts(BaseTool):
             max_observations=max_observations, max_products=max_products,
             visits=visits,
         )
-        return note + _format_download_manifest(manifest)
+        return note + _format_download_summary(summary)
 
 
 class GetJwstProgramInfo(BaseTool):

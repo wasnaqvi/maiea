@@ -1,7 +1,7 @@
 """Pins the consolidated ASTER tool surface (one tool per task, no overlap).
 
 Covers the tools merged in the consolidation pass that are not exercised by
-test_mast.py: QueryExoplanetArchive, GenerateFirJobs, the segment preflight
+test_mast.py: QueryExoplanetArchive, GenerateFirJobs, the segment check
 inside ReduceNirspecG395hTso, and the contamination-backend report inside
 VerifyPatchworkEnvironment. Pure-local: no network, no exoTEDRF env.
 """
@@ -129,7 +129,7 @@ def test_archive_rejects_bad_calls(kwargs, msg):
 from aster_toolkit.data_reduction import survey  # noqa: E402
 
 
-def _manifest(tmp_path):
+def _target_summary(tmp_path):
     m = tmp_path / "m.json"
     m.write_text(json.dumps({"planet_name": "Test b",
                              "visits": {"o001": "/raw/1", "o002": "/raw/2"}}))
@@ -137,8 +137,8 @@ def _manifest(tmp_path):
 
 
 def test_fir_jobs_patchwork_defaults(tmp_path):
-    m = _manifest(tmp_path)
-    out = _construct(survey.GenerateFirJobs, manifest_path=str(m),
+    m = _target_summary(tmp_path)
+    out = _construct(survey.GenerateFirJobs, summary_path=str(m),
                      output_root="/scratch/pw", base_directory=str(tmp_path))._run()
     assert "job=patchwork, 24:00:00, 8 CPUs, 40G" in out
     script = next(tmp_path.glob("*.sbatch")).read_text()
@@ -146,8 +146,8 @@ def test_fir_jobs_patchwork_defaults(tmp_path):
 
 
 def test_fir_jobs_optimizer_one_script_per_visit_detector(tmp_path):
-    m = _manifest(tmp_path)
-    out = _construct(survey.GenerateFirJobs, job="optimizer", manifest_path=str(m),
+    m = _target_summary(tmp_path)
+    out = _construct(survey.GenerateFirJobs, job="optimizer", summary_path=str(m),
                      output_root="/scratch/pw", detectors="nrs1",
                      base_directory=str(tmp_path))._run()
     assert "Wrote 2 optimizer sbatch script(s)" in out
@@ -155,17 +155,17 @@ def test_fir_jobs_optimizer_one_script_per_visit_detector(tmp_path):
 
 
 def test_fir_jobs_overrides_and_bad_job(tmp_path):
-    m = _manifest(tmp_path)
-    out = _construct(survey.GenerateFirJobs, manifest_path=str(m), output_root="/s",
+    m = _target_summary(tmp_path)
+    out = _construct(survey.GenerateFirJobs, summary_path=str(m), output_root="/s",
                      time="36:00:00", cpus="4", mem="",
                      base_directory=str(tmp_path))._run()
     assert "36:00:00, 4 CPUs, 40G" in out
     with pytest.raises(ValueError, match="job must be"):
-        _construct(survey.GenerateFirJobs, job="reduce", manifest_path=str(m),
+        _construct(survey.GenerateFirJobs, job="reduce", summary_path=str(m),
                    output_root="/s", base_directory=str(tmp_path))._run()
 
 
-# ---------------- Reduce preflight / Verify ----------------
+# ---------------- Reduce environment check / Verify ----------------
 
 from aster_toolkit.data_reduction import exotedrf  # noqa: E402
 
@@ -323,8 +323,8 @@ EXPECTED_REQUIRED = {
     "CombineNirspecG395hVisits": ["output_dir", "spectra_by_detector"],
     "DetectLightCurveAnomalies": ["output_dir", "white_fit_dirs"],
     "ModelStellarContamination": ["output_dir", "spectrum_csv"],
-    "RunPatchworkTarget": ["manifest_path", "output_root"],
-    "GenerateFirJobs": ["manifest_path", "output_root"],
+    "RunPatchworkTarget": ["output_root", "summary_path"],
+    "GenerateFirJobs": ["output_root", "summary_path"],
     "OptimizeNirspecG395hReduction": ["detector", "input_dir", "name_tag", "output_dir"],
     "SummarizeG395hOptimization": ["cost_table"],
 }
@@ -377,7 +377,7 @@ def test_blank_string_falls_back_to_a_non_none_default(tmp_path):
     m = tmp_path / "m.json"
     m.write_text('{"planet_name": "T b", "visits": {"o001": "/r"}}')
     out = survey.GenerateFirJobs(base_directory=str(tmp_path)).execute(
-        manifest_path=str(m), output_root="/s", job="  ", account="")
+        summary_path=str(m), output_root="/s", job="  ", account="")
     assert "job=patchwork" in out                       # job "" -> "patchwork"
     assert "--account=def-ncowan" in next(tmp_path.glob("*.sbatch")).read_text()
 

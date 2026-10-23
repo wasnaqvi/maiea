@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Write a measured/updated ephemeris into a target manifest.
+"""Write a measured/updated ephemeris into a target summary.
 
 The NASA Exoplanet Archive is CURRENT, not correct. Its ephemeris for a
 planet discovered years ago carries a period good to a few seconds, and
@@ -21,13 +21,13 @@ accumulated drift. With the updated values both land inside the window
 
     # published update
     python scripts/patchwork/set_ephemeris_override.py \\
-        ~/patchwork/manifests/TOI_125_b.json \\
+        ~/patchwork/targets/TOI_125_b.json \\
         --t0 2458978.6849 --period 4.651717 \\
         --source "ExoClock Project IV, arXiv:2511.14407"
 
     # or measure it from the visit itself, when no update exists
     python scripts/patchwork/set_ephemeris_override.py \\
-        ~/patchwork/manifests/TOI_270_b.json --measure \\
+        ~/patchwork/targets/TOI_270_b.json --measure \\
         ~/scratch/patchwork/TOI_270_b/reductions/o017
 
 Every override is recorded in the fit summary as
@@ -86,25 +86,25 @@ def measure(reduction_dir: str) -> dict[str, float]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("manifest")
+    ap.add_argument("summary", help="Target summary JSON to edit.")
     ap.add_argument("--t0", type=float, help="Mid-transit epoch, BJD_TDB.")
     ap.add_argument("--period", type=float, help="Orbital period, days.")
     ap.add_argument("--duration-hr", type=float)
     ap.add_argument("--measure", metavar="REDUCTION_DIR",
                     help="Measure t0 from this visit's Stage 3 products.")
     ap.add_argument("--source", default="",
-                    help="Where the values came from — recorded in the manifest.")
+                    help="Where the values came from — recorded in the target summary.")
     ap.add_argument("--clear", action="store_true", help="Remove the override.")
     args = ap.parse_args()
 
-    path = os.path.expanduser(args.manifest)
-    manifest = json.load(open(path))
+    path = os.path.expanduser(args.summary)
+    target = json.load(open(path))
 
     if args.clear:
-        manifest.pop("priors_override", None)
-        manifest.pop("priors_override_source", None)
+        target.pop("priors_override", None)
+        target.pop("priors_override_source", None)
     else:
-        override = dict(manifest.get("priors_override") or {})
+        override = dict(target.get("priors_override") or {})
         if args.measure:
             override.update(measure(os.path.expanduser(args.measure)))
         for key, value in (("t0", args.t0), ("period", args.period),
@@ -113,16 +113,16 @@ def main() -> int:
                 override[key] = value
         if not override:
             ap.error("Nothing to write: give --t0/--period/--duration-hr or --measure.")
-        manifest["priors_override"] = override
+        target["priors_override"] = override
         if args.source:
-            manifest["priors_override_source"] = args.source
+            target["priors_override_source"] = args.source
 
     with open(path, "w") as fh:
-        json.dump(manifest, fh, indent=2)
+        json.dump(target, fh, indent=2)
     print(f"\n{os.path.basename(path)}: "
-          f"priors_override = {manifest.get('priors_override')}")
-    if manifest.get("priors_override_source"):
-        print(f"  source: {manifest['priors_override_source']}")
+          f"priors_override = {target.get('priors_override')}")
+    if target.get("priors_override_source"):
+        print(f"  source: {target['priors_override_source']}")
     print("Refit with FORCE_REFIT=1; the summary will record "
           "priors_source='archive+override(...)'.")
     return 0

@@ -16,7 +16,7 @@ This change set preserves preexisting identity guards and summary-merge work.
   half-widths; depths remain ppm in CSV and fractions in DAT.
 - Rebin centers and half-widths describe the actual contributing support,
   not an error-weighted center paired with a displaced nominal interval.
-- Survey beta gates preserve the worst visit; mixed grazing fit versions and
+- Survey beta checks preserve the worst visit; mixed grazing fit versions and
   missing diagnostics cannot be hidden by an aggregate. These flags are
   diagnostics, not calibrated acceptance rules.
 - Review-page step markers map original integration indices through masks.
@@ -39,7 +39,8 @@ v1.5 changed one numerical thing relative to v1.4: per-channel limb
 darkening is fixed to ExoTiC-LD above white-fit b = 0.80. Every other v1.5 change
 is metadata or the DAT full-width column. So the 13 v1.4 targets with
 every white fit at b <= 0.80 were restamped, not refit, by
-`scripts/patchwork/restamp_fit_version.py`. A refit would differ only by
+`scripts/patchwork/restamp_fit_version.py` (removed after v1.6; in git
+history). A refit would differ only by
 sampler noise. GJ 9827 d (b 0.85-0.89), LTT 3780 c (0.82-0.83) and
 L 98-59 d (0.94) are refit at v1.5. The script refuses any v1.4 target
 with a fit above 0.80, records a `fit_restamps` entry (rule, max b, files)

@@ -16,7 +16,7 @@
 # submitted from a clean environment either way: SLURM exports the
 # submitting environment and `module purge` cannot undo an activation.
 #
-# "Available planets" means planets with a manifest in --manifest-dir
+# "Available planets" means planets with a target summary in --summary-dir
 # (written by DiscoverPatchworkVisits). Raw-tree directory names are
 # untrustworthy -- obsid-only folders, concatenated multi-target names,
 # _nonsurvey / _index / _review / wave2_* staging dirs -- so this script
@@ -27,7 +27,7 @@
 #   cd ~/aster/maiea
 #   python -m aster_toolkit.data_reduction.discover \
 #       --raw-root /home/wasi/aster/maiea/workspace/mast/jwst_raw \
-#       --manifest-dir ~/patchwork/manifests
+#       --summary-dir ~/patchwork/targets
 #
 # MODES
 #   reduce (default)  STEPS=inspect,reduce   2 CPUs, per-target reduce sizing.
@@ -58,7 +58,7 @@
 #   --only SLUG,SLUG         only these targets, e.g. TOI_270_c
 #   --skip SLUG,SLUG         skip these targets
 #   --mail-user ADDR         SLURM BEGIN,END,FAIL mail
-#   --manifest-dir DIR       [~/patchwork/manifests]
+#   --summary-dir DIR       [~/patchwork/targets]
 #   --output-root DIR        [~/scratch/patchwork]
 #   --job-dir DIR            [~/patchwork/jobs]
 #   --aster-repo DIR         [~/aster/maiea]
@@ -67,7 +67,7 @@
 
 set -uo pipefail
 
-MANIFEST_DIR="$HOME/patchwork/manifests"
+SUMMARY_DIR="$HOME/patchwork/targets"
 OUTPUT_ROOT="$HOME/scratch/patchwork"
 JOB_DIR="$HOME/patchwork/jobs"
 ASTER_REPO="$HOME/aster/maiea"
@@ -88,7 +88,7 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --manifest-dir) MANIFEST_DIR="$2"; shift 2 ;;
+        --summary-dir) SUMMARY_DIR="$2"; shift 2 ;;
         --output-root)  OUTPUT_ROOT="$2";  shift 2 ;;
         --job-dir)      JOB_DIR="$2";      shift 2 ;;
         --aster-repo)   ASTER_REPO="$2";   shift 2 ;;
@@ -134,7 +134,7 @@ trap 'rm -f "$PLAN"' EXIT
         exit 1
     }
     cd "$ASTER_REPO" || exit 1
-    MANIFEST_DIR="$MANIFEST_DIR" OUTPUT_ROOT="$OUTPUT_ROOT" JOB_DIR="$JOB_DIR" \
+    SUMMARY_DIR="$SUMMARY_DIR" OUTPUT_ROOT="$OUTPUT_ROOT" JOB_DIR="$JOB_DIR" \
     python - <<'PY'
 import glob
 import json
@@ -147,29 +147,29 @@ sys.path.insert(0, "scripts/patchwork")
 from generate_survey_jobs import EXCLUDED, EXPECTED_DEPTH_PPM, SIZING
 from aster_toolkit.data_reduction.survey import _slug, write_fir_slurm_script
 
-manifest_dir = os.path.expanduser(os.environ["MANIFEST_DIR"])
+summary_dir = os.path.expanduser(os.environ["SUMMARY_DIR"])
 output_root = os.path.expanduser(os.environ["OUTPUT_ROOT"])
 job_dir = Path(os.path.expanduser(os.environ["JOB_DIR"]))
 
 DEFAULT = ("6:00:00", "30:00:00", "48G", "24G", 4,
            "UNKNOWN TARGET - not in the sizing table, defaults used")
 
-manifests = [m for m in sorted(glob.glob(os.path.join(manifest_dir, "*.json")))
+targets = [m for m in sorted(glob.glob(os.path.join(summary_dir, "*.json")))
              if "_unresolved" not in m]
-if not manifests:
-    print(f"NO_MANIFESTS\t{manifest_dir}")
+if not targets:
+    print(f"NO_TARGETS\t{summary_dir}")
     raise SystemExit(0)
 
-for mpath in manifests:
-    with open(mpath) as fh:
-        manifest = json.load(fh)
-    slug = _slug(manifest["planet_name"])
+for path in targets:
+    with open(path) as fh:
+        target = json.load(fh)
+    slug = _slug(target["planet_name"])
     if slug in EXCLUDED:
         print(f"# EXCLUDED {slug}: {EXCLUDED[slug]}", file=sys.stderr)
         continue
     red_t, fit_t, red_m, fit_m, wave, note = SIZING.get(slug, DEFAULT)
     script = write_fir_slurm_script(
-        mpath, output_root, script_path=job_dir / f"run_{slug}.sbatch")
+        path, output_root, script_path=job_dir / f"run_{slug}.sbatch")
     depth = EXPECTED_DEPTH_PPM.get(slug)
     info = f"expect ~{depth} ppm" if depth else ""
     if note:
@@ -185,8 +185,8 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 
-if grep -q '^NO_MANIFESTS' "$PLAN"; then
-    echo "No manifests in $(cut -f2 < "$PLAN"). Run discover first (login"
+if grep -q '^NO_TARGETS' "$PLAN"; then
+    echo "No target summaries in $(cut -f2 < "$PLAN"). Run discover first (login"
     echo "node -- it needs the archive); see the header of this script."
     exit 1
 fi

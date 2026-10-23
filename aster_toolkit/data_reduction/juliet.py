@@ -12,8 +12,8 @@ and per detector: an inverse-variance combination of all visits, plus the
 survey health metrics (NRS1-NRS2 offset near the detector gap, white and
 spectroscopic residual rms).
 
-Uniformity contract (PATCHWORK_FIT_VERSION)
--------------------------------------------
+Frozen settings (PATCHWORK_FIT_VERSION)
+---------------------------------------
 Fitting choices are frozen module-wide. v1.2 = v1.1 plus the
 COMPASS-style relative-pixel-flux PCA regressors (6 components, Ahrer
 et al. 2025, arXiv:2511.18196) as part of the frozen definition; fits
@@ -761,7 +761,7 @@ def fit_white_lightcurve(
     """Fit the white-light transit of ONE detector with juliet.
 
     The single-detector form of ``fit_white_lightcurve_joint``, kept for
-    the per-detector tools and smoke tests. The survey fits both
+    the per-detector tools and quick tests. The survey fits both
     detectors jointly; a fit made here is stamped ``-1det`` because
     nothing outside this one detector constrains its geometry.
     """
@@ -951,7 +951,7 @@ def _summarize_white_detector(
     n_masked = int((~keep).sum())
 
     # PCA detrending is part of frozen v1.2. A fit without the PCA
-    # columns (calints unavailable, or the as-is escape hatch) is
+    # columns (calints unavailable, or the as-is per-target option) is
     # stamped so it can never be silently mixed with the survey fits.
     fit_version = PATCHWORK_FIT_VERSION
     if not any(str(n).startswith("pca_") for n in regressor_names):
@@ -1889,7 +1889,7 @@ def prepare_visit_fit_inputs(
     trace diagnostics, tilt events, regressor matrix, white-band LD.
 
     Priors come from the NASA Exoplanet Archive at fit time; when the
-    query fails (offline compute node) the manifest-cached
+    query fails (offline compute node) the cached
     ``fallback_priors`` written by discover.py are used instead, and
     ``priors_source`` records which one actually ran.
 
@@ -1913,7 +1913,7 @@ def prepare_visit_fit_inputs(
     The COMPASS-style relative-pixel-flux PCA regressors (Ahrer et al.
     2025) are part of the frozen v1.2 fit and on by default; a fit
     without them is version-stamped "-nopca" downstream. Disabling
-    (``pca_detrending=False``) is the escape hatch for comparison fits.
+    (``pca_detrending=False``) is the option for comparison fits.
 
     ``anomaly_report`` is the ``anomaly_report.json`` from a Stage 5.5
     scan (``contamination.DetectLightCurveAnomalies``). When given, the
@@ -1930,7 +1930,7 @@ def prepare_visit_fit_inputs(
             raise
         priors = dict(fallback_priors)
         priors.setdefault("planet_name", planet_name)
-        priors_source = "manifest-cache"
+        priors_source = "summary-cache"
 
     # Applied last, so it beats the archive as well as the cache.
     override_used = sorted(k for k, v in (priors_override or {}).items()

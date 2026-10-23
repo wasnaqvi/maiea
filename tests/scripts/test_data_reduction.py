@@ -68,7 +68,7 @@ from aster_toolkit.data_reduction.contamination import (  # noqa: E402
     running_mean,
 )
 from aster_toolkit.data_reduction.discover import (  # noqa: E402
-    build_manifests,
+    build_target_summaries,
     group_visits,
     parse_uncal_name,
     resolve_planet_from_rows,
@@ -81,7 +81,7 @@ from aster_toolkit.data_reduction.exotedrf import (  # noqa: E402
 from aster_toolkit.data_reduction.optimize import (  # noqa: E402
     G395H_SWEEP,
     best_params_to_overrides,
-    omega_hash,
+    config_hash,
     parse_cost_table,
     summarize_sweep,
     write_optimize_config,
@@ -90,7 +90,7 @@ from aster_toolkit.data_reduction.survey import (  # noqa: E402
     _expand_indexed_values,
     _known_overlapping_transits,
     existing_fit_products,
-    load_manifest,
+    load_target_summary,
     run_patchwork_target,
     stage_visit_uncals,
     write_fir_slurm_script,
@@ -596,8 +596,8 @@ class TestResolvePlanet:
         monkeypatch.setattr(D, "scan_raw_tree", lambda root: {"exposures": []})
         monkeypatch.setattr(D, "group_visits", lambda scan: [dict(visit)])
         monkeypatch.setattr(D, "_archive_planets_at", lambda *args: rows)
-        result = build_manifests(tmp_path)
-        assert result["manifests"] == {}
+        result = build_target_summaries(tmp_path)
+        assert result["targets"] == {}
         assert result["unresolved"][0]["planet_source"] == "ambiguous"
         assert {m["pl_name"] for m in result["unresolved"][0]["planet_matches"]} == {
             "TOI-270 b", "TOI-270 d"
@@ -797,22 +797,22 @@ class TestInspectUncal:
 
 
 class TestOptimizerRule:
-    def test_omega_hash_deterministic(self, tmp_path):
+    def test_config_hash_deterministic(self, tmp_path):
         kw = dict(input_dir="/data", detector="NRS1",
                   baseline_ints=[100, -100], name_tag="t",
                   crds_cache_path="/crds")
         p1 = write_optimize_config(tmp_path / "a.yaml", **kw)
         p2 = write_optimize_config(tmp_path / "b.yaml", **kw)
-        assert omega_hash(p1) == omega_hash(p2)
+        assert config_hash(p1) == config_hash(p2)
 
-    def test_omega_hash_changes_with_inputs(self, tmp_path):
+    def test_config_hash_changes_with_inputs(self, tmp_path):
         p1 = write_optimize_config(
             tmp_path / "a.yaml", input_dir="/data", detector="NRS1",
             baseline_ints=[100, -100], name_tag="t", crds_cache_path="/crds")
         p2 = write_optimize_config(
             tmp_path / "b.yaml", input_dir="/data", detector="NRS2",
             baseline_ints=[100, -100], name_tag="t", crds_cache_path="/crds")
-        assert omega_hash(p1) != omega_hash(p2)
+        assert config_hash(p1) != config_hash(p2)
 
     def test_sweep_grids_are_integers(self):
         for param, grid in G395H_SWEEP.items():
@@ -846,12 +846,12 @@ class TestOptimizerRule:
 # -------------------- survey --------------------
 
 
-class TestManifest:
+class TestTargetSummary:
     def test_load_requires_keys(self, tmp_path):
         p = tmp_path / "m.json"
         p.write_text(json.dumps({"planet_name": "X b"}))
         with pytest.raises(ValueError, match="visits"):
-            load_manifest(p)
+            load_target_summary(p)
 
 
 class TestStaging:
@@ -953,7 +953,7 @@ class TestIndexedSeriesExpansion:
 
 
 class TestForceRefitGuard:
-    def _manifest(self, tmp_path):
+    def _target_summary(self, tmp_path):
         raw = tmp_path / "raw"
         raw.mkdir(exist_ok=True)
         return {
@@ -969,33 +969,33 @@ class TestForceRefitGuard:
         fits_dir.mkdir(parents=True)
         (fits_dir / "_dynesty_NS_posteriors.pkl").write_bytes(b"stale")
         with pytest.raises(RuntimeError, match="force_refit"):
-            run_patchwork_target(self._manifest(tmp_path), out,
+            run_patchwork_target(self._target_summary(tmp_path), out,
                                  steps=("fit",), log=lambda *_: None)
 
     def test_known_simultaneous_transits_refused(self, tmp_path):
-        manifest = self._manifest(tmp_path)
-        manifest.update({"planet_name": "TOI-270 b", "program": "GO 4098"})
-        manifest["visits"] = {"o017": manifest["visits"]["o001"]}
+        target = self._target_summary(tmp_path)
+        target.update({"planet_name": "TOI-270 b", "program": "GO 4098"})
+        target["visits"] = {"o017": target["visits"]["o001"]}
         with pytest.raises(RuntimeError, match="overlapping transits"):
-            run_patchwork_target(manifest, tmp_path / "results",
+            run_patchwork_target(target, tmp_path / "results",
                                  steps=("fit",), log=lambda *_: None)
 
     def test_distinct_single_candidate_visits_are_not_overlaps(self):
-        manifest = {
+        target = {
             "planet_name": "Test b",
             "visits": {
                 "o001": {"transit_candidates": ["Test b"]},
                 "o002": {"transit_candidates": ["Test c"]},
             },
         }
-        assert _known_overlapping_transits(manifest) == []
+        assert _known_overlapping_transits(target) == []
 
     def test_force_refit_clears(self, tmp_path):
         out = tmp_path / "results"
         fits_dir = out / "Test_b" / "fits" / "o001" / "nrs1"
         fits_dir.mkdir(parents=True)
         (fits_dir / "_dynesty_NS_posteriors.pkl").write_bytes(b"stale")
-        run_patchwork_target(self._manifest(tmp_path), out,
+        run_patchwork_target(self._target_summary(tmp_path), out,
                              steps=("fit",), force_refit=True,
                              log=lambda *_: None)
         assert existing_fit_products(out / "Test_b" / "fits") == []
@@ -1046,7 +1046,7 @@ class TestReduceFailurePropagates:
     reported COMPLETED and nothing downstream noticed.
     """
 
-    def _manifest(self, tmp_path):
+    def _target_summary(self, tmp_path):
         raw = tmp_path / "raw"
         raw.mkdir(exist_ok=True)
         return {"planet_name": "Test b", "planet_letter": "b",
@@ -1069,19 +1069,19 @@ class TestReduceFailurePropagates:
         # the real failure: run_DMS.py died after Stage 2, exit code lost
         self._patch_run_reduction(monkeypatch, 0, [])
         with pytest.raises(RuntimeError, match="reduction failed"):
-            run_patchwork_target(self._manifest(tmp_path), tmp_path / "out",
+            run_patchwork_target(self._target_summary(tmp_path), tmp_path / "out",
                                  steps=("reduce",), log=lambda *_: None)
 
     def test_nonzero_exit_raises(self, tmp_path, monkeypatch):
         self._patch_run_reduction(monkeypatch, 1, [])
         with pytest.raises(RuntimeError, match="reduction failed"):
-            run_patchwork_target(self._manifest(tmp_path), tmp_path / "out",
+            run_patchwork_target(self._target_summary(tmp_path), tmp_path / "out",
                                  steps=("reduce",), log=lambda *_: None)
 
     def test_success_with_products_does_not_raise(self, tmp_path, monkeypatch):
         self._patch_run_reduction(monkeypatch, 0, ["/x/a_box_spectra_fullres.fits"])
         summary = run_patchwork_target(
-            self._manifest(tmp_path), tmp_path / "out",
+            self._target_summary(tmp_path), tmp_path / "out",
             steps=("reduce",), log=lambda *_: None)
         assert summary["visits"]["o001"]["reduction"]["NRS1"] is True
 
@@ -1089,7 +1089,7 @@ class TestReduceFailurePropagates:
         self._patch_run_reduction(monkeypatch, 0, [])
         out = tmp_path / "out"
         with pytest.raises(RuntimeError):
-            run_patchwork_target(self._manifest(tmp_path), out,
+            run_patchwork_target(self._target_summary(tmp_path), out,
                                  steps=("reduce",), log=lambda *_: None)
         # summary is written before raising, so the failure is diagnosable
         with (out / "Test_b" / "patchwork_summary.json").open() as fh:
@@ -1109,7 +1109,7 @@ class TestFirScript:
         assert "ASTER_EXOTEDRF_REPO" in text
         assert "CRDS_CONTEXT" in text
         assert "verify_exotedrf_environment" in text
-        assert "--manifest" in text
+        assert "--summary" in text
         assert "FORCE_REFIT" in text
 
 

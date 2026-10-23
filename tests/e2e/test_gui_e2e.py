@@ -132,8 +132,8 @@ def test_nl_session_search_then_download_then_list(stack):
         hdr = fits.getheader(path)                    # real, readable FITS
         assert hdr["DETECTOR"] in ("NRS1", "NRS2") and hdr["EXSEGTOT"] == 2
     assert not any("_02101_" in p.name for p in gui.files())   # no target acquisition
-    manifest = gui.workspace / "mast" / "WASP-39_b" / "manifest.json"
-    assert manifest.is_file()
+    summary = gui.workspace / "mast" / "WASP-39_b" / "download_summary.json"
+    assert summary.is_file()
 
     # --- 3. "list visit 2, don't download" -----------------------------------
     d2, m2 = len(model.decisions), len(mast.log)

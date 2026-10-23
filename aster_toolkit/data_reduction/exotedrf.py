@@ -6,8 +6,8 @@ exoTEDRF pipeline (Radica 2024), which wraps the official STScI ``jwst``
 DMS with TSO-specific custom steps (group-level 1/f destriping, custom
 superbias handling, bad-pixel interpolation, box extraction).
 
-Uniformity contract
--------------------
+Frozen configuration
+--------------------
 Every Patchwork target is reduced with the *same* frozen configuration
 (``PATCHWORK_G395H_CONFIG``). Per-target inputs are limited to file paths
 and stellar parameters (Teff/logg/[Fe/H], used only for wavelength
@@ -183,7 +183,7 @@ DEFAULT_EXOTEDRF_REPO = "/Users/wasi/Desktop/exoTEDRF"
 
 
 def exotedrf_repo() -> str | None:
-    """Path to an exoTEDRF source checkout that should SHADOW the installed
+    """Path to an exoTEDRF source checkout that should OVERRIDE the installed
     package, or None to use whatever is installed in the environment.
 
     Set ``ASTER_EXOTEDRF_REPO`` to run the survey from a source checkout
@@ -209,7 +209,7 @@ def exotedrf_repo() -> str | None:
 
 def _subprocess_env(crds: str, crds_context: str | None = None) -> dict[str, str]:
     """Environment for an exoTEDRF subprocess: CRDS settings plus the
-    source-checkout shadow, if one is configured."""
+    source-checkout override, if one is configured."""
     env = dict(os.environ)
     env["CRDS_PATH"] = crds
     env["CRDS_SERVER_URL"] = "https://jwst-crds.stsci.edu"
@@ -320,7 +320,7 @@ print("PATCHWORK_ENV_JSON " + json.dumps(report))
 
 def verify_exotedrf_environment(python: str | None = None,
                                 timeout: float = 300.0) -> dict[str, Any]:
-    """Preflight the exoTEDRF environment before committing hours of compute.
+    """Check the exoTEDRF environment before committing hours of compute.
 
     Runs every check inside the target interpreter in ONE subprocess and
     returns a structured report. Each check corresponds to a failure mode
@@ -588,7 +588,7 @@ def make_uncal_subset(
 ) -> Path:
     """Write a copy of an uncal file trimmed to its first ``n_integrations``.
 
-    For smoke-testing the pipeline in minutes instead of hours. Never use
+    For quick-testing the pipeline in minutes instead of hours. Never use
     subset outputs for science.
     """
     from astropy.io import fits
@@ -647,7 +647,7 @@ def exotedrf_script_path(python: str, script: str = "run_DMS.py",
     Asks the interpreter where ``exotedrf`` actually lives rather than
     reconstructing a site-packages path — venv, conda, ``pip --user`` and
     editable installs all lay that out differently, and a PYTHONPATH
-    shadow (the optimizer checkout) moves it again. ``run_DMS.py`` reads
+    override (the optimizer checkout) moves it again. ``run_DMS.py`` reads
     ``sys.argv`` at import time, so it is located by path and never
     imported here.
     """
@@ -713,7 +713,7 @@ def run_reduction(
     crds_context: str = CRDS_CONTEXT,
     baseline_ints: list[int] | None = None,
     overrides: dict[str, Any] | None = None,
-    preflight: bool = True,
+    check_environment: bool = True,
     log_callback=None,
 ) -> dict[str, Any]:
     """Run the uniform exoTEDRF Stage 1-3 reduction for one observation.
@@ -722,7 +722,7 @@ def run_reduction(
     every G395H analysis). Blocks until finished — Stage 1 on a full TSO is
     hours of compute; drive long runs in a background shell.
 
-    Returns a manifest with per-detector status, log paths, and the
+    Returns a summary with per-detector status, log paths, and the
     ``*_spectra_fullres.fits`` products for lightcurve fitting.
     """
     if isinstance(detectors, str):
@@ -737,10 +737,10 @@ def run_reduction(
     python = _exotedrf_python()
     repo = exotedrf_repo()
 
-    # Preflight before committing hours of compute. Every check here maps to
+    # Check the environment before committing hours of compute. Every check here maps to
     # a failure that has already killed a job mid-reduction; finding them in
     # seconds beats finding them after Stage 1.
-    if preflight:
+    if check_environment:
         env_report = verify_exotedrf_environment(python)
         if not env_report["ok"]:
             raise RuntimeError(
@@ -755,7 +755,7 @@ def run_reduction(
     script_path = exotedrf_script_path(python, "run_DMS.py",
                                        extra_pythonpath=repo)
 
-    manifest: dict[str, Any] = {
+    summary: dict[str, Any] = {
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "config_version": PATCHWORK_CONFIG_VERSION,
@@ -809,7 +809,7 @@ def run_reduction(
             returncode = process.wait()
 
         products = find_stage3_products(det_dir)
-        manifest["detectors"][detector.upper()] = {
+        summary["detectors"][detector.upper()] = {
             "returncode": returncode,
             "success": returncode == 0,
             "config": str(config_path),
@@ -817,12 +817,12 @@ def run_reduction(
             "spectra_fullres": products,
         }
 
-    manifest_path = Path(output_dir) / "reduction_manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("w") as handle:
-        json.dump(manifest, handle, indent=2)
-    manifest["manifest_path"] = str(manifest_path)
-    return manifest
+    summary_path = Path(output_dir) / "reduction_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w") as handle:
+        json.dump(summary, handle, indent=2)
+    summary["summary_path"] = str(summary_path)
+    return summary
 
 
 def _format_inspection(report: dict[str, Any]) -> str:
@@ -848,13 +848,13 @@ def _format_inspection(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_reduction_manifest(manifest: dict[str, Any]) -> str:
+def _format_reduction_summary(summary: dict[str, Any]) -> str:
     lines = [
-        f"exoTEDRF reduction finished (Patchwork config v{manifest['config_version']}).",
-        f"Input:  {manifest['input_dir']}",
-        f"Output: {manifest['output_dir']}",
+        f"exoTEDRF reduction finished (Patchwork config v{summary['config_version']}).",
+        f"Input:  {summary['input_dir']}",
+        f"Output: {summary['output_dir']}",
     ]
-    for det, entry in manifest["detectors"].items():
+    for det, entry in summary["detectors"].items():
         state = "OK" if entry["success"] else f"FAILED (exit {entry['returncode']})"
         lines.append(f"  {det}: {state}")
         lines.append(f"    log: {entry['log']}")
@@ -896,7 +896,7 @@ class ReduceNirspecG395hTso(BaseTool):
     assumes the SUB2048 subarray, NRSRAPID readout, and NRS1/NRS2
     detectors. Do not point it at SOSS/MIRI/NIRCam data.
 
-    Segment preflight (built in — there is no separate inspection tool):
+    Segment check (built in — there is no separate inspection tool):
     every call first inventories the uncal headers in ``input_dir`` per
     detector (EXSEGNUM/EXSEGTOT segments present vs expected, NINTS,
     NGROUPS, subarray, readout, truncated files) and prints it at the top
@@ -1008,7 +1008,7 @@ class ReduceNirspecG395hTso(BaseTool):
             except (SyntaxError, ValueError):
                 detectors = [detectors]
 
-        manifest = run_reduction(
+        summary = run_reduction(
             input_dir,
             output_dir,
             detectors=list(detectors),
@@ -1018,12 +1018,12 @@ class ReduceNirspecG395hTso(BaseTool):
             st_met=_float_or_none(self.st_met),
             planet_letter=self.planet_letter,
         )
-        return inventory_text + "\n\n" + _format_reduction_manifest(manifest)
+        return inventory_text + "\n\n" + _format_reduction_summary(summary)
 
 
 class VerifyPatchworkEnvironment(BaseTool):
     """
-    Preflight the pinned exoTEDRF environment before committing hours of
+    Check the pinned exoTEDRF environment before committing hours of
     compute to a reduction. Runs in seconds.
 
     Checks, inside the exoTEDRF interpreter itself: numpy is <2 (jwst
@@ -1064,7 +1064,7 @@ class VerifyPatchworkEnvironment(BaseTool):
         try:
             from .contamination import format_contamination_backends
             text += "\n\n" + format_contamination_backends()
-        except Exception as exc:  # never let the optional probe mask the gate
+        except Exception as exc:  # never let the optional probe hide the required checks
             text += f"\n\n(Contamination-backend probe failed: {exc})"
         return text
 
@@ -1072,7 +1072,7 @@ class VerifyPatchworkEnvironment(BaseTool):
 class MakeUncalTestSubset(BaseTool):
     """
     Create a small test copy of an uncal file containing only the first N
-    integrations. Reduces pipeline smoke-test time from hours to minutes.
+    integrations. Reduces pipeline test time from hours to minutes.
 
     NEVER use subset reductions for science — the trimmed lightcurve does
     not cover the transit.

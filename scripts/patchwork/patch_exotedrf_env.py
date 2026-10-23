@@ -41,7 +41,7 @@ import sys
 from pathlib import Path
 
 # Patch the tree that will actually RUN. When ASTER_EXOTEDRF_REPO is set the
-# toolkit shadows the installed release with that checkout, so the checkout
+# toolkit puts that checkout ahead of the installed release with that checkout, so the checkout
 # is what needs patching -- the exoTEDRF optimizer branch carries the same
 # BadPixStep resume bug as the PyPI build.
 _REPO = os.environ.get("ASTER_EXOTEDRF_REPO")

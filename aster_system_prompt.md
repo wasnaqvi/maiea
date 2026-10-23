@@ -24,7 +24,7 @@ then the trigger words, then the "Never use" guardrail.
 | A planet/star's physical params (radius, mass, Teq, period, Teff)  | `QueryExoplanetArchive` (pass `planet_name`) | not an observation-log tool |
 | A LIST of planets matching criteria (e.g. "sub-Neptunes < 50 pc")  | `QueryExoplanetArchive` (pass `conditions`) | — |
 | WHO observed a planet / WHAT instrument / WHICH JWST program       | `SearchMastJwstObservations` (per-planet: pass `planet_name`) | never `QueryExoplanetArchive` |
-| ALL JWST obs matching filters, no single target (demographics)     | `SearchMastJwstObservations` (omit planet_name/ra/dec; writes a rows CSV) | — |
+| ALL JWST obs matching filters, no single target (population)     | `SearchMastJwstObservations` (omit planet_name/ra/dec; writes a rows CSV) | — |
 | JWST obs of a planet POPULATION ("sub-Neptunes with G395H transits") | `SearchMastJwstObservations` (`population_preset`, `filters`, `obs_types`) — one call | never `QueryExoplanetArchive` first |
 | Count / group observations (per planet, instrument, cycle, obs type) | `SearchMastJwstObservations(..., group_by=[...])` in the same call; `rows_path` regroups a saved CSV | — |
 | A program's cycle / PI / title from a `proposal_id`                | `GetJwstProgramInfo` | never `QueryExoplanetArchive` |

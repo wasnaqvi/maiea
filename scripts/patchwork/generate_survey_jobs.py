@@ -7,7 +7,7 @@ Run ON FIR (login node), after `git pull`:
     source ~/aster/aster-env/bin/activate
     cd ~/aster/maiea
     python scripts/patchwork/generate_survey_jobs.py \
-        --manifest-dir ~/patchwork/manifests \
+        --summary-dir ~/patchwork/targets \
         --output-root ~/scratch/patchwork \
         --job-dir ~/patchwork/jobs \
         --mail-user you@example.com
@@ -111,7 +111,7 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
                    "21228 integrations in one visit; reduce TIMED OUT at 12 h "
                    "and the fit OOM'd at 32G — both raised"),
     # GO 4126 observed TOI-125 b AND c, one transit each (proposal
-    # abstract, ADS 2023jwst.prop.4126F). Manifest overrides:
+    # abstract, ADS 2023jwst.prop.4126F). Target summary overrides:
     #   --override jw04126101001="TOI-125 b" --override jw04126201001="TOI-125 c"
     # If the b/c <-> obs 101/201 assignment is swapped, the fit-time
     # transit-in-window guard refuses loudly — then swap the overrides.
@@ -137,8 +137,8 @@ SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
 }
 
 # Targets dropped from the survey. Every submitter and job generator skips
-# them, whatever manifest directory they are pointed at, so a stale
-# manifest can never quietly put one back. Record why.
+# them, whatever summary directory they are pointed at, so a stale
+# target summary can never quietly put one back. Record why.
 EXCLUDED: dict[str, str] = {
     "TOI_561_b": "ultra-short-period lava world, not a sub-Neptune "
                  "(dropped from Patchwork, Wasi 2026-10-20)",
@@ -157,21 +157,21 @@ EXPECTED_DEPTH_PPM = {
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest-dir", default="~/patchwork/manifests")
+    ap.add_argument("--summary-dir", default="~/patchwork/targets")
     ap.add_argument("--output-root", default="~/scratch/patchwork")
     ap.add_argument("--job-dir", default="~/patchwork/jobs")
     ap.add_argument("--mail-user", default="")
     args = ap.parse_args()
 
-    manifest_dir = Path(os.path.expanduser(args.manifest_dir))
+    summary_dir = Path(os.path.expanduser(args.summary_dir))
     job_dir = Path(os.path.expanduser(args.job_dir))
     output_root = os.path.expanduser(args.output_root)
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    manifests = sorted(glob.glob(str(manifest_dir / "*.json")))
-    manifests = [m for m in manifests if "_unresolved" not in m]
-    if not manifests:
-        print(f"No manifests in {manifest_dir}. Run discover.py first "
+    targets = sorted(glob.glob(str(summary_dir / "*.json")))
+    targets = [m for m in targets if "_unresolved" not in m]
+    if not targets:
+        print(f"No target summaries in {summary_dir}. Run discover.py first "
               "(login node — it needs the archive).")
         return 1
 
@@ -180,14 +180,14 @@ def main() -> int:
 
     by_wave: dict[int, list[str]] = {1: [], 2: [], 3: [], 4: []}
     missing_priors = []
-    for mpath in manifests:
-        with open(mpath) as fh:
-            manifest = json.load(fh)
-        slug = _slug(manifest["planet_name"])
+    for path in targets:
+        with open(path) as fh:
+            target = json.load(fh)
+        slug = _slug(target["planet_name"])
         if slug in EXCLUDED:
             print(f"# EXCLUDED {slug}: {EXCLUDED[slug]}")
             continue
-        if not manifest.get("priors"):
+        if not target.get("priors"):
             missing_priors.append(slug)
         sizing = SIZING.get(slug)
         if sizing is None:
@@ -196,11 +196,11 @@ def main() -> int:
         red_t, fit_t, red_m, fit_m, wave, note = sizing
 
         script = write_fir_slurm_script(
-            mpath, output_root,
+            path, output_root,
             script_path=job_dir / f"run_{slug}.sbatch",
         )
         depth = EXPECTED_DEPTH_PPM.get(slug)
-        block = [f"# --- {manifest['planet_name']}"
+        block = [f"# --- {target['planet_name']}"
                  + (f"  (expect ~{depth} ppm)" if depth else "")]
         if note:
             block.append(f"#     {note}")
@@ -231,13 +231,13 @@ def main() -> int:
           "sbatch from.")
     print("# Submit from a shell with NO venv active; use absolute paths.")
     if missing_priors:
-        print(f"#\n# NOTE: {len(missing_priors)} manifest(s) have no cached "
+        print(f"#\n# NOTE: {len(missing_priors)} target summaries have no cached "
               f"'priors' block ({', '.join(missing_priors)}).")
-        print("#   Regenerate manifests on a login node so compute nodes can "
+        print("#   Regenerate target summaries on a login node so compute nodes can "
               "fall back offline:")
         print("#   python -m aster_toolkit.data_reduction.discover "
               "--raw-root /project/def-ncowan/wasi/jwst_raw "
-              "--manifest-dir ~/patchwork/manifests")
+              "--summary-dir ~/patchwork/targets")
     titles = {1: "WAVE 1 — cheap single-visit validation (run these first)",
               2: "WAVE 2 — remaining single-visit targets",
               3: "WAVE 3 — multi-visit targets",
