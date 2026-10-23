@@ -322,7 +322,7 @@ and never mix old and new products in one analysis.
 |---|---|---|
 | `PATCHWORK_CONFIG_VERSION` | 1.1 | `exotedrf.py` |
 | `PATCHWORK_STAGE4_VERSION` | 1.3 | `lightcurves.py` |
-| `PATCHWORK_FIT_VERSION` | 1.6 | `juliet.py` |
+| `PATCHWORK_FIT_VERSION` | 1.7 | `juliet.py` |
 | `PATCHWORK_CONTAM_VERSION` | 1.1 | `contamination.py` |
 | `PATCHWORK_OPTIMIZER_VERSION` | 1.0 | `optimize.py` |
 | `DEFAULT_RESOLUTION` | 100 | `lightcurves.py` |
@@ -383,6 +383,38 @@ Two changes:
 
 New stamps: `-1det` (only one detector had Stage 3 products) and `-nogp`.
 Neither is a survey fit.
+
+Fit **v1.7** (2026-10-23) changes the model again, so **every target is
+refit**. In five v1.6 fits the free GP took the transit:
+K2-18 b, all four visits, 1009-2653 ppm against a published 2915-2983
+(Schmidt+2025, arXiv:2507.12622) with t0 34-68 min off; TOI-836 b o010
+339 vs 614 ppm; HD 15337 c o018 438 vs 815 ppm; TOI-125 b; TOI-270 c. A GP
+with a 30-100 min timescale can draw a box, so "shifted transit + GP" fit
+the data as well as the right answer. The GP-free pass 1 matched every
+published value (depth ~1-6%, t0 < 0.2 min), and the GP mean equalled the
+depth the transit model gave up. Changes:
+- **GP hyperparameters trained out of transit, then FIXED**
+  (`train_gp_out_of_transit`: Matern-3/2 + jitter, baseline by GLS under
+  the same covariance). Out of transit = beyond T14/2 + 10 min of the
+  **pass-1 fitted** transit, not the ephemeris. Channels keep the white
+  rho and train their own amplitude the same way. Recorded as
+  `noise_model.gp_frozen` / `gp_training`. Fewer than 200 out-of-transit
+  integrations → no GP, stamped `-nogp`.
+- **Pass 2's t0 prior is centred on pass 1** (σ 5 min) instead of the
+  ephemeris (σ 14 min), so corrections cannot slide the transit.
+- **The Stage 5.5 scan uses the pass-1 fitted transit** for in/out of
+  transit (HD 15337 c o019: a ~60 min stale ephemeris put four "steps" on
+  the real contacts, and the contact-straddle guard never saw them).
+- **A scan step wholly inside transit is fitted only with trace support**
+  (`trace_step_sources`: a trace FWHM/position/PCA series stepping within
+  5 min, either detector). TOI-270 c's real in-transit tilt has it (NRS1
+  FWHM); a mis-placed contact does not. Rejected steps are listed in
+  `scan_steps_rejected_in_transit`, never fitted.
+
+`verify_fits.py` STOPs a GP that was sampled (no `gp_frozen`), and pass 2
+moving t0 > 10 min or the depth > 10% from pass 1 (it would have caught
+all five v1.6 failures); it flags a/Rs or b disagreeing > 3σ between
+visits of one planet.
 
 `-nopca` now carries a second meaning worth knowing: no PCA components
 means no Stage 2 calints, which means no trace diagnostics, which means
@@ -573,7 +605,7 @@ band — that is the prior-returning fit, and it is bandpass-independent.
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/scripts/test_data_reduction.py -q
 ```
 
-191 tests, no network and no exoTEDRF environment required (one v1.6
+210 tests, no network and no exoTEDRF environment required (one
 joint-fit test runs real juliet + celerite and skips without them). They
 cover the transit-in-window and force-refit guards, MJD→BJD conversion,
 constant-R binning, tilt detection (including that a real transit is not

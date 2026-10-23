@@ -670,6 +670,41 @@ def step_statistic(series: np.ndarray, *, window: int = TILT_WINDOW,
     return (diff - med) / sigma
 
 
+def trace_step_sources(
+    trace_z: dict[str, dict[str, Any]],
+    event_time: float,
+    *,
+    tol_min: float = TILT_MATCH_TOL_MIN,
+    threshold: float = TILT_THRESHOLD,
+) -> list[str]:
+    """Trace diagnostics that step at ``event_time``, as ``"DET:series"``.
+
+    ``trace_z`` maps a detector to ``{"time": t, "z": {name:
+    step_statistic(series)}}`` for its trace FWHM / position / PCA series.
+    A diagnostic counts when its |z| exceeds ``threshold`` within
+    ``tol_min`` minutes of the event, in EITHER detector -- a segment tilt
+    is a telescope-level event, so it lands in both at once (TOI-270 c
+    o016: only NRS1's trace FWHM cleared 6 sigma for a 2803 ppm step seen
+    in both detectors' flux).
+
+    This is the test a flux step needs before it may be fitted inside the
+    transit (fit v1.7). The trace series carry no transit, so a real tilt
+    shows there; a step the flux scan finds at a mis-placed ingress or
+    egress does not.
+    """
+    hits = []
+    for det, rec in trace_z.items():
+        t = np.asarray(rec["time"], dtype=float)
+        near = np.abs(t - float(event_time)) <= tol_min / 1440.0
+        if not near.any():
+            continue
+        for name, z in rec["z"].items():
+            zz = np.abs(np.asarray(z, dtype=float)[near])
+            if np.any(np.isfinite(zz) & (zz > threshold)):
+                hits.append(f"{det.upper()}:{name}")
+    return sorted(hits)
+
+
 def find_tilt_events(
     flux: np.ndarray,
     *,

@@ -229,15 +229,21 @@ most of this list and exits 1 on a STOP):
 - [ ] `depth_check.status` is `ok` or `indicative` — **not** `suspect`.
       `indicative` just means the only reference was the optical archive
       value; check `depth_check.band` before reacting to a % offset
-- [ ] `fit_version` is exactly `1.6` — no suffix. `-1det` (one detector
-      only), `-nogp`, `-noscan`, `-nopca` are not survey fits. Every v1.5
-      (and restamped v1.5) fit is superseded: v1.6 is a joint NRS1+NRS2
-      white fit with a GP, so it changes every number and is never restamped
+- [ ] `fit_version` is exactly `1.7` — no suffix. `-1det` (one detector
+      only), `-nogp`, `-noscan`, `-nopca` are not survey fits. Every v1.6
+      fit is superseded: v1.7 trains the GP out of transit and fixes it,
+      so it changes every number and is never restamped
+- [ ] `noise_model.gp_frozen: true`, and pass 2 within 10 min (t0) and
+      10% (depth) of pass 1 (`t0_p1_pass1`, `white_depth_ppm_pass1`).
+      verify_fits.py STOPs on either; a bigger move means a different
+      solution, not a correction
+- [ ] `scan_steps_rejected_in_transit` read: each is a flux-only step
+      inside transit that no trace diagnostic confirmed
 - [ ] `joint_fit.n_detectors: 2`, and `t0_p1` / `b_p1` / `a_p1` identical
       in the NRS1 and NRS2 summaries (they are one shared parameter)
 - [ ] `noise_model.kind: celerite-matern32`; `GP_rho_min` a few minutes to
-      a few hours. A rho railing at the visit span means the GP is doing
-      the baseline's job — look at the white figure
+      a few hours (trained out of transit). A rho at the visit span means
+      the GP is doing the baseline's job — look at the white figure
 - [ ] `median_depth_err_ppm` << depth (tens of ppm, not ~1500)
 - [ ] white rms hundreds of ppm; record `rednoise.beta_median` (without
       the GP term — comparable with v1.5) and `rednoise_after_gp` (below 1

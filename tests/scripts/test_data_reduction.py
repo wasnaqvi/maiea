@@ -32,6 +32,7 @@ from aster_toolkit.data_reduction.lightcurves import (  # noqa: E402
     match_tilt_events,
     step_statistic,
     tilt_transition_keep_mask,
+    trace_step_sources,
     oot_mask_from_baseline,
     oot_mask_from_ephemeris,
     pca_regressors,
@@ -2378,7 +2379,8 @@ class TestJointWhiteFitPlumbing:
         for call in fake.calls:
             assert call["priors"]["GP_rho_NRS1"] == {"distribution": "fixed",
                                                      "hyperparameters": 0.01}
-            assert call["priors"]["GP_sigma_NRS1"]["distribution"] == "loguniform"
+            # v1.7: the amplitude is trained out of transit and fixed too.
+            assert call["priors"]["GP_sigma_NRS1"]["distribution"] == "fixed"
             # Same origin as the white fit, so the frozen rho means the same.
             assert call["GP_regressors_lc"]["NRS1"] == pytest.approx(lc["time"] + 0.5)
         header = (tmp_path / "transmission_spectrum.csv").read_text().splitlines()[0]
@@ -2489,3 +2491,206 @@ class TestGpTimeInput:
         # here the guard is merely redundant, not wrong.
         if factorizes(t):
             pytest.skip("this celerite build copes with absolute BJD")
+
+
+# -------------------- fit v1.7: out-of-transit GP, pass-1 t0, trace-backed steps --------------------
+
+
+def _matern_noise(t, sigma, rho, seed=0):
+    celerite = pytest.importorskip("celerite")
+    from celerite import terms
+    gp = celerite.GP(terms.Matern32Term(np.log(sigma), np.log(rho), eps=0.01))
+    gp.compute(t, 1e-9)
+    np.random.seed(seed)   # celerite's sampler draws from the global state
+    return gp.sample()
+
+
+class TestTransitWindow:
+    def test_duration_matches_the_analytic_value(self):
+        import aster_toolkit.data_reduction.juliet as J
+        # Central transit: T14 = P/pi * asin((1+k)/a) for b = 0.
+        P, a, k = 10.0, 20.0, 0.05
+        assert J.transit_duration_days(P, a, 0.0, k) == pytest.approx(
+            P / np.pi * np.arcsin((1 + k) / a), rel=1e-9)
+        assert J.transit_duration_days(P, a, 0.9, k) < J.transit_duration_days(P, a, 0.0, k)
+        assert np.isnan(J.transit_duration_days(P, a, 1.2, k))   # misses the star
+
+    def test_window_comes_from_the_fitted_summary(self):
+        import aster_toolkit.data_reduction.juliet as J
+        s = {k: {"median": v} for k, v in
+             (("t0_p1", 100.0), ("P_p1", 5.0), ("a_p1", 15.0), ("b_p1", 0.3), ("p_p1", 0.03))}
+        t0, t14 = J.transit_window_from_summary(s)
+        assert t0 == 100.0 and 0.05 < t14 < 0.12
+        t = np.linspace(99.8, 100.2, 1001)
+        oot = J.out_of_transit_mask(t, t0, t14)
+        assert not oot[np.abs(t - t0) < 0.5 * t14].any()
+        # The margin keeps the contacts themselves out of the training set.
+        edge = np.abs(np.abs(t - t0) - 0.5 * t14) < 0.5 * J.OOT_MARGIN_DAYS
+        assert not oot[edge].any()
+
+
+class TestOutOfTransitGpTraining:
+    def _visit(self, sigma=300e-6, rho=20 / 1440, depth=3000e-6, seed=1):
+        n = 3000
+        t = np.linspace(-0.15, 0.15, n)
+        rng = np.random.default_rng(seed)
+        red = _matern_noise(t, sigma, rho, seed=seed)
+        transit = -depth * (np.abs(t) < 0.05)
+        flux = 1.0 + transit + red + 2e-4 * t + rng.normal(0, 150e-6, n)
+        return t, flux, np.full(n, 150e-6), np.abs(t) > 0.06
+
+    def test_recovers_the_injected_noise_from_out_of_transit_alone(self):
+        import aster_toolkit.data_reduction.juliet as J
+        for seed in (1, 2, 3):
+            t, flux, err, oot = self._visit(seed=seed)
+            realised = _matern_noise(t, 300e-6, 20 / 1440, seed=seed)[oot].std()
+            hp = J.train_gp_out_of_transit(t, flux, err, None, oot, 0.0)
+            assert hp is not None and hp["n_oot"] == int(oot.sum())
+            assert hp["GP_rho"] == pytest.approx(20 / 1440, rel=0.6)
+            assert hp["GP_sigma"] == pytest.approx(realised, rel=0.3)
+            assert not hp["rho_fixed"]
+        # A regressor is fitted under the same covariance (GLS) and may take
+        # a share of the slow noise, but the timescale survives.
+        hp = J.train_gp_out_of_transit(t, flux, err, t[:, None], oot, 0.0)
+        assert hp["GP_rho"] == pytest.approx(20 / 1440, rel=0.6)
+
+    def test_the_transit_never_enters_the_training(self):
+        # Same noise, a 10x deeper transit: out of transit nothing changed,
+        # so neither may the hyperparameters. A v1.6-style free GP fitted
+        # with the transit had every reason to change them.
+        import aster_toolkit.data_reduction.juliet as J
+        t, flux, err, oot = self._visit(depth=3000e-6)
+        _, deep, _, _ = self._visit(depth=30000e-6)
+        a = J.train_gp_out_of_transit(t, flux, err, None, oot, 0.0)
+        b = J.train_gp_out_of_transit(t, deep, err, None, oot, 0.0)
+        assert a["GP_sigma"] == pytest.approx(b["GP_sigma"], rel=1e-6)
+        assert a["GP_rho"] == pytest.approx(b["GP_rho"], rel=1e-6)
+
+    def test_fixed_rho_trains_only_the_amplitude(self):
+        import aster_toolkit.data_reduction.juliet as J
+        t, flux, err, oot = self._visit()
+        hp = J.train_gp_out_of_transit(t, flux, err, None, oot, 0.0, rho=0.01)
+        assert hp["GP_rho"] == 0.01 and hp["rho_fixed"]
+
+    def test_too_little_baseline_returns_none(self):
+        import aster_toolkit.data_reduction.juliet as J
+        t, flux, err, oot = self._visit()
+        few = oot & (np.cumsum(oot) <= J.GP_TRAIN_MIN_OOT - 1)
+        assert J.train_gp_out_of_transit(t, flux, err, None, few, 0.0) is None
+
+
+class TestV17WhiteFitPlumbing(TestJointWhiteFitPlumbing):
+    def test_gp_is_trained_and_fixed_and_t0_tied_to_pass1(self, monkeypatch, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        fake = _FakeJuliet()
+        monkeypatch.setattr(J, "_import_juliet", lambda: fake)
+        lcs = _synthetic_joint_lcs()
+        regs = {d: np.column_stack([lcs[d]["time"], np.ones(lcs[d]["time"].size)])
+                for d in lcs}
+        out = J.fit_white_lightcurve_joint(
+            lcs, _joint_priors(), {d: tmp_path / d.lower() for d in lcs},
+            joint_dir=tmp_path / "joint", regressors=regs,
+            regressor_names={d: ["time", "pca_1"] for d in lcs},
+            gp=True, anomaly_scan={"events": []},
+            gp_train_window=(0.0, 0.1), t0_prior=(0.002, J.PASS2_T0_SIGMA_DAYS))
+        pri = fake.calls[0]["priors"]
+        for d in lcs:
+            assert pri[f"GP_sigma_{d}"]["distribution"] == "fixed"
+            assert pri[f"GP_rho_{d}"]["distribution"] == "fixed"
+            nm = out[d]["noise_model"]
+            assert nm["gp_frozen"] is True and nm["gp_training"]["n_oot"] > 0
+            # Readers (channels, verify) find the fixed values where the
+            # sampled ones used to be.
+            assert out[d][f"GP_rho_{d}"]["median"] == pytest.approx(nm["gp_training"]["GP_rho"])
+            assert out[d]["orbit_prior"]["t0"]["source"] == "pass 1"
+            assert out[d]["fit_version"] == J.PATCHWORK_FIT_VERSION
+        assert pri["t0_p1"]["hyperparameters"] == [0.002, J.PASS2_T0_SIGMA_DAYS]
+
+    def test_untrainable_gp_falls_back_to_white_and_is_stamped(self, monkeypatch, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        fake = _FakeJuliet()
+        monkeypatch.setattr(J, "_import_juliet", lambda: fake)
+        lcs = _synthetic_joint_lcs()
+        # A transit window covering the whole visit leaves no baseline.
+        out = J.fit_white_lightcurve_joint(
+            lcs, _joint_priors(), {d: tmp_path / d.lower() for d in lcs},
+            joint_dir=tmp_path / "joint", gp=True, anomaly_scan={"events": []},
+            regressor_names={d: ["pca_1"] for d in lcs},
+            regressors={d: np.ones((lcs[d]["time"].size, 1)) for d in lcs},
+            gp_train_window=(0.0, 1.0))
+        assert not any(k.startswith("GP_") for k in fake.calls[0]["priors"])
+        assert out["NRS1"]["fit_version"].endswith("-nogp")
+        assert "gp_untrained" in out["NRS1"]["noise_model"]
+
+
+class TestTraceStepSources:
+    def _trace(self, step_at=None, n=2000):
+        rng = np.random.default_rng(4)
+        t = np.arange(n) * 10.0 / 86400
+        fwhm = 2.0 + rng.normal(0, 0.001, n)
+        if step_at is not None:
+            fwhm[step_at:] += 0.02
+        return t, {"trace_fwhm": step_statistic(fwhm), "pca_0": step_statistic(rng.normal(0, 1, n))}
+
+    def test_a_real_tilt_is_supported_by_the_psf(self):
+        t, z = self._trace(step_at=1000)
+        assert trace_step_sources({"NRS1": {"time": t, "z": z}}, float(t[1000])) == \
+            ["NRS1:trace_fwhm"]
+
+    def test_a_flux_only_step_has_no_support(self):
+        # HD 15337 c o019: "steps" at a mis-placed transit contact live in
+        # the flux only; the PSF did nothing.
+        t, z = self._trace(step_at=None)
+        assert trace_step_sources({"NRS1": {"time": t, "z": z}}, float(t[1000])) == []
+
+    def test_the_other_detector_can_supply_the_support(self):
+        # TOI-270 c o016: only NRS1's FWHM cleared 6 sigma for a step both
+        # detectors' flux showed.
+        t, z1 = self._trace(step_at=1000)
+        _, z2 = self._trace(step_at=None)
+        got = trace_step_sources({"NRS1": {"time": t, "z": z1}, "NRS2": {"time": t, "z": z2}},
+                                 float(t[1003]))
+        assert got == ["NRS1:trace_fwhm"]
+
+
+class TestVerifyV17:
+    def _summary(self, **fit):
+        import aster_toolkit.data_reduction.juliet as J
+        f = {"fit_version": J.PATCHWORK_FIT_VERSION,
+             "white_depth_ppm": {"median": 2950.0, "plus": 12.0, "minus": 12.0},
+             "white_depth_ppm_pass1": {"median": 2960.0, "plus": 11.0, "minus": 11.0},
+             "t0_p1": {"median": 100.0}, "t0_p1_pass1": {"median": 100.0},
+             "b_p1": {"median": 0.6, "plus": 0.01, "minus": 0.01},
+             "a_p1": {"median": 81.0, "plus": 0.8, "minus": 0.8},
+             "noise_model": {"kind": J.GP_KERNEL, "gp_time_origin": 100.0,
+                             "gp_frozen": True, "GP_rho_min": 20.0},
+             "depth_check": {"status": "ok"}, "spot_handling": {"scan_ran": True},
+             "joint_fit": {"n_detectors": 2}, "n_channels": 26,
+             "ld_source": "exotic-ld", "tilt_handling": {"searched_diagnostics": True}}
+        f.update(fit)
+        return {"visits": {"o001": {"fits": {"NRS1": f}}}}
+
+    def _check(self, summary):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..",
+                                        "scripts", "patchwork"))
+        import verify_fits
+        return verify_fits.check_target(summary)
+
+    def test_a_healthy_v17_fit_passes(self):
+        lines, stop = self._check(self._summary())
+        assert not stop, lines
+
+    def test_a_free_gp_is_a_stop(self):
+        s = self._summary()
+        s["visits"]["o001"]["fits"]["NRS1"]["noise_model"].pop("gp_frozen")
+        _, stop = self._check(s)
+        assert stop
+
+    def test_pass2_drifting_from_pass1_is_a_stop(self):
+        # K2-18 b o004 under v1.6: 2972 ppm in pass 1, 1436 after the GP.
+        lines, stop = self._check(self._summary(
+            white_depth_ppm={"median": 1436.0, "plus": 190.0, "minus": 190.0},
+            t0_p1={"median": 100.0 - 34.4 / 1440}))
+        assert stop
+        text = "\n".join(lines)
+        assert "moved t0 -34 min" in text and "moved the depth -51%" in text

@@ -164,7 +164,24 @@ def _repair_batman_namespace() -> None:
 # Stamps: "-1det" when only one detector had Stage 3 products (no shared
 # geometry to constrain it), "-nogp" when the GP was off. Either is not a
 # survey fit.
-PATCHWORK_FIT_VERSION = "1.6"
+# v1.7 (decision Wasi 2026-10-23): the GP hyperparameters are TRAINED out
+# of transit and FIXED in the fit; they are no longer sampled with the
+# transit. A free GP with a 30-100 min timescale can draw a box, so "shifted
+# transit + GP" fitted the data as well as the right transit, and five v1.6
+# fits took that route: K2-18 b (all four visits, depth 1009-2653 ppm vs a
+# published 2915-2983, t0 34-68 min off), TOI-836 b o010 (339 vs 614 ppm),
+# HD 15337 c o018 (438 vs 815 ppm), TOI-125 b and TOI-270 c. The GP-free
+# pass 1 matched every published value (white depth within ~1-6%, t0 within
+# 0.2 min), and the GP mean equalled exactly the depth the transit model
+# gave up. Three further changes:
+#   * pass 2's t0 prior is centred on pass 1 (PASS2_T0_SIGMA_DAYS), not on
+#     the ephemeris, so the corrections cannot slide the transit;
+#   * the Stage 5.5 scan splits in/out of transit by the pass-1 FITTED
+#     transit, not the ephemeris prediction (HD 15337 c o019: a ~60 min
+#     stale ephemeris let four "steps" sit on the real contacts);
+#   * a scan step wholly inside transit becomes a regressor only when a
+#     trace diagnostic steps at the same time (see trace_corroborates).
+PATCHWORK_FIT_VERSION = "1.7"
 SAMPLER = "dynesty"
 N_LIVE_WHITE = 500
 N_LIVE_SPEC = 300
@@ -203,6 +220,17 @@ GP_SIGMA_BOUNDS = [1e-6, 1e-2]        # amplitude, relative flux (1-10000 ppm)
 # mflux and the time slope already fit. Either end would only let the two
 # trade against each other.
 GP_RHO_MIN_DAYS = 2.0 / 1440.0
+# v1.7 out-of-transit GP training. Fewer out-of-transit integrations than
+# this and the visit is fitted without a GP (stamped -nogp, not a survey
+# fit) rather than with hyperparameters nothing constrained.
+GP_TRAIN_MIN_OOT = 200
+GP_JITTER_BOUNDS = [1e-7, 1e-2]       # white excess above the pipeline errors
+# Out-of-transit = beyond half the fitted T14 plus this margin, so a
+# slightly wrong duration never puts ingress or egress in the training set.
+OOT_MARGIN_DAYS = 10.0 / 1440.0
+# Pass 2's t0 prior: Gaussian about the pass-1 mid-transit. Pass 1 matched
+# every published t0 to within 0.2 min; the v1.6 GP fits moved 11-68 min.
+PASS2_T0_SIGMA_DAYS = 5.0 / 1440.0
 
 
 def gp_time_input(time: np.ndarray, origin: float) -> np.ndarray:
@@ -221,6 +249,144 @@ def gp_time_input(time: np.ndarray, origin: float) -> np.ndarray:
     (they carry no ``gp_time_origin`` in ``noise_model``).
     """
     return np.asarray(time, dtype=float) - float(origin)
+
+
+def transit_duration_days(period: float, a_rs: float, b: float, rp_rs: float) -> float:
+    """Total transit duration T14 for a circular orbit, in days (NaN when
+    the geometry does not transit)."""
+    a, b, k = float(a_rs), float(b), float(rp_rs)
+    if not (a > 1.0 and 0.0 <= b < 1.0 + k):
+        return float("nan")
+    inc = np.arccos(b / a)
+    arg = np.sqrt(max((1.0 + k) ** 2 - b ** 2, 0.0)) / (a * np.sin(inc))
+    return float(period / np.pi * np.arcsin(min(arg, 1.0)))
+
+
+def transit_window_from_summary(summary: dict[str, Any]) -> tuple[float, float]:
+    """(t0, T14) in days from a white-fit summary's posterior medians."""
+    med = lambda key: float(summary[key]["median"])  # noqa: E731
+    t14 = transit_duration_days(med("P_p1"), med("a_p1"), med("b_p1"), med("p_p1"))
+    if not np.isfinite(t14):
+        raise ValueError(f"white fit geometry does not transit (b={med('b_p1'):.2f}, "
+                         f"a/Rs={med('a_p1'):.1f}); no transit window to exclude.")
+    return med("t0_p1"), t14
+
+
+def out_of_transit_mask(time: np.ndarray, t0: float, t14: float,
+                        margin: float = OOT_MARGIN_DAYS) -> np.ndarray:
+    """True beyond half the transit duration plus ``margin`` from ``t0``."""
+    return np.abs(np.asarray(time, dtype=float) - float(t0)) > 0.5 * float(t14) + margin
+
+
+def train_gp_out_of_transit(
+    time: np.ndarray,
+    flux: np.ndarray,
+    flux_err: np.ndarray,
+    regressors: np.ndarray | None,
+    oot: np.ndarray,
+    origin: float,
+    *,
+    rho: float | None = None,
+) -> dict[str, Any] | None:
+    """Matern-3/2 hyperparameters fitted to the out-of-transit data only.
+
+    The fit then holds them FIXED (v1.7). Out of transit there is no
+    transit for the GP to trade against, so whatever timescale and
+    amplitude it finds describe the noise and nothing else. In transit
+    the GP keeps that covariance: it can still follow correlated noise,
+    but it can no longer grow into a 3000 ppm box because the transit
+    moved.
+
+    Model: flux = X beta + GP(Matern32 sigma, rho) + jitter + flux_err, with
+    X = [1, regressors]. beta is solved by generalised least squares at
+    every trial (the profile likelihood), so the baseline is fitted under
+    the same covariance it is judged by. Regressor columns that are
+    constant out of transit (an in-transit spot Gaussian) carry no
+    information here and are dropped. ``rho`` given: only sigma and the
+    jitter are fitted (the channels reuse the white-light timescale).
+
+    Returns ``{"GP_sigma", "GP_rho", "jitter", "n_oot", "log_likelihood",
+    "rho_fixed", "sigma_at_floor", "rho_at_bound"}``, or None when fewer
+    than GP_TRAIN_MIN_OOT out-of-transit points are available.
+    """
+    import celerite
+    from celerite import terms
+    from scipy.optimize import minimize
+
+    time = np.asarray(time, dtype=float)
+    flux = np.asarray(flux, dtype=float)
+    flux_err = np.asarray(flux_err, dtype=float)
+    use = (np.asarray(oot, dtype=bool) & np.isfinite(flux)
+           & np.isfinite(flux_err) & (flux_err > 0))
+    n = int(use.sum())
+    if n < GP_TRAIN_MIN_OOT:
+        return None
+    order = np.argsort(time[use])
+    x = gp_time_input(time[use], origin)[order]
+    y = flux[use][order]
+    yerr = flux_err[use][order]
+    cols = [np.ones(n)]
+    if regressors is not None:
+        reg = np.asarray(regressors, dtype=float)
+        reg = reg.reshape(reg.shape[0], -1)[use][order]
+        cols += [c for c in reg.T if np.all(np.isfinite(c)) and np.ptp(c) > 1e-12]
+    X = np.column_stack(cols)
+
+    span = float(np.ptp(time))
+    rho_bounds = (GP_RHO_MIN_DAYS, max(span, 2 * GP_RHO_MIN_DAYS))
+    beta_ols = np.linalg.lstsq(X, y, rcond=None)[0]
+    scatter = float(np.std(y - X @ beta_ols)) or 1e-4
+
+    def neg_loglike(theta):
+        log_s, log_r, log_j = (theta if rho is None
+                               else (theta[0], np.log(rho), theta[1]))
+        try:
+            gp = celerite.GP(terms.Matern32Term(log_sigma=log_s, log_rho=log_r, eps=0.01)
+                             + terms.JitterTerm(log_sigma=log_j))
+            gp.compute(x, yerr)
+            KiX = gp.apply_inverse(X)
+            Kiy = gp.apply_inverse(y)[:, 0]
+            beta = np.linalg.lstsq(X.T @ KiX, X.T @ Kiy, rcond=None)[0]
+            ll = gp.log_likelihood(y - X @ beta)
+        except Exception:
+            return 1e25
+        return -ll if np.isfinite(ll) else 1e25
+
+    log_sb = np.log(GP_SIGMA_BOUNDS)
+    log_jb = np.log(GP_JITTER_BOUNDS)
+    log_rb = np.log(rho_bounds)
+    s0 = np.clip(np.log(0.5 * scatter), *log_sb)
+    j0 = np.clip(np.log(0.5 * scatter), *log_jb)
+    if rho is None:
+        starts = [(s0, np.clip(np.log(r / 1440.0), *log_rb), j0) for r in (5.0, 20.0, 60.0)]
+        bounds = [tuple(log_sb), tuple(log_rb), tuple(log_jb)]
+    else:
+        starts = [(s0, j0), (np.clip(s0 - 2.0, *log_sb), j0)]
+        bounds = [tuple(log_sb), tuple(log_jb)]
+    best = None
+    for start in starts:
+        res = minimize(neg_loglike, np.asarray(start, dtype=float),
+                       method="L-BFGS-B", bounds=bounds)
+        if best is None or res.fun < best.fun:
+            best = res
+    if best is None or best.fun >= 1e25:
+        return None
+    if rho is None:
+        log_s, log_r, log_j = best.x
+    else:
+        log_s, log_j = best.x
+        log_r = np.log(rho)
+    return {
+        "GP_sigma": float(np.exp(log_s)),
+        "GP_rho": float(rho) if rho is not None else float(np.exp(log_r)),
+        "jitter": float(np.exp(log_j)),
+        "n_oot": n,
+        "log_likelihood": float(-best.fun),
+        "rho_fixed": rho is not None,
+        "sigma_at_floor": bool(log_s <= log_sb[0] + 1e-3),
+        "rho_at_bound": bool(rho is None and (log_r <= log_rb[0] + 1e-3
+                                              or log_r >= log_rb[1] - 1e-3)),
+    }
 
 # Back-compat alias (pre-Stage4 name).
 load_extracted_spectra = load_stage3_spectra
@@ -566,8 +732,12 @@ def _white_priors(
     return p
 
 
-def _orbit_priors(priors: dict[str, Any], t0_obs: float) -> dict[str, dict[str, Any]]:
-    """P, t0, b, a/Rs (+ circular orbit): the geometry of one transit."""
+def _orbit_priors(priors: dict[str, Any], t0_obs: float,
+                  t0_prior: tuple[float, float] | None = None) -> dict[str, dict[str, Any]]:
+    """P, t0, b, a/Rs (+ circular orbit): the geometry of one transit.
+
+    ``t0_prior`` = (centre, sigma) replaces the ephemeris-propagated t0
+    prior; pass 2 centres it on the pass-1 mid-transit (v1.7)."""
     period = priors["period"]
     if period is None:
         raise ValueError("No orbital period available from the archive.")
@@ -578,7 +748,9 @@ def _orbit_priors(priors: dict[str, Any], t0_obs: float) -> dict[str, dict[str, 
             "hyperparameters": [period, max(priors["period_err"] or 0, 1e-5) * 3],
         },
         # t0 propagated to this visit; 0.01 d Gaussian (validated run).
-        "t0_p1": {"distribution": "normal", "hyperparameters": [t0_obs, 0.01]},
+        "t0_p1": {"distribution": "normal",
+                  "hyperparameters": ([float(t0_prior[0]), float(t0_prior[1])]
+                                      if t0_prior is not None else [t0_obs, 0.01])},
         "b_p1": {"distribution": "uniform", "hyperparameters": [0.0, 1.0]},
         "ecc_p1": {"distribution": "fixed", "hyperparameters": 0.0},
         "omega_p1": {"distribution": "fixed", "hyperparameters": 90.0},
@@ -592,8 +764,20 @@ def _orbit_priors(priors: dict[str, Any], t0_obs: float) -> dict[str, dict[str, 
     return p
 
 
-def _gp_priors(instrument: str, time: np.ndarray) -> dict[str, dict[str, Any]]:
-    """Matern-3/2 GP in time for one detector (juliet: GP_sigma + GP_rho)."""
+def _gp_priors(instrument: str, time: np.ndarray,
+               fixed: dict[str, float] | None = None) -> dict[str, dict[str, Any]]:
+    """Matern-3/2 GP in time for one detector (juliet: GP_sigma + GP_rho).
+
+    ``fixed`` (``{"GP_sigma", "GP_rho"}`` from train_gp_out_of_transit)
+    holds both hyperparameters at the out-of-transit values -- the v1.7
+    survey fit. Without it both are sampled (v1.6 behaviour)."""
+    if fixed is not None:
+        return {
+            f"GP_sigma_{instrument}": {"distribution": "fixed",
+                                       "hyperparameters": float(fixed["GP_sigma"])},
+            f"GP_rho_{instrument}": {"distribution": "fixed",
+                                     "hyperparameters": float(fixed["GP_rho"])},
+        }
     span = float(np.ptp(np.asarray(time, dtype=float)))
     return {
         f"GP_sigma_{instrument}": {"distribution": "loguniform",
@@ -608,20 +792,23 @@ def _joint_white_priors(
     priors: dict[str, Any],
     t0_obs: float,
     detectors: dict[str, dict[str, Any]],
+    t0_prior: tuple[float, float] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Priors for one white-light fit of every detector in ``detectors``.
 
     ``detectors`` maps a detector name to ``{"n_regressors", "ld",
-    "gp_time"}`` (``gp_time`` None = no GP). The orbit (JOINT_SHARED_PARAMS)
-    is one set of parameters; the depth is ``p_p1_<det>`` per detector.
+    "gp_time", "gp_fixed"}`` (``gp_time`` None = no GP; ``gp_fixed`` the
+    trained hyperparameters, None = sampled). The orbit
+    (JOINT_SHARED_PARAMS) is one set of parameters; the depth is
+    ``p_p1_<det>`` per detector.
     """
-    p = _orbit_priors(priors, t0_obs)
+    p = _orbit_priors(priors, t0_obs, t0_prior)
     for det, spec in detectors.items():
         p[f"p_p1_{det}"] = {"distribution": "uniform", "hyperparameters": [0.0, 0.3]}
         p.update(_ld_prior_entries(det, spec.get("ld")))
         p.update(_common_instrument_priors(det, int(spec["n_regressors"])))
         if spec.get("gp_time") is not None:
-            p.update(_gp_priors(det, spec["gp_time"]))
+            p.update(_gp_priors(det, spec["gp_time"], spec.get("gp_fixed")))
     return p
 
 
@@ -632,7 +819,7 @@ def _require_celerite() -> None:
         import celerite  # noqa: F401
     except ImportError as exc:
         raise ImportError(
-            "Patchwork fit v1.6 models red noise with a celerite GP, and "
+            "Patchwork fit v1.6+ models red noise with a celerite GP, and "
             "celerite is not importable in this environment. Install it "
             "(pip install celerite) in the env that runs the fit."
         ) from exc
@@ -809,8 +996,10 @@ def fit_white_lightcurve_joint(
     tilt_reports: dict[str, dict[str, Any] | None] | None = None,
     n_spot_masked: dict[str, int] | None = None,
     n_tilt_masked: dict[str, int] | None = None,
+    gp_train_window: tuple[float, float] | None = None,
+    t0_prior: tuple[float, float] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Fit one visit's white light on every detector at once (fit v1.6).
+    """Fit one visit's white light on every detector at once (fit v1.6+).
 
     ``lcs`` maps detector -> Stage 4 lightcurve. The orbit
     (JOINT_SHARED_PARAMS: P, t0, a/Rs, b) is shared; depth
@@ -822,7 +1011,16 @@ def fit_white_lightcurve_joint(
     works unchanged.
 
     ``gp=True`` adds a Matern-3/2 GP in time per detector. Leave it off
-    only for pass 1, whose residuals feed the Stage 5.5 scan.
+    only for pass 1, whose residuals feed the Stage 5.5 scan. Since v1.7
+    its hyperparameters are trained on the out-of-transit data first and
+    held fixed (train_gp_out_of_transit); out of transit means outside
+    ``gp_train_window`` = (t0, T14) when given -- the pass-1 fitted
+    transit -- else the lightcurve's ephemeris ``oot_mask``. A detector
+    with too little out-of-transit data turns the GP off for the visit
+    (stamped -nogp) rather than sampling it free.
+
+    ``t0_prior`` = (centre, sigma) in days overrides the ephemeris t0
+    prior (pass 2 centres it on pass 1).
 
     Returns ``{det: summary}``.
     """
@@ -873,11 +1071,33 @@ def fit_white_lightcurve_joint(
     # The GP sees time from the predicted mid-transit, never absolute BJD
     # (see gp_time_input). One origin for both detectors.
     gp_origin = t0_obs
+    gp_fixed: dict[str, dict[str, Any] | None] = {det: None for det in dets}
+    gp_untrained = None
+    if gp:
+        for det in dets:
+            oot = (out_of_transit_mask(times[det], *gp_train_window)
+                   if gp_train_window is not None
+                   else np.asarray(lcs[det]["oot_mask"], dtype=bool))
+            k = keeps[det]
+            gp_fixed[det] = train_gp_out_of_transit(
+                times[det][k], lcs[det]["wl_flux"][k], lcs[det]["wl_err"][k],
+                regs[det][k], oot[k], gp_origin)
+            if gp_fixed[det] is None:
+                gp_untrained = (f"{det}: {int((oot & k).sum())} out-of-transit "
+                                f"integrations, need {GP_TRAIN_MIN_OOT}")
+        if gp_untrained:
+            # All or nothing: the detectors share one geometry, so they share
+            # one noise-model choice too. Stamped -nogp downstream.
+            print(f"[patchwork] WARNING ({visit}): GP not trained ({gp_untrained}); "
+                  "fitting without a GP -- this fit is stamped -nogp.")
+            gp = False
+            gp_fixed = {det: None for det in dets}
     prior_dict = _joint_white_priors(priors, t0_obs, {
         det: {"n_regressors": regs[det].shape[1], "ld": ld.get(det),
-              "gp_time": times[det][keeps[det]] if gp else None}
+              "gp_time": times[det][keeps[det]] if gp else None,
+              "gp_fixed": gp_fixed[det]}
         for det in dets
-    })
+    }, t0_prior=t0_prior)
     dataset = juliet.load(
         priors=prior_dict,
         t_lc={d: times[d][keeps[d]] for d in dets},
@@ -908,6 +1128,8 @@ def fit_white_lightcurve_joint(
             anomaly_scan=anomaly_scan, tilt_report=tilt_reports.get(det),
             n_spot_masked=int(n_spot_masked.get(det, 0)),
             n_tilt_masked=int(n_tilt_masked.get(det, 0)),
+            gp_training=gp_fixed[det], gp_untrained=gp_untrained,
+            t0_prior=t0_prior,
         )
     if len(dets) > 1:
         shared = {k: summaries[dets[0]][k] for k in JOINT_SHARED_PARAMS
@@ -941,10 +1163,13 @@ def _summarize_white_detector(
     tilt_report: dict[str, Any] | None,
     n_spot_masked: int,
     n_tilt_masked: int,
+    gp_training: dict[str, Any] | None = None,
+    gp_untrained: str | None = None,
+    t0_prior: tuple[float, float] | None = None,
 ) -> dict[str, Any]:
     """One detector's white-fit summary, residuals and figure from a
     (possibly joint) juliet result. Same layout as every fit before v1.6,
-    plus ``joint_fit`` and ``noise_model``."""
+    plus ``joint_fit``, ``noise_model`` and (v1.7) ``orbit_prior``."""
     out.mkdir(parents=True, exist_ok=True)
     times = lc["time"]
     n_reg = len(regressor_names)
@@ -978,7 +1203,14 @@ def _summarize_white_detector(
         "program": program,
         "visit": visit,
         "joint_fit": dict(joint_record, n_detectors=n_detectors),
-        "noise_model": {"kind": GP_KERNEL if gp else "white"},
+        "noise_model": {"kind": GP_KERNEL if gp else "white",
+                        **({"gp_untrained": gp_untrained} if gp_untrained else {})},
+        "orbit_prior": {"t0": ({"centre": float(t0_prior[0]),
+                                "sigma_min": float(t0_prior[1]) * 1440.0,
+                                "source": "pass 1"} if t0_prior is not None
+                               else {"centre": float(lc["t0_obs"]),
+                                     "sigma_min": 0.01 * 1440.0,
+                                     "source": "ephemeris"})},
         "spot_handling": {
             "scan_ran": anomaly_scan is not None,
             "method": ("mask" if n_spot_masked else
@@ -1035,6 +1267,12 @@ def _summarize_white_detector(
     for key in keys:
         if key in posterior:
             summary[key] = _posterior_stat(posterior[key])
+    # Fixed (out-of-transit trained) hyperparameters are not in the
+    # posterior; record them in the same shape so readers need not care.
+    for name in ("GP_sigma", "GP_rho"):
+        if gp_training is not None and f"{name}_{instrument}" not in summary:
+            summary[f"{name}_{instrument}"] = {"median": float(gp_training[name]),
+                                               "minus": 0.0, "plus": 0.0}
     summary["p_p1"] = _posterior_stat(posterior[p_key])
     d = np.percentile(posterior[p_key] ** 2, [50, 16, 84]) * 1e6
     summary["depth_ppm"] = {"median": float(d[0]),
@@ -1046,6 +1284,10 @@ def _summarize_white_detector(
             # The channels must use the same GP input coordinate. Its
             # presence also marks a fit made after the absolute-time fix.
             "gp_time_origin": float(gp_origin),
+            # v1.7: trained out of transit and held fixed, never sampled
+            # with the transit. Absent = a v1.6 fit with a free GP.
+            "gp_frozen": gp_training is not None,
+            **({"gp_training": dict(gp_training)} if gp_training is not None else {}),
         })
 
     flux = lc["wl_flux"][keep]
@@ -1499,8 +1741,10 @@ def fit_transmission_spectrum(
 
     # v1.6: a white fit with a GP passes it on. The timescale is a
     # property of the visit's systematics, not of the channel, so it is
-    # frozen to the white posterior like the orbit; only the amplitude is
-    # free per channel.
+    # frozen to the white value like the orbit. v1.7: the per-channel
+    # amplitude is no longer sampled either -- it is trained on the
+    # channel's out-of-transit data (rho held at the white value) and
+    # fixed, so no channel's GP can trade against its depth.
     gp_rho = gp_origin = None
     noise = white_summary.get("noise_model") or {}
     if noise.get("kind") == GP_KERNEL:
@@ -1538,8 +1782,15 @@ def fit_transmission_spectrum(
             f"keep_mask has {keep.size} entries but the lightcurve has "
             f"{times.size} integrations."
         )
+    # Out of transit by the white fit's own geometry where it carries one;
+    # the ephemeris mask only for summaries that predate p_p1/a_p1.
+    try:
+        oot = out_of_transit_mask(times, *transit_window_from_summary(white_summary))
+    except (KeyError, TypeError, ValueError):
+        oot = np.asarray(lc["oot_mask"], dtype=bool)
 
     rows = []
+    n_gp_untrained = 0
     for i in range(lc["wave"].size):
         f, e = lc["sp_flux"][:, i], lc["sp_err"][:, i]
         good = np.isfinite(f) & np.isfinite(e) & keep
@@ -1567,12 +1818,15 @@ def fit_transmission_spectrum(
         else:
             prior_dict.update(_ld_prior_entries(instrument, ld))
         prior_dict.update(_common_instrument_priors(instrument, n_reg))
+        channel_gp = None
         if gp_rho is not None:
-            prior_dict[f"GP_sigma_{instrument}"] = {
-                "distribution": "loguniform",
-                "hyperparameters": list(GP_SIGMA_BOUNDS)}
-            prior_dict[f"GP_rho_{instrument}"] = {
-                "distribution": "fixed", "hyperparameters": gp_rho}
+            channel_gp = train_gp_out_of_transit(
+                times[good], f[good], e[good], regressors[good], oot[good],
+                gp_origin, rho=gp_rho)
+            if channel_gp is None:
+                n_gp_untrained += 1
+            else:
+                prior_dict.update(_gp_priors(instrument, times[good], channel_gp))
 
         dataset = juliet.load(
             priors=prior_dict,
@@ -1581,7 +1835,7 @@ def fit_transmission_spectrum(
             yerr_lc={instrument: e[good]},
             linear_regressors_lc={instrument: regressors[good]},
             GP_regressors_lc=({instrument: gp_time_input(times[good], gp_origin)}
-                              if gp_rho is not None else None),
+                              if channel_gp is not None else None),
             out_folder=str(out / f"bin{i:03d}"),
         )
         results = dataset.fit(sampler=SAMPLER, n_live_points=n_live, verbose=False)
@@ -1595,6 +1849,8 @@ def fit_transmission_spectrum(
             "depth_err": float(0.5 * (depth[2] - depth[1])),
             "rms_ppm": float(np.nanstd(f[good] - model) * 1e6),
         })
+        if channel_gp is not None:
+            rows[-1]["gp_sigma_ppm"] = channel_gp["GP_sigma"] * 1e6
 
     csv_path = out / "transmission_spectrum.csv"
     # Stamp the version the WHITE fit carries, not the module constant:
@@ -1608,7 +1864,9 @@ def fit_transmission_spectrum(
         f"regressors={','.join(white_summary.get('regressor_names', []))}, "
         f"masked_integrations={int((~keep).sum())}"
         + (f", spot_events={len(spot.get('events') or [])}" if spot else "")
-        + (f", noise={GP_KERNEL} rho={gp_rho * 1440:.1f}min"
+        + (f", noise={GP_KERNEL} rho={gp_rho * 1440:.1f}min "
+           f"(sigma trained out of transit, fixed; {n_gp_untrained} channel(s) "
+           "untrained -> white)"
            if gp_rho is not None else ", noise=white")
     ))
 
@@ -1635,6 +1893,7 @@ def fit_transmission_spectrum(
             "impact_parameter": (float(b_white) if b_white is not None else None),
             "fit_version": fit_version,
             "n_masked": int((~keep).sum()),
+            "n_channels_gp_untrained": n_gp_untrained,
             "median_depth_err_ppm": float(np.nanmedian(
                 [r["depth_err"] for r in rows]) * 1e6) if rows else None,
             "median_rms_ppm": float(np.nanmedian(
@@ -2026,6 +2285,14 @@ def prepare_visit_fit_inputs(
             "ld": ld,
             "diagnostics_used": diagnostics is not None,
             "pca_used": pca is not None,
+            # The PSF series the tilt search ran on, kept for the v1.7
+            # in-transit step test (lightcurves.trace_step_sources).
+            "trace_series": {
+                **{f"trace_{k}": np.asarray(diagnostics[k], dtype=float)
+                   for k in ("fwhm", "y", "x") if diagnostics and k in diagnostics},
+                **({f"pca_{j}": pca[:, j] for j in range(pca.shape[1])}
+                   if pca is not None and pca.ndim == 2 else {}),
+            },
             "keep_mask": keep_mask, "anomaly_scan": scan,
             "n_spot_masked": n_spot_masked,
             "n_masked": int((~keep_mask).sum())}

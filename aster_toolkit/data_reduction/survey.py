@@ -76,7 +76,9 @@ from .lightcurves import (
     DEFAULT_RESOLUTION,
     ramp_regressors,
     step_regressors,
+    step_statistic,
     tilt_transition_keep_mask,
+    trace_step_sources,
 )
 from .juliet import (
     PATCHWORK_FIT_VERSION,
@@ -86,7 +88,10 @@ from .juliet import (
     fetch_transit_priors,
     fit_transmission_spectrum,
     fit_white_lightcurve_joint,
+    out_of_transit_mask,
+    PASS2_T0_SIGMA_DAYS,
     prepare_visit_fit_inputs,
+    transit_window_from_summary,
     write_spectrum_csv,
     _plot_combined,
     _require_celerite,
@@ -498,6 +503,13 @@ def run_patchwork_target(
                 n_tilt_masked={det: p["n_tilt_masked"] for det, p in preps.items()},
             )
 
+            # The transit as pass 1 FITTED it (shared geometry, so any
+            # detector's summary). v1.7: this, not the ephemeris prediction,
+            # decides what is in transit from here on -- for the scan, the
+            # in-transit step test, and the GP training. A stale ephemeris
+            # (HD 15337 c o019, ~60 min) otherwise misplaces the contacts.
+            transit_window = transit_window_from_summary(next(iter(pass1.values())))
+
             # -- Stage 5.5: scan pass-1 residuals, cross-confirm --------
             anomaly_dir = root / "fits" / vname / "anomalies"
             anomaly_dir.mkdir(parents=True, exist_ok=True)
@@ -509,11 +521,12 @@ def run_patchwork_target(
                 residual_full = _expand_indexed_values(
                     npz["residual"], original_index, prep["lc"]["time"].size
                 )
+                fitted_oot = out_of_transit_mask(npz["time"], *transit_window)
                 series[det] = {"time": npz["time"], "residual": npz["residual"],
                                "residual_full": residual_full,
-                               "oot_mask": npz["oot_mask"]}
+                               "oot_mask": fitted_oot}
                 reports[det] = detect_lightcurve_anomalies(
-                    npz["time"], npz["residual"], oot_mask=npz["oot_mask"],
+                    npz["time"], npz["residual"], oot_mask=fitted_oot,
                     detector=det,
                 )
                 # Pass 1 was fitted with the tilt transition mask, so the
@@ -577,6 +590,7 @@ def run_patchwork_target(
             # Build every detector's corrections first: the refit is one
             # joint fit, so it needs all of them at once.
             p2: dict[str, dict[str, Any]] = {}
+            trace_z: dict[str, dict[str, Any]] | None = None
             for det, prep in preps.items():
                 keep = masks[det]
                 # A step confirmed by the Stage 5.5 scan but missed by
@@ -590,6 +604,38 @@ def run_patchwork_target(
                 # centre (see step_events_for_regressors).
                 scan_steps = step_events_for_regressors(
                     merged, det, residual=series.get(det, {}).get("residual_full"))
+                # v1.7: a flux step wholly INSIDE the transit is fitted only
+                # when a trace diagnostic steps at the same moment. In
+                # transit a Heaviside trades against the transit shape, and
+                # the flux scan alone cannot tell a tilt from a contact the
+                # transit model put in the wrong place (HD 15337 c o019:
+                # four such "steps", t0 60 min off the published value).
+                # Rejected steps are reported, never fitted.
+                rejected_steps = []
+                t_det = prep["lc"]["time"]
+                in_transit = ~out_of_transit_mask(t_det, *transit_window)
+                kept_steps = []
+                for e in scan_steps:
+                    if not in_transit[int(e["index"])]:
+                        kept_steps.append(e)
+                        continue
+                    if trace_z is None:
+                        trace_z = {d: {"time": p["lc"]["time"],
+                                       "z": {name: step_statistic(v)
+                                             for name, v in (p.get("trace_series") or {}).items()}}
+                                   for d, p in preps.items()}
+                    support = trace_step_sources(trace_z, float(t_det[int(e["index"])]))
+                    if support:
+                        kept_steps.append(dict(e, trace_support=support))
+                    else:
+                        rejected_steps.append(dict(e, reason="in transit, no trace "
+                                                   "diagnostic steps with it"))
+                if rejected_steps:
+                    log(f"[{slug}] {vname} {det}: {len(rejected_steps)} in-transit "
+                        "scan step(s) NOT fitted (no trace support): "
+                        + "; ".join(f"index {e['index']} ({e['amplitude_ppm']:+.0f} ppm)"
+                                    for e in rejected_steps))
+                scan_steps = kept_steps
                 regressors = prep["regressors"]
                 regressor_names = list(prep["regressor_names"])
                 spot_cols, spot_meta = spot_crossing_regressors(
@@ -627,11 +673,17 @@ def run_patchwork_target(
                 p2[det] = {"keep": keep, "regressors": regressors,
                            "regressor_names": regressor_names,
                            "scan_steps": scan_steps, "spot_meta": spot_meta,
+                           "rejected_steps": rejected_steps,
                            "n_masked": int((~keep).sum()),
                            "tilt_report": fit_tilt_report}
 
+            # v1.7: GP hyperparameters trained out of the pass-1 transit
+            # and fixed; t0 tied to pass 1 so the corrections cannot slide
+            # the transit (the v1.6 GP fits moved it 11-68 min).
+            t0_pass1 = float(next(iter(pass1.values()))["t0_p1"]["median"])
             log(f"[{slug}] fitting {vname} white light, pass 2 "
-                f"({'+'.join(preps)} joint, GP; masked "
+                f"({'+'.join(preps)} joint, out-of-transit-trained GP, "
+                f"t0 {PASS2_T0_SIGMA_DAYS * 1440:.0f} min about pass 1; masked "
                 + ", ".join(f"{d} {p2[d]['n_masked']}" for d in p2) + ")...")
             whites = fit_white_lightcurve_joint(
                 {det: p["lc"] for det, p in preps.items()},
@@ -647,6 +699,8 @@ def run_patchwork_target(
                 tilt_reports={det: p2[det]["tilt_report"] for det in preps},
                 n_spot_masked={det: 0 for det in preps},
                 n_tilt_masked={det: p2[det]["n_masked"] for det in preps},
+                gp_train_window=transit_window,
+                t0_prior=(t0_pass1, PASS2_T0_SIGMA_DAYS),
             )
 
             for det, prep in preps.items():
@@ -665,6 +719,9 @@ def run_patchwork_target(
                 summary["visits"].setdefault(vname, {}).setdefault("fits", {})[det] = {
                     "white_depth_ppm": white["depth_ppm"],
                     "white_depth_ppm_pass1": pass1[det]["depth_ppm"],
+                    "t0_p1_pass1": pass1[det].get("t0_p1"),
+                    "b_p1_pass1": pass1[det].get("b_p1"),
+                    "a_p1_pass1": pass1[det].get("a_p1"),
                     "white_rms_ppm": white["residual_rms_ppm"],
                     "fit_version": white["fit_version"],
                     "joint_fit": white.get("joint_fit"),
@@ -674,6 +731,8 @@ def run_patchwork_target(
                     "a_p1": white.get("a_p1"),
                     "tilt_events": len(prep["tilt_events"]),
                     "scan_steps_corrected": p2[det]["scan_steps"],
+                    "scan_steps_rejected_in_transit": p2[det]["rejected_steps"],
+                    "n_channels_gp_untrained": spec.get("n_channels_gp_untrained"),
                     "spot_crossings_modelled": p2[det]["spot_meta"],
                     "tilt_handling": white.get("tilt_handling"),
                     "spot_handling": white.get("spot_handling"),

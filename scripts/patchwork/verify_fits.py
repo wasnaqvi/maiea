@@ -10,8 +10,9 @@ not exit codes: a fit that ran to completion can still be the wrong fit.
     python scripts/patchwork/verify_fits.py ~/scratch/patchwork HD_15337_c TOI_451_c
 
 Exit status is 1 when any target has a STOP-level failure (wrong version,
-suspect depth, prior-returning fit, scan never ran), so a script can stop
-on it. Read-only.
+suspect depth, prior-returning fit, scan never ran, a GP sampled with the
+transit, pass 2 moving t0 or the depth away from pass 1), so a script can
+stop on it. Read-only.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -33,6 +36,16 @@ from aster_toolkit.data_reduction.juliet import (  # noqa: E402
 MIN_CHANNELS = {"NRS1": 24, "NRS2": 20}
 BETA_AFTER_GP_FLAG = 1.5
 FRAC_MASKED_FLAG = 0.15
+# v1.7: pass 2 adds corrections to pass 1 but the same transit. Moving t0
+# or the depth this far means the fit found a different solution -- what a
+# free GP did to five v1.6 fits (t0 11-68 min, depth 30-70%).
+T0_SHIFT_STOP_MIN = 10.0
+DEPTH_SHIFT_STOP_FRAC = 0.10
+GEOMETRY_SIGMA_FLAG = 3.0
+
+
+def _err(x):
+    return max(x.get("plus") or 0.0, x.get("minus") or 0.0) if isinstance(x, dict) else 0.0
 
 
 def _med(x):
@@ -42,6 +55,7 @@ def _med(x):
 def check_target(summary: dict) -> tuple[list[str], bool]:
     """Report lines for one target, and whether it hit a STOP condition."""
     lines, stop = [], False
+    visit_geometry: dict[str, tuple[dict, dict]] = {}
     offset = summary.get("nrs1_nrs2_offset_ppm")
     lines.append(f"  NRS1-NRS2 offset {offset:+.0f} ppm" if offset is not None
                  else "  NRS1-NRS2 offset not measured")
@@ -52,6 +66,9 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
         lines.append(f"  -- {vname}"
                      + ("  (t0 shared)" if visit.get("t0_shared_across_detectors") else ""))
         geometry = {}
+        first = next(iter(sorted(fits.items())))[1]
+        if first.get("a_p1") and first.get("b_p1"):
+            visit_geometry[vname] = (first["a_p1"], first["b_p1"])
         for det, f in sorted(fits.items()):
             stops, notes = [], []
             w = f.get("white_depth_ppm") or {}
@@ -86,6 +103,31 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
                 # First v1.6 runs (2026-10-20) fed the GP absolute BJD; the
                 # likelihood was numerically unreliable. Refit.
                 stops.append("GP on absolute BJD (pre-fix v1.6) — refit")
+            elif not noise.get("gp_frozen"):
+                stops.append("GP hyperparameters sampled with the transit (pre-v1.7)")
+            if noise.get("gp_untrained"):
+                notes.append(f"GP not trained: {noise['gp_untrained']}")
+            if f.get("n_channels_gp_untrained"):
+                notes.append(f"{f['n_channels_gp_untrained']} channel(s) without GP")
+            # Pass 2 against pass 1 (v1.7).
+            w1 = f.get("white_depth_ppm_pass1") or {}
+            t1, t2 = _med(f.get("t0_p1_pass1") or {}), _med(f.get("t0_p1") or {})
+            if t1 is not None and t2 is not None:
+                dt = (t2 - t1) * 1440.0
+                if abs(dt) > T0_SHIFT_STOP_MIN:
+                    stops.append(f"pass 2 moved t0 {dt:+.0f} min from pass 1")
+            d1 = w1.get("median")
+            if d1 and depth:
+                frac = (depth - d1) / d1
+                sig = abs(depth - d1) / max(np.hypot(err, _err(w1)), 1e-9)
+                if abs(frac) > DEPTH_SHIFT_STOP_FRAC:
+                    stops.append(f"pass 2 moved the depth {frac * 100:+.0f}% from pass 1 "
+                                 f"({d1:.0f} -> {depth:.0f} ppm)")
+                elif sig > 3:
+                    notes.append(f"pass 2 depth {frac * 100:+.1f}% ({sig:.1f} sigma) from pass 1")
+            for e in f.get("scan_steps_rejected_in_transit") or []:
+                notes.append(f"in-transit scan step {e.get('amplitude_ppm') or 0:+.0f} ppm "
+                             "not fitted (no trace support)")
             rho_min = noise.get("GP_rho_min")
             if rho_min is not None and rho_min < 1.5 * GP_RHO_MIN_DAYS * 1440:
                 notes.append(f"GP rho {rho_min:.1f} min at its lower bound")
@@ -115,7 +157,10 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
                 + f"  chans={nch}")
             for e in th.get("events") or []:
                 src = e.get("sources") or [e.get("source")]
-                weak = (e.get("n_sources") or len(src)) < 2 or "trace_fwhm" not in src
+                if e.get("trace_support"):
+                    src = list(src) + [f"trace: {', '.join(e['trace_support'])}"]
+                weak = (((e.get("n_sources") or len(src)) < 2 or "trace_fwhm" not in src)
+                        and not e.get("trace_support"))
                 lines.append(
                     f"        tilt {e.get('hours_from_mid') or 0:+.2f} h "
                     f"{e.get('amplitude_ppm') or 0:+.0f} ppm"
@@ -137,6 +182,17 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
             stop = True
             lines.append("     STOP: detectors disagree on the shared geometry "
                          f"{geometry} (stale per-detector summary?)")
+    # One planet, one orbit: a/Rs and b should agree between visits.
+    names = sorted(visit_geometry)
+    for i, va in enumerate(names):
+        for vb in names[i + 1:]:
+            for k, label in ((0, "a/Rs"), (1, "b")):
+                xa, xb = visit_geometry[va][k], visit_geometry[vb][k]
+                diff = abs(_med(xa) - _med(xb))
+                sig = diff / max(np.hypot(_err(xa), _err(xb)), 1e-9)
+                if sig > GEOMETRY_SIGMA_FLAG:
+                    lines.append(f"  look: {label} differs {va} {_med(xa):.2f} vs "
+                                 f"{vb} {_med(xb):.2f} ({sig:.1f} sigma) -- one orbit")
     contam = summary.get("contamination")
     if not contam:
         lines.append("  Stage 6.5: not run")
