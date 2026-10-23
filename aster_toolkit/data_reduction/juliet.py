@@ -1158,6 +1158,8 @@ _PLOT_STYLE = {
 }
 DATA_COLOR = "#1A2F6B"      # deep navy
 BINNED_COLOR = "#0B1B45"
+RAW_COLOR = "#8E9AB3"       # slate -- unbinned integrations sit behind
+EXCLUDED_COLOR = "#C2573A"  # rust -- integrations the fit dropped
 MODEL_COLOR = "#E8A33D"     # amber -- reads strongly over dense navy points
 NRS2_COLOR = "#1B7F79"      # teal
 GAP_COLOR = "#B9C2CC"
@@ -1180,6 +1182,10 @@ def figure_title(planet: str, instrument: str = "", *, program: str = "",
     if suffix:
         parts.append(suffix)
     return "   ·   ".join(parts)
+
+
+# Display bins for the white-light figure: ~10-15 min over a typical visit.
+WHITE_PLOT_BINS = 45
 
 
 def _bin_series(x, y, n_bins: int = 90):
@@ -1242,6 +1248,7 @@ def plot_white_fit_series(
     title: str = "",
     excluded_time: np.ndarray | None = None,
     excluded_flux: np.ndarray | None = None,
+    n_bins: int | None = None,
 ) -> str:
     """White-light fit figure: systematics removed, transit model alone.
 
@@ -1258,14 +1265,15 @@ def plot_white_fit_series(
     (TOI-270 c: 7249 vs 5230 ppm).
 
     ``excluded_*`` are integrations dropped at fitted step transitions.
-    They are drawn greyed, corrected by the systematics model
-    interpolated from their neighbours, so the figure does not silently
-    hide them.
+    They are drawn as the same circles in ``EXCLUDED_COLOR``, corrected by
+    the systematics model interpolated from their neighbours, so the
+    figure does not silently hide them. They are not in the binned series.
+
+    ``n_bins`` sets the display binning (default ``WHITE_PLOT_BINS``).
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.patheffects as pe
 
     time = np.asarray(time, float)
     flux, flux_err = np.asarray(flux, float), np.asarray(flux_err, float)
@@ -1287,28 +1295,31 @@ def plot_white_fit_series(
     with plt.rc_context(_PLOT_STYLE):
         fig, (a1, a2) = plt.subplots(2, 1, figsize=(10.0, 6.4), sharex=True,
                                      height_ratios=[3, 1])
+        n_bins = n_bins or WHITE_PLOT_BINS
+        # Unbinned integrations as a slate backdrop with no error bars (the
+        # residual rms states their scatter); the binned series is the one
+        # to read. Thousands of navy points with error bars buried it.
+        raw = dict(ms=2.0, mew=0, alpha=0.75, zorder=1, rasterized=True)
+        binned = dict(fmt="o", mec="white", mew=0.8, color=BINNED_COLOR,
+                      ecolor=BINNED_COLOR, elinewidth=1.3, capsize=0, zorder=5)
+        a1.plot(t_hr, corrected, "o", color=RAW_COLOR, label="integrations",
+                **raw)
+        ex_hr = ex_corr = ex_res = None
         if excluded_time is not None and len(excluded_time):
             ex_t = np.asarray(excluded_time, float)
-            ex_sys = np.interp(ex_t, time[order], systematics[order])
-            a1.plot((ex_t - t0_fit) * 24, np.asarray(excluded_flux) - ex_sys,
-                    "x", ms=3.6, color=GAP_COLOR, alpha=0.9, zorder=1,
-                    label="excluded transition")
-        # Per-integration errors as a faint layer under more opaque
-        # markers: one alpha either buries the binned series or hides the
-        # uncertainties.
-        a1.errorbar(t_hr, corrected, yerr=flux_err, fmt="none",
-                    ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
-                    alpha=0.18, zorder=1)
-        a1.plot(t_hr, corrected, "o", ms=2.4, mew=0, color=DATA_COLOR,
-                alpha=0.38, zorder=2, label="integrations, systematics removed")
-        bx, by, be = _bin_series(t_hr, corrected)
-        a1.errorbar(bx, by, yerr=be, fmt="o", ms=5.0, mew=0,
-                    color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.2,
-                    capsize=0, alpha=0.95, zorder=3, label="binned")
-        a1.plot(grid_hr, smooth, color=MODEL_COLOR, lw=2.6, zorder=4,
-                solid_capstyle="round", label="transit model",
-                path_effects=[pe.Stroke(linewidth=4.6, foreground="white"),
-                              pe.Normal()])
+            ex_f = np.asarray(excluded_flux, float)
+            ex_hr = (ex_t - t0_fit) * 24
+            ex_corr = ex_f - np.interp(ex_t, time[order], systematics[order])
+            ex_res = (ex_f - np.interp(ex_t, time[order], model[order])) * 1e6
+            a1.plot(ex_hr, ex_corr, "o", color=EXCLUDED_COLOR,
+                    label=f"excluded at tilt step ({ex_t.size})",
+                    **{**raw, "zorder": 2, "alpha": 0.9, "ms": 2.6})
+        bx, by, be = _bin_series(t_hr, corrected, n_bins=n_bins)
+        bin_min = float(np.median(np.diff(bx))) * 60 if len(bx) > 1 else 0.0
+        a1.errorbar(bx, by, yerr=be, ms=6.0,
+                    label=f"binned ({bin_min:.0f} min)", **binned)
+        a1.plot(grid_hr, smooth, color=MODEL_COLOR, lw=1.3, zorder=4,
+                label="transit model")
         t0_obs = summary.get("t0_obs")
         if t0_obs is not None:
             offset_min = (float(t0_obs) - t0_fit) * 1440
@@ -1318,13 +1329,13 @@ def plot_white_fit_series(
                                color=MEAN_COLOR, zorder=0)
                 a1.plot([], [], ls="--", lw=1.1, color=MEAN_COLOR,
                         label=f"ephemeris mid-transit ({offset_min:+.0f} min)")
-        a1.set_ylabel("Relative flux")
+        a1.set_ylabel("Relative flux, systematics removed")
         a1.set_title(title or figure_title(
             summary.get("planet_name", ""), summary.get("instrument", ""),
             program=summary.get("program", ""), visit=summary.get("visit", ""),
             suffix="white light"), pad=12)
         a1.legend(loc="lower left", ncol=2, columnspacing=1.4,
-                  handletextpad=0.5)
+                  handletextpad=0.5, markerscale=1.5)
         note = f"depth {depth_ppm:.0f} ppm\nresidual rms {rms:.0f} ppm"
         if beta is not None and np.isfinite(beta):
             note += f"\nred-noise $\\beta$ = {beta:.2f}"
@@ -1334,16 +1345,13 @@ def plot_white_fit_series(
         a1.annotate(note, xy=(0.985, 0.06), xycoords="axes fraction",
                     ha="right", va="bottom", fontsize=10.5, color="#4E5866")
 
-        a2.errorbar(t_hr, residual * 1e6, yerr=flux_err * 1e6, fmt="none",
-                    ecolor=DATA_COLOR, elinewidth=0.5, capsize=0,
-                    alpha=0.18, zorder=1)
-        a2.plot(t_hr, residual * 1e6, "o", ms=2.4, mew=0, color=DATA_COLOR,
-                alpha=0.38, zorder=2)
-        rbx, rby, rbe = _bin_series(t_hr, residual * 1e6)
-        a2.errorbar(rbx, rby, yerr=rbe, fmt="o", ms=4.5, mew=0,
-                    color=BINNED_COLOR, ecolor=BINNED_COLOR, elinewidth=1.1,
-                    capsize=0, alpha=0.95, zorder=3)
-        a2.axhline(0, color=MODEL_COLOR, lw=1.8, zorder=2)
+        a2.plot(t_hr, residual * 1e6, "o", color=RAW_COLOR, **raw)
+        if ex_hr is not None:
+            a2.plot(ex_hr, ex_res, "o", color=EXCLUDED_COLOR,
+                    **{**raw, "zorder": 2, "alpha": 0.9, "ms": 2.6})
+        rbx, rby, rbe = _bin_series(t_hr, residual * 1e6, n_bins=n_bins)
+        a2.errorbar(rbx, rby, yerr=rbe, ms=5.0, **binned)
+        a2.axhline(0, color=MODEL_COLOR, lw=1.0, zorder=2)
         a2.set_xlabel("Time from fitted mid-transit  [h]")
         a2.set_ylabel("Residual  [ppm]")
         a2.set_ylim(-4 * rms, 4 * rms)
@@ -1360,7 +1368,8 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
     """Draw the fit figure (see ``plot_white_fit_series``) and save the
     plotted series so figures can be restyled without refitting.
 
-    ``keep`` is the fit mask; excluded integrations are drawn greyed.
+    ``keep`` is the fit mask; excluded integrations are drawn in
+    ``EXCLUDED_COLOR``.
     ``model`` is the already-evaluated full model (evaluating a GP model
     again costs a posterior-sample loop).
     """
@@ -1379,7 +1388,68 @@ def _plot_white_fit(results, lc, instrument: str, out: Path,
                np.column_stack([lc["time"][keep], flux,
                                 lc["wl_err"][keep], model]),
                delimiter=",", header="time_bjd,flux,flux_err,model",
-               comments="", fmt="%.10g")
+               # %.10g on BJD ~2.46e6 rounds time to 86 s; keep it to ~1 ms.
+               comments="", fmt=["%.8f", "%.10g", "%.10g", "%.10g"])
+
+
+def load_white_fit_series(fit_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """The plotted series of a finished white fit, for redrawing it.
+
+    Reads ``white_lightcurve_residuals.npz`` (full-precision time). The
+    series CSV is a fallback only: before 2026-10-23 it was written with
+    ``%.10g``, which rounds BJD to 86 s and misplaces ingress/egress
+    points. Integrations the fit dropped are recovered from
+    ``pass1/white_lightcurve_residuals.npz`` -- pass 1 is unmasked, holds
+    every index, and shares the raw flux -- as ``excluded_time`` /
+    ``excluded_flux`` (None when there is no pass 1 or nothing dropped).
+    """
+    fit_dir = Path(fit_dir)
+    npz_path = fit_dir / "white_lightcurve_residuals.npz"
+    csv_path = fit_dir / "white_lightcurve_series.csv"
+    out: dict[str, Any] = {"excluded_time": None, "excluded_flux": None}
+    if npz_path.is_file():
+        with np.load(npz_path) as d:
+            out.update({k: np.asarray(d[k], float)
+                        for k in ("time", "flux", "flux_err", "model")})
+            index = np.asarray(d["index"])
+        pass1 = fit_dir / "pass1" / "white_lightcurve_residuals.npz"
+        if pass1.is_file():
+            with np.load(pass1) as p:
+                drop = ~np.isin(p["index"], index)
+                if drop.any():
+                    out["excluded_time"] = np.asarray(p["time"][drop], float)
+                    out["excluded_flux"] = np.asarray(p["flux"][drop], float)
+        out["source"] = npz_path.name
+    elif csv_path.is_file():
+        d = np.genfromtxt(csv_path, delimiter=",", names=True)
+        out.update({"time": d["time_bjd"], "flux": d["flux"],
+                    "flux_err": d["flux_err"], "model": d["model"]})
+        out["source"] = csv_path.name
+    else:
+        return None
+    return out
+
+
+def replot_white_fit(fit_dir: str | os.PathLike[str],
+                     out: str | os.PathLike[str] | None = None, *,
+                     n_bins: int | None = None) -> str | None:
+    """Redraw ``white_lightcurve_fit.pdf/.svg`` for one fit dir, no refit.
+
+    Writes into ``out`` (default: in place). Returns the PDF path, or None
+    when the dir has no summary or saved series.
+    """
+    fit_dir = Path(fit_dir)
+    json_path = fit_dir / "white_fit_summary.json"
+    series = load_white_fit_series(fit_dir)
+    if series is None or not json_path.is_file():
+        return None
+    summary = json.loads(json_path.read_text())
+    out = Path(out) if out is not None else fit_dir
+    out.mkdir(parents=True, exist_ok=True)
+    return plot_white_fit_series(
+        out, summary, series["time"], series["flux"], series["flux_err"],
+        series["model"], excluded_time=series["excluded_time"],
+        excluded_flux=series["excluded_flux"], n_bins=n_bins)
 
 
 def fit_transmission_spectrum(

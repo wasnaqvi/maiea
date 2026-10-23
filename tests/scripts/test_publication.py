@@ -256,3 +256,59 @@ def test_white_fit_figure_removes_systematics(tmp_path, monkeypatch):
     np.testing.assert_allclose(corrected, transit + (flux - model))
     np.testing.assert_allclose(residual, (flux - model) * 1e6)
     assert np.std(corrected - transit) < 150e-6
+
+
+def _write_white_fit_dir(fit_dir, s, t, flux, model, index):
+    fit_dir.mkdir(parents=True, exist_ok=True)
+    (fit_dir / "white_fit_summary.json").write_text(json.dumps(s))
+    np.savez(fit_dir / "white_lightcurve_residuals.npz", index=index,
+             time=t[index], flux=flux[index], flux_err=np.full(index.size, 1e-4),
+             model=model[index])
+
+
+def test_replot_white_fit_uses_exact_times_and_keeps_excluded(tmp_path, monkeypatch):
+    """Redrawing reads the npz (exact BJD), and the integrations the final
+    fit dropped at a tilt step come back from pass 1 and are drawn."""
+    pytest.importorskip("batman.transitmodel")
+    pytest.importorskip("matplotlib")
+    from aster_toolkit.data_reduction import juliet
+    s = _white_summary()
+    t = 2460000.0 + np.linspace(99.85, 100.15, 1200)
+    s["t0_p1"] = {"median": 2460100.0}
+    s["t0_obs"] = s["t0_p1"]["median"]
+    model = juliet.transit_only_model(s, t)
+    flux = model + 100e-6 * np.random.default_rng(2).standard_normal(t.size)
+    all_idx = np.arange(t.size)
+    kept = np.setdiff1d(all_idx, np.arange(600, 609))   # 9 dropped at a step
+    fit_dir = tmp_path / "fits" / "o001" / "nrs1"
+    _write_white_fit_dir(fit_dir / "pass1", s, t, flux, model, all_idx)
+    _write_white_fit_dir(fit_dir, s, t, flux, model, kept)
+    # A %.10g CSV beside it must NOT be preferred: it rounds BJD to 86 s.
+    np.savetxt(fit_dir / "white_lightcurve_series.csv",
+               np.column_stack([t[kept], flux[kept], np.full(kept.size, 1e-4),
+                                model[kept]]),
+               delimiter=",", header="time_bjd,flux,flux_err,model",
+               comments="", fmt="%.10g")
+
+    series = juliet.load_white_fit_series(fit_dir)
+    assert series["source"] == "white_lightcurve_residuals.npz"
+    np.testing.assert_array_equal(series["time"], t[kept])
+    np.testing.assert_array_equal(series["excluded_time"], t[600:609])
+    np.testing.assert_array_equal(series["excluded_flux"], flux[600:609])
+    assert juliet.load_white_fit_series(fit_dir / "pass1")["excluded_time"] is None
+
+    seen = {}
+    real = juliet.plot_white_fit_series
+
+    def spy(out, summary, *a, **kw):
+        seen.update(kw)
+        return real(out, summary, *a, **kw)
+
+    monkeypatch.setattr(juliet, "plot_white_fit_series", spy)
+    out = tmp_path / "preview"
+    path = juliet.replot_white_fit(fit_dir, out, n_bins=30)
+    assert Path(path) == out / "white_lightcurve_fit.pdf"
+    assert (out / "white_lightcurve_fit.svg").is_file()
+    assert not (fit_dir / "white_lightcurve_fit.pdf").exists()   # preview only
+    assert seen["excluded_time"].size == 9 and seen["n_bins"] == 30
+    assert juliet.replot_white_fit(tmp_path / "missing") is None
