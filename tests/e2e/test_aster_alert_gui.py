@@ -133,8 +133,8 @@ def test_nl_email_me_on_release_day_is_delivered_by_the_gui(stack):
         subs = json.loads((gui.workspace / "mast/alert/subscriptions.json").read_text())
         assert [s["status"] for s in subs["subscriptions"]] == ["pending"]
 
-        # The GUI's notifier (checking every second here) emails once MAST
-        # reports the observation public, about 12 s from now.
+        # The GUI's notifier (looking every second here) emails when the
+        # stored release date arrives, about 12 s from now.
         assert smtp.received.wait(60), "\n".join(gui.log[-30:])
         msg = smtp.messages[-1]
         assert msg["To"] == "astro@example.org"

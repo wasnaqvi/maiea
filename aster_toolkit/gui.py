@@ -11,8 +11,9 @@ the orchestral package is modified; everything is added to its FastAPI app:
                       for AsterAlert tool calls and animate the ASTER Alert card.
 * ``GET /api/aster-alert/subscriptions``  pending release-day emails, for the
                       card's reminder bell.
-* ASTER Alert's release-day email notifier, a background thread that checks
-  MAST every ``ASTER_ALERT_CHECK_SECONDS`` (default 3600; 0 disables it).
+* ASTER Alert's release-day email notifier, a background thread that sends
+  the subscribed emails whose date has arrived, looking every
+  ``ASTER_ALERT_CHECK_SECONDS`` (default 3600; 0 disables it).
 """
 from __future__ import annotations
 

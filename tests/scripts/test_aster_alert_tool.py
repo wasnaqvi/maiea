@@ -179,6 +179,20 @@ def test_subscribe_when_everything_is_public(fake_mast, tmp_path):
     assert not alert.subscriptions_path(tmp_path).exists()
 
 
+def test_subscribe_needs_a_release_date(fake_mast, tmp_path):
+    """No date from MAST means no day to email on: refuse, store nothing."""
+    fake_mast["rows"][-1]["t_obs_release"] = None
+    out = alert.AsterAlert(base_directory=str(tmp_path)).execute(
+        action="subscribe", target="HD-12572b", email="me@example.org")
+    assert out.startswith("ASTER Alert · cannot subscribe: MAST gives no release date")
+    assert not alert.subscriptions_path(tmp_path).exists()
+
+
+def test_check_action_is_gone(tmp_path):
+    out = alert.AsterAlert(base_directory=str(tmp_path)).execute(action="check")
+    assert "Unknown action 'check'" in out
+
+
 def _pending(tmp_path, release=NOW - 0.5):
     path = alert.subscriptions_path(tmp_path)
     rec = alert.observation_record(caom("376915403", release, "EXCLUSIVE_ACCESS"), NOW - 10)
@@ -187,14 +201,21 @@ def _pending(tmp_path, release=NOW - 0.5):
     return path
 
 
-def test_deliver_sends_once_when_mast_says_public(tmp_path, monkeypatch):
-    path = _pending(tmp_path)
-    monkeypatch.setattr(alert, "fetch_observations_by_obsid", lambda ids, **k: {
-        "376915403": alert.observation_record(caom("376915403", NOW - 0.5, "PUBLIC"), NOW)})
+def _no_mast(monkeypatch):
+    """Delivery works from the stored date alone; any MAST call is a bug."""
+    for name in ("fetch_observations_by_obsid", "lookup_target", "fetch_snapshot"):
+        monkeypatch.setattr(alert, name,
+                            lambda *a, **k: pytest.fail("delivery must not query MAST"))
+
+
+def test_deliver_sends_once_when_the_release_date_arrives(tmp_path, monkeypatch):
+    _no_mast(monkeypatch)
+    path = _pending(tmp_path)                       # release half a day ago
     sent = []
     log = alert.deliver_due_subscriptions(path, now=NOW, send=lambda *m: sent.append(m))
     assert len(sent) == 1 and sent[0][0] == "me@example.org"
     assert "HIP 9618 b: JWST data is public - GO 8004" in sent[0][1]
+    assert alert.mjd_to_iso(NOW - 0.5) in sent[0][2]
     assert 'DownloadMastJwstProducts(obsids="376915403"' in sent[0][2]
     assert log and log[0].startswith("emailed me@example.org")
     assert alert.load_subscriptions(path)[0]["status"] == "sent"
@@ -202,22 +223,21 @@ def test_deliver_sends_once_when_mast_says_public(tmp_path, monkeypatch):
     assert len(sent) == 1
 
 
-def test_deliver_follows_a_moved_release_date(tmp_path, monkeypatch):
+def test_deliver_waits_for_the_release_date(tmp_path, monkeypatch):
+    _no_mast(monkeypatch)
     path = _pending(tmp_path, release=NOW + 5)
-    monkeypatch.setattr(alert, "fetch_observations_by_obsid", lambda ids, **k: {
-        "376915403": alert.observation_record(caom("376915403", NOW + 40, "EXCLUSIVE_ACCESS"), NOW)})
+    before = path.read_text()
     sent = []
-    log = alert.deliver_due_subscriptions(path, now=NOW, send=lambda *m: sent.append(m))
-    assert not sent and "release moved" in log[0]
-    sub = alert.load_subscriptions(path)[0]
-    assert sub["status"] == "pending" and sub["t_obs_release"] == NOW + 40
-    assert sub["rescheduled_from"] == alert.mjd_to_iso(NOW + 5)
+    assert alert.deliver_due_subscriptions(path, now=NOW, send=lambda *m: sent.append(m)) == []
+    assert alert.deliver_due_subscriptions(path, now=NOW + 4.99, send=lambda *m: sent.append(m)) == []
+    assert not sent and path.read_text() == before          # untouched until the day
+    assert alert.deliver_due_subscriptions(path, now=NOW + 5, send=lambda *m: sent.append(m))
+    assert len(sent) == 1 and alert.load_subscriptions(path)[0]["status"] == "sent"
 
 
-def test_deliver_retries_failed_sends_and_mast_outages(tmp_path, monkeypatch):
+def test_deliver_retries_a_failed_send(tmp_path, monkeypatch):
+    _no_mast(monkeypatch)
     path = _pending(tmp_path)
-    monkeypatch.setattr(alert, "fetch_observations_by_obsid", lambda ids, **k: {
-        "376915403": alert.observation_record(caom("376915403", NOW - 0.5, "PUBLIC"), NOW)})
 
     def boom(*_):
         raise OSError("connection refused")
@@ -226,18 +246,28 @@ def test_deliver_retries_failed_sends_and_mast_outages(tmp_path, monkeypatch):
     sub = alert.load_subscriptions(path)[0]
     assert sub["status"] == "pending" and "connection refused" in sub["last_error"]
     assert "will retry" in log[0]
-
-    def down(*a, **k):
-        raise ConnectionError("MAST down")
-
-    monkeypatch.setattr(alert, "fetch_observations_by_obsid", down)
-    assert "MAST unreachable" in alert.deliver_due_subscriptions(path, now=NOW, send=boom)[0]
+    sent = []
+    alert.deliver_due_subscriptions(path, now=NOW, send=lambda *m: sent.append(m))
+    sub = alert.load_subscriptions(path)[0]
+    assert len(sent) == 1 and sub["status"] == "sent" and "last_error" not in sub
 
 
 def test_deliver_with_no_subscriptions_touches_nothing(tmp_path, monkeypatch):
-    monkeypatch.setattr(alert, "fetch_observations_by_obsid",
-                        lambda *a, **k: pytest.fail("no network without subscriptions"))
+    _no_mast(monkeypatch)
     assert alert.deliver_due_subscriptions(alert.subscriptions_path(tmp_path)) == []
+    assert not alert.subscriptions_path(tmp_path).exists()
+
+
+def test_command_line_sends_what_is_due_and_nothing_else(tmp_path, monkeypatch, capsys):
+    _no_mast(monkeypatch)
+    _pending(tmp_path / "workspace")
+    sent = []
+    monkeypatch.setattr(alert, "send_email", lambda *m: sent.append(m))
+    monkeypatch.setattr(alert, "now_mjd", lambda: NOW)
+    assert alert.main(["--base-dir", str(tmp_path)]) == 0
+    assert len(sent) == 1 and "emailed me@example.org" in capsys.readouterr().out
+    assert alert.main(["--base-dir", str(tmp_path)]) == 0
+    assert len(sent) == 1 and "no release-day emails due" in capsys.readouterr().out
 
 
 # ---------------- real SMTP (local fake) ----------------
@@ -322,9 +352,8 @@ def test_install_serves_page_assets_and_subscriptions(tmp_path, monkeypatch):
 
 
 def test_notifier_thread_delivers_and_stops(tmp_path, monkeypatch):
-    path = _pending(tmp_path)
-    monkeypatch.setattr(alert, "fetch_observations_by_obsid", lambda ids, **k: {
-        "376915403": alert.observation_record(caom("376915403", NOW - 0.5, "PUBLIC"), NOW)})
+    _no_mast(monkeypatch)
+    path = _pending(tmp_path, release=alert.now_mjd() - 0.5)
     smtp = fake_smtp.start()
     try:
         for k, v in smtp.env().items():
