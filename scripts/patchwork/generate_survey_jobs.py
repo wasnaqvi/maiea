@@ -66,13 +66,17 @@ from aster_toolkit.data_reduction.survey import (  # noqa: E402
 SIZING: dict[str, tuple[str, str, str, str, int, str]] = {
     "TOI_1468_c": ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
     "LTT_3780_c": ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
-    "TOI_270_c":  ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
+    # TOI-270: both visits hold two transits, fitted jointly (the second
+    # planet is a "companions" entry on the visit). A second planet adds six
+    # free parameters per fit, so these get the two-visit fit walltime.
+    "TOI_270_c":  ("2:00:00", "3-18:00:00", "48G", "24G", 1,
+                   "GO 4098 o016 holds TOI-270 c + d; d fitted as a companion"),
     "TOI_1231_b": ("2:00:00", "1-21:00:00", "48G", "24G", 1, ""),
     "GJ_1214_b":  ("2:00:00", "1-21:00:00", "48G", "24G", 2,
                    "only visit o019 usable; 13430 ppm depth = easiest sanity check"),
-    "TOI_270_b":  ("2:00:00", "1-21:00:00", "48G", "24G", 4,
-                   "GO 4098 o017 contains nearly simultaneous b+d transits; "
-                   "BLOCKED until Patchwork has a two-planet light-curve model"),
+    "TOI_270_b":  ("2:00:00", "3-18:00:00", "48G", "24G", 4,
+                   "GO 4098 o017 holds TOI-270 b + d ~1.2 h apart; d fitted "
+                   "as a companion"),
     "L_98_59_d":  ("2:00:00", "1-21:00:00", "48G", "24G", 2, "below demographic"),
     "GJ_357_b":   ("3:00:00", "1-21:00:00", "48G", "24G", 2,
                    "below demographic; folder label says d, headers say b — APT check"),
@@ -214,16 +218,10 @@ def main() -> int:
         block.append(
             f"# after reduce verifies (CAMPAIGN.md checklist), submit the fit:"
         )
-        if slug == "TOI_270_b":
-            block.append(
-                "# FIT BLOCKED: o017 contains TOI-270 b and d nearly "
-                "simultaneously; a one-planet fit assigns d's transit to b."
-            )
-        else:
-            block.append(
-                f"# STEPS=fit,combine,contamination FORCE_REFIT=1 sbatch --export=ALL "
-                f"--time={fit_t} --cpus-per-task=4 --mem={fit_m}{mail} {script}"
-            )
+        block.append(
+            f"# STEPS=fit,combine,contamination FORCE_REFIT=1 sbatch --export=ALL "
+            f"--time={fit_t} --cpus-per-task=4 --mem={fit_m}{mail} {script}"
+        )
         by_wave[wave].append("\n".join(block))
 
     print(f"# Patchwork survey submission plan — {sum(len(v) for v in by_wave.values())} targets")

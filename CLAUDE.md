@@ -416,6 +416,21 @@ moving t0 > 10 min or the depth > 10% from pass 1 (it would have caught
 all five v1.6 failures); it flags a/Rs or b disagreeing > 3σ between
 visits of one planet.
 
+**Companion transits** (still v1.7: a visit without companions runs the
+same code path). When another planet of the system transits in the same
+visit, declare it on the visit in the target summary:
+`"companions": [{"planet_name": "TOI-270 d", "priors_override": {"t0": ...,
+"period": ..., "source": "..."}}]`. It becomes juliet planet 2 in the white
+and channel fits (own P, t0, a/Rs, b, per-detector depth; limb darkening
+shared, since it belongs to the star; models combined as 1 + Σ(F_i − 1)),
+its window is excluded from every out-of-transit mask, and its spectrum is
+written under `spectro/companion_<slug>/`. A visit with a known overlap
+that does not declare it refuses to fit. Check the companion ephemeris
+against the data before fitting: for TOI-270 the archive default (Kaye+22)
+is hours off and Kokori+23 / Van Eylen+21 are 30-40 min off at the 2024
+visit (TTVs); ExoFOP matches both visits. `verify_fits.py` STOPs a
+companion that is undetected or that moves between passes.
+
 `-nopca` now carries a second meaning worth knowing: no PCA components
 means no Stage 2 calints, which means no trace diagnostics, which means
 the tilt search fell back to the out-of-transit flux and could not have

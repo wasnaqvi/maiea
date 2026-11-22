@@ -2694,3 +2694,209 @@ class TestVerifyV17:
         assert stop
         text = "\n".join(lines)
         assert "moved t0 -34 min" in text and "moved the depth -51%" in text
+
+
+# -------------------- companion transits (TOI-270) --------------------
+# Both TOI-270 G395H visits hold two planets in transit at once: b + d on
+# 2023 Oct 4 and c + d on 2024 Aug 29. A visit declares its companions in
+# the target summary and they are fitted jointly as juliet planets 2+.
+
+
+def _companion(t0_obs=0.01, name="Test d"):
+    return {"planet_name": name, "t0_obs": t0_obs, "priors_source": "test",
+            "priors": {"planet_name": name, "period": 11.0, "period_err": 1e-5,
+                       "a_rs": 40.0, "a_rs_err": 0.5, "rp_rs": 0.05,
+                       "t0": t0_obs, "duration_hr": 2.0}}
+
+
+class TestCompanionOverlapGuard:
+    def test_declared_companion_lifts_the_refusal(self):
+        target = {"planet_name": "TOI-270 b", "program": "GO 4098",
+                  "visits": {"o017": {"raw_root": "/x", "visit_prefix": "jw",
+                                      "companions": [{"planet_name": "TOI-270 d"}]}}}
+        assert _known_overlapping_transits(target) == []
+
+    def test_undeclared_candidate_still_refused(self):
+        target = {"planet_name": "TOI-270 c",
+                  "visits": {"o016": {"transit_candidates": ["TOI-270 c", "TOI-270 d"]}}}
+        assert _known_overlapping_transits(target) == ["TOI-270 c", "TOI-270 d"]
+        target["visits"]["o016"]["companions"] = ["TOI-270 d"]   # bare names work
+        assert _known_overlapping_transits(target) == []
+
+
+class TestCompanionPriors:
+    def test_companion_is_planet_two_with_its_own_orbit_and_depths(self):
+        import aster_toolkit.data_reduction.juliet as J
+        p = J._joint_white_priors(_joint_priors(), 0.0, {
+            "NRS1": {"n_regressors": 1, "ld": None, "gp_time": None},
+            "NRS2": {"n_regressors": 1, "ld": None, "gp_time": None},
+        }, companions=[_companion(0.01)])
+        for key in ("P_p2", "t0_p2", "a_p2", "b_p2", "ecc_p2", "omega_p2",
+                    "p_p2_NRS1", "p_p2_NRS2"):
+            assert key in p, key
+        assert p["t0_p2"]["hyperparameters"] == [0.01, 0.01]
+        assert p["a_p2"]["hyperparameters"][0] == 40.0
+        assert p["P_p2"]["hyperparameters"][0] == 11.0
+        # One star: limb darkening is still one (q1, q2) per detector.
+        assert not any(k.startswith("q1_p") for k in p)
+        # Target priors unchanged by the companion.
+        assert p["a_p1"]["hyperparameters"][0] == 15.0
+
+    def test_companion_t0_prior_can_be_tied_to_pass_one(self):
+        import aster_toolkit.data_reduction.juliet as J
+        comp = dict(_companion(0.01), t0_prior=(0.012, 5 / 1440))
+        p = J._joint_white_priors(_joint_priors(), 0.0, {
+            "NRS1": {"n_regressors": 1, "ld": None, "gp_time": None}},
+            companions=[comp])
+        assert p["t0_p2"]["hyperparameters"] == [0.012, pytest.approx(5 / 1440)]
+
+    def test_override_wins_for_a_companion(self, monkeypatch):
+        import aster_toolkit.data_reduction.juliet as J
+        monkeypatch.setattr(J, "fetch_transit_priors", lambda name: {
+            "planet_name": name, "t0": 1.0, "period": 11.38194, "duration_hr": 2.1})
+        out = J.resolve_companion_priors({
+            "planet_name": "TOI-270 d",
+            "priors_override": {"t0": 2.0, "period": 11.3797, "source": "ExoFOP"}})
+        assert out["priors"]["t0"] == 2.0 and out["priors"]["period"] == 11.3797
+        assert out["priors"]["duration_hr"] == 2.1
+        assert out["priors_source"] == "archive+override(period,t0) [ExoFOP]"
+
+
+class TestCompanionWindows:
+    def test_out_of_transit_means_outside_every_transit(self):
+        import aster_toolkit.data_reduction.juliet as J
+        t = np.linspace(-0.2, 0.2, 401)
+        one = J.out_of_transits_mask(t, (0.0, 0.06))
+        assert np.array_equal(one, J.out_of_transit_mask(t, 0.0, 0.06))
+        both = J.out_of_transits_mask(t, [(0.0, 0.06), (0.1, 0.08)])
+        assert np.array_equal(both, one & J.out_of_transit_mask(t, 0.1, 0.08))
+        assert both.sum() < one.sum()
+
+    def test_summary_windows_include_companions(self):
+        import aster_toolkit.data_reduction.juliet as J
+        s = {"P_p1": {"median": 5.0}, "a_p1": {"median": 15.0},
+             "b_p1": {"median": 0.3}, "p_p1": {"median": 0.03}, "t0_p1": {"median": 0.0},
+             "companions": [{"P": {"median": 11.0}, "a": {"median": 40.0},
+                             "b": {"median": 0.2}, "p": {"median": 0.05},
+                             "t0": {"median": 0.02}}]}
+        w = J.transit_windows_from_summary(s)
+        assert len(w) == 2 and w[1][0] == 0.02
+        assert w[1][1] == pytest.approx(J.transit_duration_days(11.0, 40.0, 0.2, 0.05))
+
+    def test_lightcurve_baseline_excludes_the_companion(self):
+        spectra = synthetic_spectra()
+        base = build_lightcurves(spectra, detector="NRS1", t0_ref=T0_REF,
+                                 period=PERIOD, duration_hr=DUR_HR)
+        tc = float(np.median(spectra["time"])) + 1.5 / 24
+        lc = build_lightcurves(spectra, detector="NRS1", t0_ref=T0_REF,
+                               period=PERIOD, duration_hr=DUR_HR,
+                               companion_transits=[{"t0_ref": tc, "period": 50.0,
+                                                    "duration_hr": 1.0}])
+        assert lc["companion_t0_obs"] == [pytest.approx(tc)]
+        near = np.abs(spectra["time"] - tc) < 0.5 / 24
+        assert base["oot_mask"][near].all() and not lc["oot_mask"][near].any()
+        assert base["companion_t0_obs"] == []
+
+    def test_transit_model_sums_the_deficits(self):
+        import aster_toolkit.data_reduction.juliet as J
+        J._import_juliet()
+        t = np.linspace(-0.1, 0.1, 500)
+        s = {"P_p1": {"median": 5.0}, "a_p1": {"median": 15.0}, "b_p1": {"median": 0.3},
+             "p_p1": {"median": 0.03}, "t0_p1": {"median": 0.0},
+             "q1_NRS1": {"median": 0.1}, "q2_NRS1": {"median": 0.3}}
+        alone = J.transit_only_model(s, t, "NRS1")
+        comp = {"P": {"median": 11.0}, "a": {"median": 40.0}, "b": {"median": 0.2},
+                "p": {"median": 0.05}, "t0": {"median": 0.02}}
+        other = J.transit_only_model(
+            {**s, "P_p1": comp["P"], "a_p1": comp["a"], "b_p1": comp["b"],
+             "p_p1": comp["p"], "t0_p1": comp["t0"]}, t, "NRS1")
+        both = J.transit_only_model({**s, "companions": [comp]}, t, "NRS1")
+        assert both == pytest.approx(alone + other - 1.0)
+
+
+class TestCompanionWhiteFitPlumbing:
+    def test_companion_reaches_juliet_and_both_summaries(self, monkeypatch, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        fake = _FakeJuliet()
+        monkeypatch.setattr(J, "_import_juliet", lambda: fake)
+        monkeypatch.setattr(J, "_require_celerite", lambda: None)
+        monkeypatch.setattr(J, "_plot_white_fit", lambda *a, **k: None)
+        lcs = _synthetic_joint_lcs()
+        regs = {d: lcs[d]["time"][:, None] for d in lcs}
+        out = J.fit_white_lightcurve_joint(
+            lcs, _joint_priors(), {d: tmp_path / d.lower() for d in lcs},
+            joint_dir=tmp_path / "joint", regressors=regs,
+            regressor_names={d: ["pca_1"] for d in lcs}, gp=False,
+            anomaly_scan={"events": []}, companions=[_companion(0.01)])
+        call = fake.calls[0]["priors"]
+        assert {"t0_p2", "p_p2_NRS1", "p_p2_NRS2"} <= set(call)
+        for det in lcs:
+            (c,) = out[det]["companions"]
+            assert c["planet_name"] == "Test d" and c["index"] == 2
+            assert c["t0_prior"]["source"] == "ephemeris"
+            assert {"P", "t0", "a", "b", "p", "depth_ppm", "depth_check"} <= set(c)
+        assert out["NRS1"]["companions"][0]["t0"] == out["NRS2"]["companions"][0]["t0"]
+        assert out["NRS1"]["joint_fit"]["companions"] == ["Test d"]
+        joint = json.loads((tmp_path / "joint" / "joint_white_fit_summary.json").read_text())
+        assert set(joint["companions"][0]["depth_ppm"]) == {"NRS1", "NRS2"}
+
+    def test_channels_fit_the_companion_and_write_its_spectrum(self, monkeypatch, tmp_path):
+        import aster_toolkit.data_reduction.juliet as J
+        fake = _FakeJuliet()
+        monkeypatch.setattr(J, "_import_juliet", lambda: fake)
+        lc = _synthetic_joint_lcs()["NRS1"]
+        n = lc["time"].size
+        lc.update(wave=np.array([3.0, 3.5]), wave_err=np.array([0.01, 0.01]),
+                  sp_flux=np.column_stack([lc["wl_flux"]] * 2),
+                  sp_err=np.column_stack([lc["wl_err"]] * 2))
+        comp = {"planet_name": "Test d", "index": 2, "P": {"median": 11.0},
+                "t0": {"median": 0.03}, "a": {"median": 40.0}, "b": {"median": 0.2},
+                "p": {"median": 0.05}}
+        white = {"P_p1": {"median": 5.0}, "t0_p1": {"median": 0.0},
+                 "b_p1": {"median": 0.3}, "a_p1": {"median": 15.0},
+                 "p_p1": {"median": 0.03}, "planet_name": "Test b",
+                 "ld_source": "uniform", "fit_version": J.PATCHWORK_FIT_VERSION,
+                 "noise_model": {"kind": "white"}, "regressor_names": ["time"],
+                 "companions": [comp]}
+        out = J.fit_transmission_spectrum(lc, white, tmp_path, instrument="NRS1",
+                                          regressors=np.ones((n, 1)))
+        for call in fake.calls:
+            pr = call["priors"]
+            assert pr["t0_p2"] == {"distribution": "fixed", "hyperparameters": 0.03}
+            assert pr["b_p2"]["distribution"] == "fixed"
+            assert pr["p_p2"]["distribution"] == "uniform"
+        (cp,) = out["companions"]
+        assert cp["planet_name"] == "Test d" and cp["n_bins"] == 2
+        from pathlib import Path
+        assert Path(cp["spectrum_csv"]).parent.name == "companion_Test_d"
+        assert Path(cp["spectrum_path"]).read_text().count("\n") == 4
+        assert out["n_bins"] == 2
+
+
+class TestVerifyCompanions:
+    _summary = TestVerifyV17._summary
+    _check = TestVerifyV17._check
+
+    def _with_companion(self, **comp):
+        c = {"planet_name": "TOI-270 d",
+             "white_depth_ppm": {"median": 3000.0, "plus": 20.0, "minus": 20.0},
+             "white_depth_ppm_pass1": {"median": 3010.0, "plus": 20.0, "minus": 20.0},
+             "t0": {"median": 100.002}, "t0_pass1": {"median": 100.002},
+             "depth_check": {"status": "indicative", "band": "cross-band"},
+             "n_channels": 26, "priors_source": "archive+override(t0) [ExoFOP]"}
+        c.update(comp)
+        return self._summary(companions=[c])
+
+    def test_a_detected_steady_companion_passes(self):
+        lines, stop = self._check(self._with_companion())
+        assert not stop, lines
+        assert any("companion TOI-270 d: 3000" in ln for ln in lines)
+
+    def test_an_undetected_companion_is_a_stop(self):
+        lines, stop = self._check(self._with_companion(
+            white_depth_ppm={"median": 40.0, "plus": 60.0, "minus": 40.0}))
+        assert stop and "not detected" in "\n".join(lines)
+
+    def test_a_companion_sliding_between_passes_is_a_stop(self):
+        lines, stop = self._check(self._with_companion(t0={"median": 100.002 + 20 / 1440}))
+        assert stop and "companion TOI-270 d t0 +20 min" in "\n".join(lines)

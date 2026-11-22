@@ -239,12 +239,20 @@ def build_lightcurves(
     n_bins: int | None = None,
     wave_min: float | None = None,
     wave_max: float | None = None,
+    companion_transits: list[dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """Stage 4: white + spectroscopic lightcurves for one visit x detector.
 
     Normalization is by the median of the out-of-transit baseline. The
     mask comes from the propagated ephemeris + literature duration when
     available, else from ``baseline_ints``; one of the two must be given.
+
+    ``companion_transits`` (``{"t0_ref", "period", "duration_hr"}`` each)
+    are other planets transiting in the same visit. Their predicted
+    windows are taken out of the out-of-transit mask too, so neither the
+    normalization nor the flux tilt search treats a companion's transit
+    as baseline. Their propagated mid-transits are returned as
+    ``companion_t0_obs``.
     """
     wave = spectra["wave"][N_REFPIX_COLS:-N_REFPIX_COLS]
     wave_err = spectra["wave_err"][N_REFPIX_COLS:-N_REFPIX_COLS]
@@ -270,6 +278,11 @@ def build_lightcurves(
         oot = oot_mask_from_baseline(time.size, baseline_ints)
     else:
         raise ValueError("Need duration_hr or baseline_ints for the OOT mask.")
+    companion_t0_obs = []
+    for comp in companion_transits or ():
+        tc = propagate_t0(float(comp["t0_ref"]), float(comp["period"]), time)
+        companion_t0_obs.append(tc)
+        oot &= oot_mask_from_ephemeris(time, tc, float(comp["duration_hr"]))
     if oot.sum() < 10:
         raise ValueError(
             f"Only {oot.sum()} out-of-transit integrations — check the "
@@ -331,6 +344,7 @@ def build_lightcurves(
         "sp_err": sp_err,
         "oot_scatter_ppm": float(np.nanstd(wl_flux[oot]) * 1e6),
         "stage4_version": PATCHWORK_STAGE4_VERSION,
+        "companion_t0_obs": companion_t0_obs,
     }
 
 

@@ -278,6 +278,47 @@ def out_of_transit_mask(time: np.ndarray, t0: float, t14: float,
     return np.abs(np.asarray(time, dtype=float) - float(t0)) > 0.5 * float(t14) + margin
 
 
+def companion_windows_from_summary(summary: dict[str, Any]) -> list[tuple[float, float]]:
+    """(t0, T14) of every companion transit a white-fit summary carries.
+
+    A companion that does not transit at its fitted geometry contributes
+    no window rather than failing the visit; its depth then tells the
+    story (verify_fits flags a companion consistent with zero)."""
+    windows = []
+    for comp in summary.get("companions") or []:
+        med = lambda key: float(comp[key]["median"])  # noqa: E731
+        t14 = transit_duration_days(med("P"), med("a"), med("b"), med("p"))
+        if np.isfinite(t14):
+            windows.append((med("t0"), t14))
+    return windows
+
+
+def transit_windows_from_summary(summary: dict[str, Any]) -> list[tuple[float, float]]:
+    """(t0, T14) of the target transit, then of every companion transit."""
+    return [transit_window_from_summary(summary)] + companion_windows_from_summary(summary)
+
+
+def out_of_transits_mask(time: np.ndarray,
+                         windows: tuple[float, float] | list[tuple[float, float]],
+                         margin: float = OOT_MARGIN_DAYS) -> np.ndarray:
+    """``out_of_transit_mask`` for every transit in ``windows`` at once:
+    out of transit means outside ALL of them. A single (t0, T14) tuple is
+    accepted too, so single-planet callers need not change."""
+    windows = _as_windows(windows)
+    oot = np.ones(np.asarray(time).shape, dtype=bool)
+    for t0, t14 in windows:
+        oot &= out_of_transit_mask(time, t0, t14, margin)
+    return oot
+
+
+def _as_windows(windows) -> list[tuple[float, float]]:
+    if windows is None:
+        return []
+    if (len(windows) == 2 and not hasattr(windows[0], "__len__")):
+        return [(float(windows[0]), float(windows[1]))]
+    return [(float(w[0]), float(w[1])) for w in windows]
+
+
 def train_gp_out_of_transit(
     time: np.ndarray,
     flux: np.ndarray,
@@ -733,34 +774,38 @@ def _white_priors(
 
 
 def _orbit_priors(priors: dict[str, Any], t0_obs: float,
-                  t0_prior: tuple[float, float] | None = None) -> dict[str, dict[str, Any]]:
+                  t0_prior: tuple[float, float] | None = None,
+                  *, index: int = 1) -> dict[str, dict[str, Any]]:
     """P, t0, b, a/Rs (+ circular orbit): the geometry of one transit.
 
     ``t0_prior`` = (centre, sigma) replaces the ephemeris-propagated t0
-    prior; pass 2 centres it on the pass-1 mid-transit (v1.7)."""
+    prior; pass 2 centres it on the pass-1 mid-transit (v1.7).
+    ``index`` is juliet's planet number: 1 for the target, 2+ for a
+    companion transiting in the same visit (see fit_white_lightcurve_joint)."""
     period = priors["period"]
     if period is None:
         raise ValueError("No orbital period available from the archive.")
+    k = f"_p{int(index)}"
 
     p: dict[str, dict[str, Any]] = {
-        "P_p1": {
+        f"P{k}": {
             "distribution": "normal",
-            "hyperparameters": [period, max(priors["period_err"] or 0, 1e-5) * 3],
+            "hyperparameters": [period, max(priors.get("period_err") or 0, 1e-5) * 3],
         },
         # t0 propagated to this visit; 0.01 d Gaussian (validated run).
-        "t0_p1": {"distribution": "normal",
-                  "hyperparameters": ([float(t0_prior[0]), float(t0_prior[1])]
-                                      if t0_prior is not None else [t0_obs, 0.01])},
-        "b_p1": {"distribution": "uniform", "hyperparameters": [0.0, 1.0]},
-        "ecc_p1": {"distribution": "fixed", "hyperparameters": 0.0},
-        "omega_p1": {"distribution": "fixed", "hyperparameters": 90.0},
+        f"t0{k}": {"distribution": "normal",
+                   "hyperparameters": ([float(t0_prior[0]), float(t0_prior[1])]
+                                       if t0_prior is not None else [t0_obs, 0.01])},
+        f"b{k}": {"distribution": "uniform", "hyperparameters": [0.0, 1.0]},
+        f"ecc{k}": {"distribution": "fixed", "hyperparameters": 0.0},
+        f"omega{k}": {"distribution": "fixed", "hyperparameters": 90.0},
     }
-    a_rs = priors["a_rs"]
+    a_rs = priors.get("a_rs")
     if a_rs is not None:
-        err = priors["a_rs_err"] or 0.1 * a_rs
-        p["a_p1"] = {"distribution": "normal", "hyperparameters": [a_rs, 3 * err]}
+        err = priors.get("a_rs_err") or 0.1 * a_rs
+        p[f"a{k}"] = {"distribution": "normal", "hyperparameters": [a_rs, 3 * err]}
     else:
-        p["a_p1"] = {"distribution": "uniform", "hyperparameters": [1.0, 300.0]}
+        p[f"a{k}"] = {"distribution": "uniform", "hyperparameters": [1.0, 300.0]}
     return p
 
 
@@ -793,6 +838,7 @@ def _joint_white_priors(
     t0_obs: float,
     detectors: dict[str, dict[str, Any]],
     t0_prior: tuple[float, float] | None = None,
+    companions: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Priors for one white-light fit of every detector in ``detectors``.
 
@@ -801,10 +847,20 @@ def _joint_white_priors(
     trained hyperparameters, None = sampled). The orbit
     (JOINT_SHARED_PARAMS) is one set of parameters; the depth is
     ``p_p1_<det>`` per detector.
+
+    ``companions`` (``{"priors", "t0_obs", "t0_prior"}`` each) adds planets
+    2, 3, ... with their own orbit and a per-detector depth ``p_p<k>_<det>``.
+    Limb darkening stays one (q1, q2) per detector: it is the star's.
     """
     p = _orbit_priors(priors, t0_obs, t0_prior)
+    for k, comp in enumerate(companions or (), start=2):
+        p.update(_orbit_priors(comp["priors"], comp["t0_obs"], comp.get("t0_prior"),
+                               index=k))
     for det, spec in detectors.items():
         p[f"p_p1_{det}"] = {"distribution": "uniform", "hyperparameters": [0.0, 0.3]}
+        for k in range(2, 2 + len(companions or ())):
+            p[f"p_p{k}_{det}"] = {"distribution": "uniform",
+                                  "hyperparameters": [0.0, 0.3]}
         p.update(_ld_prior_entries(det, spec.get("ld")))
         p.update(_common_instrument_priors(det, int(spec["n_regressors"])))
         if spec.get("gp_time") is not None:
@@ -996,8 +1052,9 @@ def fit_white_lightcurve_joint(
     tilt_reports: dict[str, dict[str, Any] | None] | None = None,
     n_spot_masked: dict[str, int] | None = None,
     n_tilt_masked: dict[str, int] | None = None,
-    gp_train_window: tuple[float, float] | None = None,
+    gp_train_window: tuple[float, float] | list[tuple[float, float]] | None = None,
     t0_prior: tuple[float, float] | None = None,
+    companions: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Fit one visit's white light on every detector at once (fit v1.6+).
 
@@ -1021,6 +1078,17 @@ def fit_white_lightcurve_joint(
 
     ``t0_prior`` = (centre, sigma) in days overrides the ephemeris t0
     prior (pass 2 centres it on pass 1).
+
+    ``companions`` models other planets of the system transiting in the
+    same visit (TOI-270: b + d on 2023 Oct 4, c + d on 2024 Aug 29). Each
+    entry is ``{"planet_name", "priors", "t0_obs", "t0_prior"}`` with
+    ``priors`` shaped like fetch_transit_priors and ``t0_obs`` its
+    propagated mid-transit; it becomes juliet planet 2, 3, ... with its
+    own P, t0, a/Rs, b and a per-detector depth. Fitting such a visit with
+    the target alone hands the companion's transit to the target's depth,
+    baseline and regressors (TOI-270 c v1.7: pass 2 32-34% below pass 1).
+    ``gp_train_window`` may then be a list of (t0, T14), one per transit,
+    and out of transit means outside all of them.
 
     Returns ``{det: summary}``.
     """
@@ -1073,9 +1141,10 @@ def fit_white_lightcurve_joint(
     gp_origin = t0_obs
     gp_fixed: dict[str, dict[str, Any] | None] = {det: None for det in dets}
     gp_untrained = None
+    companions = list(companions or [])
     if gp:
         for det in dets:
-            oot = (out_of_transit_mask(times[det], *gp_train_window)
+            oot = (out_of_transits_mask(times[det], gp_train_window)
                    if gp_train_window is not None
                    else np.asarray(lcs[det]["oot_mask"], dtype=bool))
             k = keeps[det]
@@ -1097,7 +1166,7 @@ def fit_white_lightcurve_joint(
               "gp_time": times[det][keeps[det]] if gp else None,
               "gp_fixed": gp_fixed[det]}
         for det in dets
-    }, t0_prior=t0_prior)
+    }, t0_prior=t0_prior, companions=companions)
     dataset = juliet.load(
         priors=prior_dict,
         t_lc={d: times[d][keeps[d]] for d in dets},
@@ -1116,6 +1185,8 @@ def fit_white_lightcurve_joint(
         "shared": list(JOINT_SHARED_PARAMS),
         "joint_dir": str(jdir),
     }
+    if companions:
+        joint_record["companions"] = [c["planet_name"] for c in companions]
     summaries: dict[str, dict[str, Any]] = {}
     for det in dets:
         summaries[det] = _summarize_white_detector(
@@ -1129,7 +1200,7 @@ def fit_white_lightcurve_joint(
             n_spot_masked=int(n_spot_masked.get(det, 0)),
             n_tilt_masked=int(n_tilt_masked.get(det, 0)),
             gp_training=gp_fixed[det], gp_untrained=gp_untrained,
-            t0_prior=t0_prior,
+            t0_prior=t0_prior, companions=companions,
         )
     if len(dets) > 1:
         shared = {k: summaries[dets[0]][k] for k in JOINT_SHARED_PARAMS
@@ -1137,7 +1208,16 @@ def fit_white_lightcurve_joint(
         with (jdir / "joint_white_fit_summary.json").open("w") as handle:
             json.dump({"fit_version": summaries[dets[0]]["fit_version"],
                        "detectors": dets, "shared": shared,
-                       "depth_ppm": {d: summaries[d]["depth_ppm"] for d in dets}},
+                       "depth_ppm": {d: summaries[d]["depth_ppm"] for d in dets},
+                       **({"companions": [
+                           {"planet_name": c["planet_name"],
+                            "index": c["index"],
+                            **{k: c[k] for k in ("P", "t0", "a", "b")},
+                            "depth_ppm": {d: next(x for x in summaries[d]["companions"]
+                                                  if x["index"] == c["index"])["depth_ppm"]
+                                          for d in dets}}
+                           for c in summaries[dets[0]]["companions"]]}
+                          if companions else {})},
                       handle, indent=2)
     return summaries
 
@@ -1166,6 +1246,7 @@ def _summarize_white_detector(
     gp_training: dict[str, Any] | None = None,
     gp_untrained: str | None = None,
     t0_prior: tuple[float, float] | None = None,
+    companions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One detector's white-fit summary, residuals and figure from a
     (possibly joint) juliet result. Same layout as every fit before v1.6,
@@ -1277,6 +1358,35 @@ def _summarize_white_detector(
     d = np.percentile(posterior[p_key] ** 2, [50, 16, 84]) * 1e6
     summary["depth_ppm"] = {"median": float(d[0]),
                             "minus": float(d[0] - d[1]), "plus": float(d[2] - d[0])}
+    # Companion planets transiting in the same visit (juliet planets 2+).
+    # Recorded in full -- geometry, depth, the prior it started from and its
+    # own depth check -- because the channels freeze the geometry from here
+    # and the companion's spectrum is a product in its own right.
+    summary["companions"] = []
+    for k, comp in enumerate(companions or (), start=2):
+        pk = f"p_p{k}_{instrument}" if f"p_p{k}_{instrument}" in posterior else f"p_p{k}"
+        dk = np.percentile(posterior[pk] ** 2, [50, 16, 84]) * 1e6
+        entry = {
+            "planet_name": comp["planet_name"],
+            "index": k,
+            **{name: _posterior_stat(posterior[f"{name}_p{k}"])
+               for name in ("P", "t0", "a", "b")},
+            "p": _posterior_stat(posterior[pk]),
+            "depth_ppm": {"median": float(dk[0]), "minus": float(dk[0] - dk[1]),
+                          "plus": float(dk[2] - dk[0])},
+            "t0_obs": float(comp["t0_obs"]),
+            "t0_prior": ({"centre": float(comp["t0_prior"][0]),
+                          "sigma_min": float(comp["t0_prior"][1]) * 1440.0,
+                          "source": "pass 1"} if comp.get("t0_prior") is not None
+                         else {"centre": float(comp["t0_obs"]), "sigma_min": 0.01 * 1440.0,
+                               "source": "ephemeris"}),
+            "priors_source": comp.get("priors_source"),
+        }
+        entry["depth_check"] = evaluate_depth_check(
+            entry["depth_ppm"]["median"],
+            max(entry["depth_ppm"]["plus"], entry["depth_ppm"]["minus"]),
+            comp["priors"], planet_name=comp["planet_name"])
+        summary["companions"].append(entry)
     if gp:
         summary["noise_model"].update({
             "GP_sigma_ppm": summary[f"GP_sigma_{instrument}"]["median"] * 1e6,
@@ -1462,21 +1572,32 @@ def transit_only_model(summary: dict[str, Any], time: np.ndarray,
     fitted at all. This is the batman light curve juliet evaluates
     inside that model (quadratic law, Kipping q1/q2, circular orbit),
     normalised to 1 out of transit.
+
+    Companion transits in the same visit (``summary["companions"]``) are
+    included, summed the way juliet sums them (1 + sum of each planet's
+    deficit), so the drawn model is the one that was fitted.
     """
     from batman.transitmodel import TransitModel, TransitParams
 
     inst = instrument or summary.get("instrument", "")
     med = lambda key: float(summary[key]["median"])  # noqa: E731
     q1, q2 = med(f"q1_{inst}"), med(f"q2_{inst}")
-    params = TransitParams()
-    params.t0, params.per = med("t0_p1"), med("P_p1")
-    params.rp, params.a = med("p_p1"), med("a_p1")
-    params.inc = float(np.degrees(np.arccos(med("b_p1") / med("a_p1"))))
-    params.ecc, params.w = 0.0, 90.0
-    params.limb_dark = "quadratic"
-    params.u = [2 * np.sqrt(q1) * q2, np.sqrt(q1) * (1 - 2 * q2)]
     time = np.asarray(time, dtype=float)
-    return TransitModel(params, time).light_curve(params)
+
+    def _one(t0, per, rp, a, b):
+        params = TransitParams()
+        params.t0, params.per, params.rp, params.a = t0, per, rp, a
+        params.inc = float(np.degrees(np.arccos(b / a)))
+        params.ecc, params.w = 0.0, 90.0
+        params.limb_dark = "quadratic"
+        params.u = [2 * np.sqrt(q1) * q2, np.sqrt(q1) * (1 - 2 * q2)]
+        return TransitModel(params, time).light_curve(params)
+
+    flux = _one(med("t0_p1"), med("P_p1"), med("p_p1"), med("a_p1"), med("b_p1"))
+    for comp in summary.get("companions") or []:
+        c = lambda key: float(comp[key]["median"])  # noqa: E731
+        flux = flux + _one(c("t0"), c("P"), c("p"), c("a"), c("b")) - 1.0
+    return flux
 
 
 def plot_white_fit_series(
@@ -1722,6 +1843,11 @@ def fit_transmission_spectrum(
     Writes ``transmission_spectrum.csv`` (ppm, with per-channel residual
     rms) and ``transmission_spectrum.dat`` (fractional depth, TauREx
     input format).
+
+    A white fit with companions (``white_summary["companions"]``) fits
+    them in every channel too: geometry frozen to the white posterior
+    like the target's, depth free per channel. Each companion's spectrum
+    is written beside the target's, under ``companion_<planet slug>/``.
     """
     juliet = _import_juliet()
 
@@ -1738,6 +1864,13 @@ def fit_transmission_spectrum(
         "b_p1": white_summary["b_p1"]["median"],
         "a_p1": white_summary["a_p1"]["median"],
     }
+    companions = list(white_summary.get("companions") or [])
+    for comp in companions:
+        k = int(comp["index"])
+        fixed.update({f"{name}_p{k}": float(comp[name]["median"])
+                      for name in ("P", "t0", "b", "a")})
+        fixed.update({f"ecc_p{k}": 0.0, f"omega_p{k}": 90.0})
+    comp_rows: dict[int, list[dict[str, float]]] = {int(c["index"]): [] for c in companions}
 
     # v1.6: a white fit with a GP passes it on. The timescale is a
     # property of the visit's systematics, not of the channel, so it is
@@ -1785,7 +1918,7 @@ def fit_transmission_spectrum(
     # Out of transit by the white fit's own geometry where it carries one;
     # the ephemeris mask only for summaries that predate p_p1/a_p1.
     try:
-        oot = out_of_transit_mask(times, *transit_window_from_summary(white_summary))
+        oot = out_of_transits_mask(times, transit_windows_from_summary(white_summary))
     except (KeyError, TypeError, ValueError):
         oot = np.asarray(lc["oot_mask"], dtype=bool)
 
@@ -1808,6 +1941,9 @@ def fit_transmission_spectrum(
             "omega_p1": {"distribution": "fixed", "hyperparameters": 90.0},
             "p_p1": {"distribution": "uniform", "hyperparameters": [0.0, 0.3]},
         })
+        for k in comp_rows:
+            prior_dict[f"p_p{k}"] = {"distribution": "uniform",
+                                     "hyperparameters": [0.0, 0.3]}
         if fix_ld and ld is not None:
             prior_dict.update({
                 f"q1_{instrument}": {"distribution": "fixed",
@@ -1851,6 +1987,12 @@ def fit_transmission_spectrum(
         })
         if channel_gp is not None:
             rows[-1]["gp_sigma_ppm"] = channel_gp["GP_sigma"] * 1e6
+        for k, crow in comp_rows.items():
+            cd = np.percentile(results.posteriors["posterior_samples"][f"p_p{k}"] ** 2,
+                               [50, 16, 84])
+            crow.append({"wave": rows[-1]["wave"], "wave_err": rows[-1]["wave_err"],
+                         "depth": float(cd[0]), "depth_err": float(0.5 * (cd[2] - cd[1])),
+                         "rms_ppm": rows[-1]["rms_ppm"]})
 
     csv_path = out / "transmission_spectrum.csv"
     # Stamp the version the WHITE fit carries, not the module constant:
@@ -1887,7 +2029,41 @@ def fit_transmission_spectrum(
                    planet=white_summary.get("planet_name", ""),
                    program=program or white_summary.get("program", ""),
                    visit=visit or white_summary.get("visit", ""))
+
+    companion_products = []
+    for comp in companions:
+        k = int(comp["index"])
+        cname = comp["planet_name"]
+        cdir = out / f"companion_{cname.replace(' ', '_').replace('-', '_')}"
+        cdir.mkdir(parents=True, exist_ok=True)
+        ccsv = cdir / "transmission_spectrum.csv"
+        write_spectrum_csv(ccsv, comp_rows[k], header=(
+            f"Patchwork juliet fit v{fit_version}, instrument={instrument}, "
+            f"companion {cname} (juliet planet {k}) fitted jointly with "
+            f"{white_summary.get('planet_name', '')}; geometry frozen to the joint "
+            f"white fit, masked_integrations={int((~keep).sum())}"))
+        cdat = cdir / "transmission_spectrum.dat"
+        with cdat.open("w") as handle:
+            handle.write(
+                "# wavelength_um  transit_depth  depth_err  bin_width_um\n"
+                f"# Patchwork juliet fit v{fit_version}, instrument={instrument}, "
+                f"companion {cname} fitted jointly with "
+                f"{white_summary.get('planet_name', '')}\n")
+            for r in comp_rows[k]:
+                handle.write(f"{r['wave']:.6f}  {r['depth']:.8f}  "
+                             f"{r['depth_err']:.8f}  {2*r['wave_err']:.6f}\n")
+        _plot_spectrum(comp_rows[k], cdir, instrument, planet=cname,
+                       program=program or white_summary.get("program", ""),
+                       visit=visit or white_summary.get("visit", ""))
+        companion_products.append({
+            "planet_name": cname, "index": k,
+            "spectrum_csv": str(ccsv), "spectrum_path": str(cdat),
+            "n_bins": len(comp_rows[k]),
+            "median_depth_err_ppm": (float(np.nanmedian(
+                [r["depth_err"] for r in comp_rows[k]]) * 1e6) if comp_rows[k] else None)})
+
     return {"spectrum_csv": str(csv_path), "spectrum_path": str(dat_path),
+            "companions": companion_products,
             "n_bins": len(rows), "rows": rows,
             "ld_fixed_per_channel": fix_ld,
             "impact_parameter": (float(b_white) if b_white is not None else None),
@@ -2143,6 +2319,7 @@ def prepare_visit_fit_inputs(
     priors_override: dict[str, Any] | None = None,
     pca_detrending: bool = True,
     anomaly_report: str | os.PathLike[str] | None = None,
+    companions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Shared Stage 4 -> Stage 5 preparation: archive priors, lightcurves,
     trace diagnostics, tilt events, regressor matrix, white-band LD.
@@ -2180,6 +2357,13 @@ def prepare_visit_fit_inputs(
     white and the spectroscopic fits, and the scan payload is carried
     through so the fit summary records what was masked. Without it the
     fit is stamped "-noscan".
+
+    ``companions`` lists other planets transiting in this visit, as the
+    target summary declares them: ``{"planet_name", "priors_override",
+    "priors"}`` (``priors`` the offline cache). Each is resolved the same
+    way as the target (archive, else cache, then the override on top) and
+    returned under ``companions`` ready for fit_white_lightcurve_joint,
+    with its propagated mid-transit as ``t0_obs``.
     """
     priors_source = "archive"
     try:
@@ -2198,6 +2382,7 @@ def prepare_visit_fit_inputs(
         priors = dict(priors)
         priors.update({k: priors_override[k] for k in override_used})
         priors_source = f"{priors_source}+override({','.join(override_used)})"
+    companion_priors = [resolve_companion_priors(c) for c in (companions or ())]
     spectra = load_stage3_spectra(spectra_path)
     lc = build_lightcurves(
         spectra,
@@ -2209,7 +2394,20 @@ def prepare_visit_fit_inputs(
         n_bins=n_bins,
         wave_min=wave_min,
         wave_max=wave_max,
+        companion_transits=[{"t0_ref": c["priors"]["t0"], "period": c["priors"]["period"],
+                             "duration_hr": c["priors"]["duration_hr"]}
+                            for c in companion_priors],
     )
+    for c, tc in zip(companion_priors, lc["companion_t0_obs"]):
+        c["t0_obs"] = float(tc)
+        span = (float(np.nanmin(lc["time"])), float(np.nanmax(lc["time"])))
+        half = 0.5 * float(c["priors"]["duration_hr"]) / 24.0
+        if tc + half < span[0] or tc - half > span[1]:
+            raise ValueError(
+                f"Companion {c['planet_name']}: predicted mid-transit {tc:.5f} BJD "
+                f"is outside this visit ({span[0]:.5f}-{span[1]:.5f}). A companion "
+                "the data do not contain cannot be fitted -- check its ephemeris "
+                f"(priors source: {c['priors_source']}) or drop it from the visit.")
 
     diagnostics = None
     pca = None
@@ -2278,6 +2476,7 @@ def prepare_visit_fit_inputs(
 
     return {"priors": priors, "priors_source": priors_source,
             "priors_override_used": override_used, "lc": lc,
+            "companions": companion_priors,
             "regressors": regressors, "regressor_names": regressor_names,
             "tilt_events": tilt_events, "tilt_report": tilt_report,
             "tilt_keep_mask": tilt_keep,
@@ -2296,6 +2495,40 @@ def prepare_visit_fit_inputs(
             "keep_mask": keep_mask, "anomaly_scan": scan,
             "n_spot_masked": n_spot_masked,
             "n_masked": int((~keep_mask).sum())}
+
+
+def resolve_companion_priors(companion: dict[str, Any]) -> dict[str, Any]:
+    """Priors for one companion planet declared on a visit.
+
+    Same precedence as the target: archive, else the cached ``priors``,
+    then ``priors_override`` on top. The override is the normal case for
+    companions, not the exception: the companion's archive default
+    ephemeris was never checked against this visit (TOI-270 d: the
+    pscomppars solution, Kaye+2022, predicts the 2024 Aug 29 transit
+    10.9 h late; ExoFOP, Van Eylen+2021 and Kokori+2023 all put it within
+    an hour of TOI-270 c, where the data show it)."""
+    name = companion["planet_name"]
+    source = "archive"
+    try:
+        priors = fetch_transit_priors(name)
+    except Exception:
+        if not companion.get("priors"):
+            raise
+        priors = dict(companion["priors"])
+        priors.setdefault("planet_name", name)
+        source = "summary-cache"
+    override = companion.get("priors_override") or {}
+    used = sorted(k for k, v in override.items() if v is not None and k != "source")
+    if used:
+        priors = dict(priors)
+        priors.update({k: override[k] for k in used})
+        source = f"{source}+override({','.join(used)})"
+        if override.get("source"):
+            source += f" [{override['source']}]"
+    for key in ("t0", "period", "duration_hr"):
+        if priors.get(key) is None:
+            raise ValueError(f"Companion {name}: no {key} in its priors ({source}).")
+    return {"planet_name": name, "priors": priors, "priors_source": source}
 
 
 def load_anomaly_mask(

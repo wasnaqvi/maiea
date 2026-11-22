@@ -11,7 +11,8 @@ not exit codes: a fit that ran to completion can still be the wrong fit.
 
 Exit status is 1 when any target has a STOP-level failure (wrong version,
 suspect depth, prior-returning fit, scan never ran, a GP sampled with the
-transit, pass 2 moving t0 or the depth away from pass 1), so a script can
+transit, pass 2 moving t0 or the depth away from pass 1, a declared
+companion transit not detected or moving between passes), so a script can
 stop on it. Read-only.
 """
 
@@ -125,6 +126,39 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
                                  f"({d1:.0f} -> {depth:.0f} ppm)")
                 elif sig > 3:
                     notes.append(f"pass 2 depth {frac * 100:+.1f}% ({sig:.1f} sigma) from pass 1")
+            # Companion planets fitted jointly in this visit: the same
+            # pass-1/pass-2 rules, and the companion must be detected -- a
+            # companion depth consistent with zero means the declared
+            # overlap is not in the data (wrong ephemeris, wrong planet).
+            companion_lines = []
+            for c in f.get("companions") or []:
+                cw, cw1 = c.get("white_depth_ppm") or {}, c.get("white_depth_ppm_pass1") or {}
+                cd, ce = cw.get("median") or 0.0, _err(cw)
+                cname = c.get("planet_name")
+                if not cd or ce > 0.5 * cd:
+                    stops.append(f"companion {cname} not detected ({cd:.0f} ± {ce:.0f} ppm)")
+                ct1, ct2 = _med(c.get("t0_pass1") or {}), _med(c.get("t0") or {})
+                if ct1 is not None and ct2 is not None and abs(ct2 - ct1) * 1440 > T0_SHIFT_STOP_MIN:
+                    stops.append(f"pass 2 moved companion {cname} t0 "
+                                 f"{(ct2 - ct1) * 1440:+.0f} min from pass 1")
+                if cw1.get("median") and cd:
+                    cfrac = (cd - cw1["median"]) / cw1["median"]
+                    if abs(cfrac) > DEPTH_SHIFT_STOP_FRAC:
+                        stops.append(f"pass 2 moved companion {cname} depth {cfrac * 100:+.0f}% "
+                                     f"from pass 1 ({cw1['median']:.0f} -> {cd:.0f} ppm)")
+                cdc = c.get("depth_check") or {}
+                if cdc.get("status") == "suspect":
+                    stops.append(f"companion {cname} depth SUSPECT")
+                if (c.get("n_channels") or 0) < MIN_CHANNELS.get(det, 20):
+                    notes.append(f"companion {cname}: only {c.get('n_channels') or 0} channels")
+                companion_lines.append(
+                    f"        + companion {cname}: {cd:.0f} ± {ce:.0f} ppm  "
+                    f"check={cdc.get('status')}/{cdc.get('band')}"
+                    + (f" ({cdc['difference_frac'] * 100:+.1f}%)"
+                       if cdc.get("difference_frac") is not None else "")
+                    + (f"  t0 {(ct2 - _med(f.get('t0_p1') or {})) * 1440:+.1f} min from target"
+                       if ct2 is not None and _med(f.get("t0_p1") or {}) is not None else "")
+                    + f"  chans={c.get('n_channels') or 0}  priors {c.get('priors_source')}")
             for e in f.get("scan_steps_rejected_in_transit") or []:
                 notes.append(f"in-transit scan step {e.get('amplitude_ppm') or 0:+.0f} ppm "
                              "not fitted (no trace support)")
@@ -155,6 +189,7 @@ def check_target(summary: dict) -> tuple[list[str], bool]:
                 f" -> {beta if beta is None else round(beta, 2)} after GP"
                 + (f" (rho {rho_min:.0f} min)" if rho_min is not None else "")
                 + f"  chans={nch}")
+            lines.extend(companion_lines)
             for e in th.get("events") or []:
                 src = e.get("sources") or [e.get("source")]
                 if e.get("trace_support"):

@@ -89,9 +89,11 @@ from .juliet import (
     fit_transmission_spectrum,
     fit_white_lightcurve_joint,
     out_of_transit_mask,
+    out_of_transits_mask,
     PASS2_T0_SIGMA_DAYS,
     prepare_visit_fit_inputs,
     transit_window_from_summary,
+    transit_windows_from_summary,
     write_spectrum_csv,
     _plot_combined,
     _require_celerite,
@@ -166,17 +168,35 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             tmp.unlink()
 
 
+def _visit_companions(spec: Any) -> list[dict[str, Any]]:
+    """Companion planets a target-summary visit declares (see
+    prepare_visit_fit_inputs): ``{"planet_name", "priors_override",
+    "priors"}`` each, or bare planet names."""
+    if not isinstance(spec, dict):
+        return []
+    return [c if isinstance(c, dict) else {"planet_name": str(c)}
+            for c in (spec.get("companions") or [])]
+
+
 def _known_overlapping_transits(target: dict[str, Any]) -> list[str]:
+    """Planets known to transit together in some visit of this target
+    that the visit does NOT declare as companions. Non-empty means a
+    one-planet fit of that visit would be wrong."""
     overlaps: set[str] = set()
+    planet = target.get("planet_name")
     for visit, spec in target.get("visits", {}).items():
+        candidates: set[str] = set()
         if isinstance(spec, dict):
             candidates = {str(p) for p in spec.get("transit_candidates", [])}
-            if len(candidates) > 1:
-                overlaps.update(candidates)
-        if (target.get("planet_name") == "TOI-270 b"
+        if (planet == "TOI-270 b"
                 and visit == "o017"
                 and "4098" in str(target.get("program", ""))):
-            overlaps.update(("TOI-270 b", "TOI-270 d"))
+            candidates.update(("TOI-270 b", "TOI-270 d"))
+        if len(candidates) < 2:
+            continue
+        declared = {c["planet_name"] for c in _visit_companions(spec)}
+        if candidates - declared - {planet}:
+            overlaps.update(candidates)
     return sorted(overlaps)
 
 
@@ -404,10 +424,12 @@ def run_patchwork_target(
         if len(overlapping) > 1:
             raise RuntimeError(
                 f"{planet} has overlapping transits in this visit: "
-                f"{', '.join(overlapping)}. Patchwork currently fits one planet, "
-                "so a single-planet fit would absorb the deeper companion transit "
-                "and assign the wrong depth/spectrum. Use a multi-planet transit "
-                "model before fitting this visit."
+                f"{', '.join(overlapping)}, and the visit does not declare the "
+                "other planet(s) as companions. A single-planet fit would absorb "
+                "the companion transit and assign the wrong depth/spectrum. Add "
+                "them under the visit's \"companions\" in the target summary "
+                "(planet_name, plus a priors_override ephemeris checked against "
+                "this visit) so they are fitted jointly."
             )
 
         # juliet reloads existing posteriors instead of refitting, so a rerun
@@ -465,6 +487,7 @@ def run_patchwork_target(
                     # into priors_source. See prepare_visit_fit_inputs.
                     priors_override=target.get("priors_override"),
                     resolution=resolution,
+                    companions=_visit_companions(target["visits"][vname]),
                 )
                 preps[det] = prep
                 tr = prep["tilt_report"] or {}
@@ -481,6 +504,16 @@ def run_patchwork_target(
                     log(f"[{slug}] {vname} {det}: WARNING {tr['rate_warning']}")
             if not preps:
                 continue
+            # Other planets transiting in this visit, fitted jointly with
+            # the target (juliet planets 2+). Same ephemeris for both
+            # detectors, so either detector's resolution will do.
+            companions = next(iter(preps.values()))["companions"]
+            if companions:
+                log(f"[{slug}] {vname}: fitting jointly with companion(s) "
+                    + ", ".join(f"{c['planet_name']} (predicted "
+                                f"{(c['t0_obs'] - next(iter(preps.values()))['lc']['t0_obs']) * 24:+.2f} h "
+                                f"from {planet}; {c['priors_source']})"
+                                for c in companions))
 
             # v1.6: ONE white fit for both detectors (shared orbit), no
             # GP in pass 1 -- a GP would soak up the very bumps the
@@ -501,6 +534,7 @@ def run_patchwork_target(
                 gp=False, program=program, visit=vname,
                 tilt_reports={det: p["tilt_report"] for det, p in preps.items()},
                 n_tilt_masked={det: p["n_tilt_masked"] for det, p in preps.items()},
+                companions=companions,
             )
 
             # The transit as pass 1 FITTED it (shared geometry, so any
@@ -508,7 +542,10 @@ def run_patchwork_target(
             # decides what is in transit from here on -- for the scan, the
             # in-transit step test, and the GP training. A stale ephemeris
             # (HD 15337 c o019, ~60 min) otherwise misplaces the contacts.
-            transit_window = transit_window_from_summary(next(iter(pass1.values())))
+            # With companions, "in transit" is inside ANY of the visit's
+            # transits: a companion's transit is not baseline for the scan,
+            # the in-transit step test, or the GP training.
+            transit_window = transit_windows_from_summary(next(iter(pass1.values())))
 
             # -- Stage 5.5: scan pass-1 residuals, cross-confirm --------
             anomaly_dir = root / "fits" / vname / "anomalies"
@@ -521,7 +558,7 @@ def run_patchwork_target(
                 residual_full = _expand_indexed_values(
                     npz["residual"], original_index, prep["lc"]["time"].size
                 )
-                fitted_oot = out_of_transit_mask(npz["time"], *transit_window)
+                fitted_oot = out_of_transits_mask(npz["time"], transit_window)
                 series[det] = {"time": npz["time"], "residual": npz["residual"],
                                "residual_full": residual_full,
                                "oot_mask": fitted_oot}
@@ -613,7 +650,7 @@ def run_patchwork_target(
                 # Rejected steps are reported, never fitted.
                 rejected_steps = []
                 t_det = prep["lc"]["time"]
-                in_transit = ~out_of_transit_mask(t_det, *transit_window)
+                in_transit = ~out_of_transits_mask(t_det, transit_window)
                 kept_steps = []
                 for e in scan_steps:
                     if not in_transit[int(e["index"])]:
@@ -681,6 +718,13 @@ def run_patchwork_target(
             # and fixed; t0 tied to pass 1 so the corrections cannot slide
             # the transit (the v1.6 GP fits moved it 11-68 min).
             t0_pass1 = float(next(iter(pass1.values()))["t0_p1"]["median"])
+            # Companions' t0 are tied to pass 1 the same way.
+            pass1_comps = {c["planet_name"]: c
+                           for c in next(iter(pass1.values())).get("companions") or []}
+            companions_p2 = [
+                dict(c, t0_prior=(float(pass1_comps[c["planet_name"]]["t0"]["median"]),
+                                  PASS2_T0_SIGMA_DAYS))
+                for c in companions]
             log(f"[{slug}] fitting {vname} white light, pass 2 "
                 f"({'+'.join(preps)} joint, out-of-transit-trained GP, "
                 f"t0 {PASS2_T0_SIGMA_DAYS * 1440:.0f} min about pass 1; masked "
@@ -701,6 +745,7 @@ def run_patchwork_target(
                 n_tilt_masked={det: p2[det]["n_masked"] for det in preps},
                 gp_train_window=transit_window,
                 t0_prior=(t0_pass1, PASS2_T0_SIGMA_DAYS),
+                companions=companions_p2,
             )
 
             for det, prep in preps.items():
@@ -749,6 +794,21 @@ def run_patchwork_target(
                     "median_channel_rms_ppm": spec["median_rms_ppm"],
                     "spectrum_csv": spec["spectrum_csv"],
                 }
+                if companions:
+                    p1c = {c["planet_name"]: c for c in pass1[det].get("companions") or []}
+                    summary["visits"][vname]["fits"][det]["companions"] = [
+                        {"planet_name": c["planet_name"],
+                         "white_depth_ppm": c["depth_ppm"],
+                         "white_depth_ppm_pass1": p1c.get(c["planet_name"], {}).get("depth_ppm"),
+                         "t0": c["t0"], "t0_pass1": p1c.get(c["planet_name"], {}).get("t0"),
+                         "b": c["b"], "a": c["a"],
+                         "depth_check": c.get("depth_check"),
+                         "priors_source": c.get("priors_source"),
+                         "spectrum_csv": next((x["spectrum_csv"] for x in spec.get("companions") or []
+                                               if x["planet_name"] == c["planet_name"]), None),
+                         "n_channels": next((x["n_bins"] for x in spec.get("companions") or []
+                                             if x["planet_name"] == c["planet_name"]), 0)}
+                        for c in white.get("companions") or []]
                 dc = white.get("depth_check") or {}
                 if dc.get("status") == "suspect":
                     log(f"[{slug}] {vname} {det}: SUSPECT white-light depth "
