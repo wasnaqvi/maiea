@@ -671,33 +671,53 @@ pinned to `numpy<2`.
   the CUDA plugin finding no driver; harmless, and not seen on GPU nodes.
 - Jobs request `--gpus-per-node=h100:1`; submit with no venv active.
 
-**Retrieving a Patchwork spectrum** — `scripts/platon/retrieve_patchwork.py`
-(one planet, one model), submitted with `retrieve_patchwork.sbatch`:
+**Retrieving the Patchwork spectra** — `scripts/platon/`:
 
 ```bash
-cd ~/scratch && sbatch --job-name=platon_L_98_59_d_eq \
-    --export=ALL,SLUG=L_98_59_d,MODE=eq \
-    ~/aster/maiea/scripts/platon/retrieve_patchwork.sbatch
+bash ~/aster/maiea/scripts/platon/submit_platon_survey.sh            # dry run
+bash ~/aster/maiea/scripts/platon/submit_platon_survey.sh --submit   # every planet
 ```
 
+- One H100 job per planet (`retrieve_patchwork.sbatch`) runs three models
+  in sequence with `retrieve_patchwork.py`: `flat` (featureless null:
+  cloud deck at 10^-3.9 Pa, the top of PLATON's grid), `eq` (logZ, C/O in
+  equilibrium) and `free` (log VMRs of H2O, CH4, CO2, CO, NH3, SO2, H2S in
+  H2+He; `GASES` overrides). All fit Rp, `offset_nrs2` (NRS1 is the
+  reference; the combine step only *measures* the detector offset) and
+  `error_excess` (added in quadrature; combined spectra have chi2_red
+  1.5-2.9); eq and free also fit isothermal T and a grey cloud top. Mp is
+  fixed. 2-10 min per model.
 - Input: `~/scratch/patchwork/<slug>/combined/combined_{nrs1,nrs2}_transmission_spectrum.csv`
-  plus the planet's row in `scripts/patchwork/planet_params_v17.csv`
-  (Rp, Mp, R*, Teff, a). A planet missing from that CSV refuses to run.
-- `MODE=eq`: logZ, C/O (equilibrium). `MODE=free`: log VMRs of H2O, CH4,
-  CO2, CO, NH3 in H2+He. Both fit Rp, isothermal T, grey cloud top,
-  `offset_nrs2` (NRS1 is the reference; the combine step only *measures*
-  the detector offset, so the retrieval must fit it) and `error_excess`
-  (added in quadrature; the combined spectra have chi2_red 1.5-2.9).
-  `EXTRA="--haze"` adds a scattering amplitude; `EXTRA="--gases H2O,CH4,CO2,CO,NH3,SO2,H2S"`
-  changes the free-mode gas list (SO2 and H2S opacities are in the data). Mp is fixed.
-- Outputs in `~/scratch/platon/<slug>/<mode>[_haze]/`: `result.pkl`,
-  `summary.json` (median ± 1σ per parameter, offset and error excess in
-  ppm, μ at 1 mbar from 300 posterior draws, best-fit χ², ln evidence),
-  `spectrum_transit.png`, `corner.png`. Scratch is purged — copy them off.
+  plus the planet's row in `scripts/patchwork/planet_params_v17.csv`; a
+  planet missing from that CSV is skipped. `HOLD` skips planets that fail
+  `verify_fits` (default TOI_125_c, TOI_561_b). The submitter skips planets
+  with a live job or complete results; `FORCE=1` reruns.
+- MODES/GASES contain commas, so they travel in the environment with
+  `sbatch --export=ALL`, never `--export=VAR=a,b`.
+- Outputs in `~/scratch/platon/<slug>/<mode>/`: `result.pkl`,
+  `summary.json` (median ± 1σ, priors, offset and error excess in ppm,
+  μ at 1 mbar from 300 posterior draws, best-fit χ², ln evidence),
+  `posterior.npz`, `models.npz`, and PLATON's `spectrum_transit.png`,
+  `corner.png`, `contrib_contrib_func.png`. Scratch is purged — copy off.
 - Refuses to overwrite `result.pkl`; `--force` reruns the sampler,
-  `--post-only` rebuilds summary/μ/plots from the saved result in seconds.
-- Use ln evidence only between runs on the same spectrum (eq vs free,
-  haze vs none).
+  `--post-only` rebuilds the outputs from the saved result in seconds.
+  `--n-eff` lowers nautilus's stopping point: a near-featureless spectrum
+  with seven free gases can sample very slowly (GJ 3090 b free: N_eff 455
+  after 1.9 M calls; rerun with `--n-eff 1000` finished in 9 min).
+- `collect_platon_survey.py <root>` (numpy/scipy/matplotlib only, runs on
+  the Mac) writes `platon_survey_table.{csv,md}` — ln B of eq and free
+  against flat with the Benneke & Seager (2013) σ, logZ, C/O, μ, offset,
+  error excess, and flags for prior-shaped parameters — plus
+  `platon_spectra_atlas`, `platon_posteriors` and `platon_mu_teq`
+  (PDF/PNG/SVG, house style via the local `exoplot.py` copy).
+  `write_priors.py` backfills prior ranges into older summaries.
+- logZ's upper prior (3, i.e. 1000× solar) is PLATON's grid limit: a
+  posterior piled there is a lower bound, not a measurement. C/O is
+  unconstrained by G395H alone for every Patchwork planet.
+- Compare ln evidence only between runs on the same spectrum.
+- GPU node `fc10512` failed JAX start-up with CUDA_ERROR_OUT_OF_MEMORY on
+  2026-11-25; the sbatch now checks the GPU first and exits 3 naming the
+  node, to resubmit with `--exclude`.
 
 ## Testing the agent end to end
 

@@ -25,12 +25,19 @@ Model choices, and why:
 - eq:   logZ (log10 x solar) and C/O in chemical equilibrium.
   free: log VMRs of --gases (default H2O CH4 CO2 CO NH3; add SO2, H2S
         etc. per planet), H2+He filling the rest.
+  flat: featureless null -- cloud top at the top of PLATON's pressure grid
+        (10^-3.9 Pa), so only Rp, the NRS2 offset and the error excess are
+        fitted. ln B = ln Z(eq or free) - ln Z(flat) is the evidence for
+        any atmospheric feature in the spectrum.
 - The mean molecular weight mu at 1 mbar is computed for posterior draws
   and reported, since mu is what the Patchwork population science uses.
 
 Outputs in --out (default ~/scratch/platon/<slug>/<mode>[_haze]/):
-result.pkl (PLATON RetrievalResult), summary.json (medians, 1-sigma, ln
-evidence, chi2, mu), spectrum.png, corner.png. Refuses to overwrite an
+result.pkl (PLATON RetrievalResult), posterior.npz (equal-weight
+samples + names), models.npz (data, best fit and 1-sigma model band at
+native resolution), summary.json (medians, 1-sigma, ln
+evidence, chi2, mu), spectrum_transit.png, corner.png,
+contrib_contrib_func.png. Refuses to overwrite an
 existing result without --force.
 """
 import argparse
@@ -48,6 +55,8 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_PARAMS = HERE.parent / "patchwork" / "planet_params_v17.csv"
 FREE_GASES = "H2O,CH4,CO2,CO,NH3"  # H2-He is appended as the filler
 MU_PRESSURE_PA = 100.0  # 1 mbar, where G395H transmission probes
+FLAT_LOG_CLOUDTOP_P = -3.9  # log10 Pa: just inside the top of PLATON's grid (1e-4 Pa;
+                           # exactly -4 fails its bounds check by rounding)
 
 
 def slugify(name):
@@ -99,7 +108,10 @@ def build_fit_info(retriever, planet, mode, n1, n_total, haze, gases):
     common = dict(Rs=Rs, Mp=Mp, Rp=Rp, T=T0, log_cloudtop_P=4,
                   log_scatt_factor=0, error_excess=0, T_star=Teff,
                   transit_offsets={"offset_nrs2": (n1, n_total)})
-    if mode == "eq":
+    if mode == "flat":
+        common["log_cloudtop_P"] = FLAT_LOG_CLOUDTOP_P
+        fit_info = retriever.get_default_fit_info(logZ=0, CO_ratio=0.53, **common)
+    elif mode == "eq":
         fit_info = retriever.get_default_fit_info(logZ=1, CO_ratio=0.53, **common)
         fit_info.add_uniform_fit_param("logZ", -1, 3)
         fit_info.add_uniform_fit_param("CO_ratio", 0.05, 2.0)
@@ -108,12 +120,16 @@ def build_fit_info(retriever, planet, mode, n1, n_total, haze, gases):
                                                   fit_vmr=True, **common)
         fit_info.add_gases_vmr(gases + ["H2-He"], 1e-12, 10**-0.3)
 
-    fit_info.add_uniform_fit_param("Rp", 0.7 * Rp, 1.3 * Rp)
-    fit_info.add_uniform_fit_param("T", 100, T_hi)
-    fit_info.add_uniform_fit_param("log_cloudtop_P", -1, 8)
+    # Rp is the radius at 1 bar; with the flat model's deck at 1e-4 Pa the
+    # visible radius sits ~20 scale heights higher, so it needs room below.
+    fit_info.add_uniform_fit_param("Rp", (0.4 if mode == "flat" else 0.7) * Rp,
+                                   1.3 * Rp)
+    if mode != "flat":
+        fit_info.add_uniform_fit_param("T", 100, T_hi)
+        fit_info.add_uniform_fit_param("log_cloudtop_P", -1, 8)
     fit_info.add_uniform_fit_param("offset_nrs2", -300e-6, 300e-6)
     fit_info.add_uniform_fit_param("error_excess", 0, 300e-6)
-    if haze:
+    if haze and mode != "flat":
         fit_info.add_uniform_fit_param("log_scatt_factor", -2, 6)
     return fit_info, Teq
 
@@ -155,11 +171,14 @@ def summarize(samples, names):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("slug", help="target directory name, e.g. L_98_59_d")
-    ap.add_argument("--mode", choices=["eq", "free"], default="eq")
+    ap.add_argument("--mode", choices=["eq", "free", "flat"], default="eq")
     ap.add_argument("--root", default=os.path.expanduser("~/scratch/patchwork"))
     ap.add_argument("--params", default=str(DEFAULT_PARAMS))
     ap.add_argument("--out", default=None)
     ap.add_argument("--n-live", type=int, default=1000)
+    ap.add_argument("--n-eff", type=int, default=5000,
+                    help="nautilus stopping point (effective posterior samples); "
+                         "lower it for weakly constrained free retrievals")
     ap.add_argument("--haze", action="store_true",
                     help="also fit a Rayleigh-like scattering amplitude")
     ap.add_argument("--gases", default=FREE_GASES,
@@ -212,12 +231,14 @@ def main():
         t0 = time.time()
         result = retriever.run_nautilus(bins, depths, errors, None, None, None,
                                         fit_info, n_live=args.n_live,
-                                        n_train_workers=ncpu)
+                                        n_eff=args.n_eff, n_train_workers=ncpu)
         elapsed = round(time.time() - t0, 1)
         with open(out / "result.pkl", "wb") as f:
             pickle.dump(result, f)
     data = (bins, depths, errors, None, None, None)
-    mus = mu_posterior(retriever, result, data, args.mu_draws)
+    # The flat model fixes the composition (logZ=0), so its mu means nothing.
+    mus = (np.array([]) if args.mode == "flat"
+           else mu_posterior(retriever, result, data, args.mu_draws))
 
     names = list(fit_info.fit_param_names)
     summary = {
@@ -226,7 +247,7 @@ def main():
         "haze": args.haze,
         "gases": gases if args.mode == "free" else None,
         "platon_version": platon.__version__, "jax_version": jax.__version__,
-        "sampler": "nautilus", "n_live": args.n_live,
+        "sampler": "nautilus", "n_live": args.n_live, "n_eff_target": args.n_eff,
         "n_nrs1": n1, "n_nrs2": len(depths) - n1, "Teq_K": Teq,
         "planet_params": planet,
         "ln_evidence": float(np.atleast_1d(result.final_logz)[-1])
@@ -234,11 +255,17 @@ def main():
         "chi2_best": float(result.transit_chi_sqr),
         "n_data": int(len(depths)),
         "params": summarize(np.asarray(result.equal_samples), names),
+        "priors": {n: [float(fit_info.all_params[n].low_lim),
+                       float(fit_info.all_params[n].high_lim)] for n in names},
         "mu_1mbar": ({"median": float(np.median(mus)),
                       "p16": float(np.percentile(mus, 15.865)),
                       "p84": float(np.percentile(mus, 84.135)),
                       "n_draws": int(len(mus))} if len(mus) else None),
         "elapsed_s": elapsed,
+        # Peak-to-peak of the binned best fit over NRS1 (no offset there):
+        # ~0 for the flat model, the size of the fitted features otherwise.
+        "model_span_nrs1_ppm": float(1e6 * np.ptp(
+            np.asarray(result.best_fit_transit_depths)[:n1])),
     }
     for k in ("offset_nrs2", "error_excess"):
         if k in summary["params"]:
@@ -246,11 +273,44 @@ def main():
                 kk: 1e6 * v for kk, v in summary["params"][k].items()}
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
+    # Light products for plotting off Fir (result.pkl needs PLATON to load).
+    eq = np.asarray(result.equal_samples)
+    np.savez_compressed(out / "posterior.npz", names=np.array(names),
+                        samples=eq, mu_1mbar=mus)
+    bf = result.best_fit_transit_dict
+    rand = np.asarray(result.random_transit_depths)
+    off = float(np.median(eq[:, names.index("offset_nrs2")]))
+    np.savez_compressed(
+        out / "models.npz",
+        bins_m=bins, depth=depths, depth_err=errors, n_nrs1=n1,
+        offset_nrs2_median=off,
+        best_fit_binned=np.asarray(result.best_fit_transit_depths),
+        wavelength_m=np.asarray(bf["unbinned_wavelengths"]),
+        best_fit=np.asarray(bf["unbinned_depths"]),
+        band_p16=np.percentile(rand, 15.865, axis=0) if len(rand) else [],
+        band_p50=np.percentile(rand, 50, axis=0) if len(rand) else [],
+        band_p84=np.percentile(rand, 84.135, axis=0) if len(rand) else [])
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     cwd = os.getcwd()
     os.chdir(out)
     try:
-        Plotter.plot_retrieval_transit_spectrum(result, prefix="spectrum")
-        Plotter.plot_retrieval_corner(result, filename="corner.png")
+        for name, plot in (
+                ("spectrum", lambda: Plotter.plot_retrieval_transit_spectrum(
+                    result, prefix="spectrum")),
+                ("corner", lambda: Plotter.plot_retrieval_corner(
+                    result, filename="corner.png")),
+                ("contrib", lambda: Plotter.plot_contrib_func(
+                    bf, log_scale=True, prefix="contrib"))):
+            if name == "contrib" and args.mode == "flat":
+                continue  # fully opaque deck: no contribution function
+            try:
+                plot()
+            except Exception as exc:  # one bad plot must not lose the rest
+                print(f"plot {name} failed: {exc!r}")
+            plt.close("all")
     finally:
         os.chdir(cwd)
 
@@ -264,7 +324,8 @@ def main():
         print(f"  mu(1 mbar)       {m['median']:.2f} "
               f"[{m['p16']:.2f}, {m['p84']:.2f}]")
     print(f"  chi2 {summary['chi2_best']:.1f} / {summary['n_data']} points, "
-          f"ln(evidence) {summary['ln_evidence']:.2f}")
+          f"ln(evidence) {summary['ln_evidence']:.2f}, "
+          f"NRS1 model span {summary['model_span_nrs1_ppm']:.0f} ppm")
 
 
 if __name__ == "__main__":
