@@ -635,6 +635,42 @@ single-detector excursions never masked, the chromatic amplitude ratio,
 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` avoids an unrelated `pkg_resources`
 breakage in the local pytest plugins.
 
+## PLATON 7 retrievals on Fir (`scripts/platon/`)
+
+Retrievals on the Patchwork spectral library use PLATON 7.0 (JAX, FP32,
+GPU by default). It has **its own environment** and never goes into
+`aster-env` or the exoTEDRF env: it needs `numpy>=2` and `jax[cuda12]`,
+which would move numpy/scipy under the juliet survey fits, and exoTEDRF is
+pinned to `numpy<2`.
+
+| piece | where |
+|---|---|
+| venv | `~/envs/platon-env` (python/3.13.2, StdEnv/2023, same module as aster-env) |
+| source | `/project/def-ncowan/wasi/platon`, tag `v7.0` = `202e939` |
+| opacity data | `<source>/platon/data` (~11 GB zip, md5 `8a209c5a…`); on /project because home is too small and scratch is purged |
+| lock | `scripts/platon/requirements-platon-fir.txt` (jax 0.12.1, CUDA 12 pip wheels) |
+| interpreter | `~/bin/platon-python` (wrapper: module purge, clears `PYTHONPATH`, activates the venv) |
+
+- **Build / rebuild**: `bash scripts/platon/setup_platon_fir.sh` on a
+  **login node** (pip, git and the data download need the internet;
+  compute nodes have none). Installs from the lock when it exists, so a
+  rebuild gives the same versions. Deleting the lock is a deliberate
+  upgrade; never mix retrievals across locks.
+- **jax comes from PyPI**: the Alliance wheelhouse stops at jaxlib 0.4.28.
+  Do not `module load cuda` with this env — jax ships its own CUDA
+  libraries as pip wheels and a module would shadow them.
+- **Verify**: `sbatch scripts/platon/verify_platon.sbatch` (one H100,
+  `def-ncowan`) runs `verify_platon.py` (version, numpy, data md5, jax on
+  the GPU, one G395H-range forward model; prints READY) and PLATON's
+  transit-depth and retrieval tests. A job that got a GPU but whose jax
+  fell back to CPU fails the check: that is ~100x slower. First run
+  (2026-11-25, job 6032478): READY, opacity load 19 s, one binned
+  forward model 1 ms, 17 passed / 2 skipped (skipped upstream).
+- On a login node, `import jax` prints a `Jax plugin configuration error
+  ... nanobind ... SystemError` traceback and falls back to CPU. That is
+  the CUDA plugin finding no driver; harmless, and not seen on GPU nodes.
+- Jobs request `--gpus-per-node=h100:1`; submit with no venv active.
+
 ## Testing the agent end to end
 
 Three layers, cheapest first:

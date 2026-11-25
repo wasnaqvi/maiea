@@ -1,0 +1,40 @@
+#!/bin/bash
+# Wrapper: run the pinned PLATON 7 interpreter in a clean environment,
+# independent of whatever the caller has loaded (aster-env, exoTEDRF, a
+# cuda module).
+#
+# Why a separate environment at all: PLATON 7 needs numpy>=2 and
+# jax[cuda12]. aster-env runs the juliet/celerite survey fits, and
+# installing PLATON there would move numpy/scipy under them mid-survey.
+# The exoTEDRF env is pinned to numpy<2. So PLATON gets its own venv,
+# built by setup_platon_fir.sh from requirements-platon-fir.txt.
+#
+# Why a wrapper: an Alliance virtualenv must be ACTIVATED (calling
+# <venv>/bin/python by path leaves site-packages off sys.path on a
+# compute node), and a loaded cuda module or a PYTHONPATH from another
+# env would shadow the CUDA libraries jax[cuda12] ships as pip wheels.
+#
+# Install once on Fir (setup_platon_fir.sh does this):
+#     cp ~/aster/maiea/scripts/platon/platon-python ~/bin/
+#     chmod +x ~/bin/platon-python
+#
+# Use it as an interpreter: platon-python script.py, platon-python -m pytest
+
+set -euo pipefail
+
+PLATON_ENV="${PLATON_ENV:-$HOME/envs/platon-env}"
+PLATON_MODULES="${PLATON_MODULES:-python/3.13.2}"
+
+if command -v module >/dev/null 2>&1; then
+    # Module output must never reach stdout: callers may parse it.
+    # shellcheck disable=SC2086
+    { module --force purge && module load StdEnv/2023 $PLATON_MODULES; } \
+        >/dev/null 2>&1 || true
+fi
+
+# Nothing from another environment may leak in.
+unset PYTHONPATH PYTHONHOME
+
+# shellcheck disable=SC1091
+source "$PLATON_ENV/bin/activate"
+exec python "$@"
