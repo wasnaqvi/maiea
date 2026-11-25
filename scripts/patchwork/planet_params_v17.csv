@@ -1,0 +1,22 @@
+pl_name,rp_rearth,mp_mearth,rstar_rsun,teff_k,a_au,source
+GJ 1214 b,2.73300000,8.41000000,0.216200,3101.00,0.0150500000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+GJ 3090 b,2.18000000,4.52000000,0.516000,3707.00,0.0316000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+GJ 357 b,1.217,1.84,0.337,3505,0.035,"Luque et al. 2019, A&A 628, A39"
+GJ 9827 d,1.98000000,3.02000000,0.580000,4236.00,0.0530000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+HD 15337 b,1.77000000,6.51900000,0.855000,5131.00,0.0524500000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+HD 15337 c,2.52600000,6.79200000,0.855000,5131.00,0.1235000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+HIP 9618 b,3.82838127,8.30000000,0.959300,5649.00,0.1450000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+K2-18 b,2.37000000,8.92000000,0.411000,3457.00,0.1429000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+L 98-59 d,1.521,1.94,0.303,3415,0.0484,"Demangeon et al. 2021, A&A 653, A41"
+LTT 3780 c,2.39000000,8.04000000,0.380000,3358.00,0.0757000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-1231 b,3.65000000,15.40000000,0.476000,3553.00,0.1288000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-125 b,2.72600000,9.50000000,0.848000,5320.00,0.0518600000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-1468 c,2.12600000,4.10000000,0.371400,3376.00,0.0860800000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-270 c,2.33000000,6.20000000,0.380000,3506.00,0.0452600000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-4336 A b,2.13700000,3.33000000,0.326000,3307.00,0.0849000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-451 c,2.93000000,3.70000000,0.850000,5490.00,0.0795000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-451 d,3.93000000,10.20000000,0.850000,5490.00,0.1168000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-776 b,1.79800000,5.00000000,0.547000,3725.00,0.0653000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-776 c,2.04700000,6.90000000,0.547000,3725.00,0.1001000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)
+TOI-836 b,1.704,4.55,0.665,4552,0.0422,"Hawthorn et al. 2023, MNRAS 520, 3649"
+TOI-836.01,2.58700000,9.60000000,0.665000,4552.00,0.0750000000,NASA Exoplanet Archive (MAIA/aster/workspace/mast/subneptunes_jwst.csv)

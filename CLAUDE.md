@@ -671,6 +671,34 @@ pinned to `numpy<2`.
   the CUDA plugin finding no driver; harmless, and not seen on GPU nodes.
 - Jobs request `--gpus-per-node=h100:1`; submit with no venv active.
 
+**Retrieving a Patchwork spectrum** — `scripts/platon/retrieve_patchwork.py`
+(one planet, one model), submitted with `retrieve_patchwork.sbatch`:
+
+```bash
+cd ~/scratch && sbatch --job-name=platon_L_98_59_d_eq \
+    --export=ALL,SLUG=L_98_59_d,MODE=eq \
+    ~/aster/maiea/scripts/platon/retrieve_patchwork.sbatch
+```
+
+- Input: `~/scratch/patchwork/<slug>/combined/combined_{nrs1,nrs2}_transmission_spectrum.csv`
+  plus the planet's row in `scripts/patchwork/planet_params_v17.csv`
+  (Rp, Mp, R*, Teff, a). A planet missing from that CSV refuses to run.
+- `MODE=eq`: logZ, C/O (equilibrium). `MODE=free`: log VMRs of H2O, CH4,
+  CO2, CO, NH3 in H2+He. Both fit Rp, isothermal T, grey cloud top,
+  `offset_nrs2` (NRS1 is the reference; the combine step only *measures*
+  the detector offset, so the retrieval must fit it) and `error_excess`
+  (added in quadrature; the combined spectra have chi2_red 1.5-2.9).
+  `EXTRA="--haze"` adds a scattering amplitude; `EXTRA="--gases H2O,CH4,CO2,CO,NH3,SO2,H2S"`
+  changes the free-mode gas list (SO2 and H2S opacities are in the data). Mp is fixed.
+- Outputs in `~/scratch/platon/<slug>/<mode>[_haze]/`: `result.pkl`,
+  `summary.json` (median ± 1σ per parameter, offset and error excess in
+  ppm, μ at 1 mbar from 300 posterior draws, best-fit χ², ln evidence),
+  `spectrum_transit.png`, `corner.png`. Scratch is purged — copy them off.
+- Refuses to overwrite `result.pkl`; `--force` reruns the sampler,
+  `--post-only` rebuilds summary/μ/plots from the saved result in seconds.
+- Use ln evidence only between runs on the same spectrum (eq vs free,
+  haze vs none).
+
 ## Testing the agent end to end
 
 Three layers, cheapest first:
